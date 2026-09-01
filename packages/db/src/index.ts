@@ -33,7 +33,7 @@ import {
   type Role,
   validateExternalIdentity,
 } from "../../identity/src/index.js";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   compareResourceVersions,
   MemoryClusterScopeStore,
@@ -42,6 +42,8 @@ import {
   type ClusterScopeStore,
   type NormalizedObservation,
   type NormalizedPodObservation,
+  type SupportedResourceKind,
+  SUPPORTED_RESOURCE_KINDS,
   markRecovery,
 } from "../../cluster/src/index.js";
 
@@ -66,6 +68,7 @@ export const OBSERVATION_TIMELINE_MIGRATION_ID = "0006_observation_timeline";
 export const RECENT_LOGS_MIGRATION_ID = "0007_recent_logs";
 export const NORMALIZED_OBSERVATION_MIGRATION_ID = "0008_normalized_observations";
 export const OBSERVATION_CHECKPOINTS_MIGRATION_ID = "0009_observation_checkpoints";
+export const TIMELINE_ATTENTION_MIGRATION_ID = "0010_timeline_attention";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -79,6 +82,7 @@ const migrations: readonly Migration[] = [
   { id: RECENT_LOGS_MIGRATION_ID, path: "../migrations/0007_recent_logs.sql" },
   { id: NORMALIZED_OBSERVATION_MIGRATION_ID, path: "../migrations/0008_normalized_observations.sql" },
   { id: OBSERVATION_CHECKPOINTS_MIGRATION_ID, path: "../migrations/0009_observation_checkpoints.sql" },
+  { id: TIMELINE_ATTENTION_MIGRATION_ID, path: "../migrations/0010_timeline_attention.sql" },
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -270,6 +274,12 @@ type ClusterRow = Readonly<{
 export type TimelineQuery = Readonly<{
   limit: number;
   cursor?: string;
+  kind?: SupportedResourceKind;
+  namespace?: string;
+  name?: string;
+  state?: string;
+  attention?: boolean;
+  unread?: boolean;
 }>;
 
 export type TimelineEntry = Readonly<{
@@ -282,6 +292,8 @@ export type TimelineEntry = Readonly<{
   attentionReason: AttentionReasonCode | null;
   recoveryOf: string | null;
   observation: NormalizedObservation;
+  attention: boolean;
+  attentionUnread: boolean;
 }>;
 
 export type ObservationPersistenceResult = Readonly<{
@@ -302,6 +314,13 @@ export type IngestionCheckpoint = Readonly<{
 export type TimelinePage = Readonly<{
   entries: readonly TimelineEntry[];
   nextCursor: string | null;
+  unreadAttentionCount?: number;
+}>;
+
+export type AttentionReviewResult = Readonly<{
+  entryId: string;
+  reviewed: boolean;
+  unreadCount: number;
 }>;
 
 export class TimelineQueryValidationError extends Error {
@@ -311,23 +330,102 @@ export class TimelineQueryValidationError extends Error {
   }
 }
 
-function encodeTimelineCursor(entry: Pick<TimelineEntry, "occurredAt" | "id">): string {
-  return btoa(JSON.stringify({ occurredAt: entry.occurredAt, id: entry.id })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const timelineFilterFields = ["kind", "namespace", "name", "state", "attention", "unread", "memberId"] as const;
+const timelineStates = ["Pending", "Running", "Succeeded", "Failed", "Unknown"] as const;
+type TimelineFilterField = (typeof timelineFilterFields)[number];
+
+type TimelineCursor = Readonly<{
+  version: 1;
+  occurredAt: string;
+  id: string;
+  memberId: string | null;
+  filters: string;
+}>;
+
+export const DEFAULT_TIMELINE_CURSOR_SECRET = "tracegarden-test-timeline-cursor-secret";
+
+function timelineFilters(query: TimelineQuery, memberId?: string): Readonly<Record<TimelineFilterField, string | boolean | null | undefined>> {
+  return {
+    kind: query.kind,
+    namespace: query.namespace,
+    name: query.name,
+    state: query.state,
+    attention: query.attention,
+    unread: query.unread,
+    memberId: memberId ?? null,
+  };
 }
 
-function decodeTimelineCursor(value: string): Readonly<{ occurredAt: string; id: string }> {
+function timelineFilterKey(query: TimelineQuery, memberId?: string): string {
+  return JSON.stringify(timelineFilters(query, memberId));
+}
+
+function base64UrlEncode(value: string | Uint8Array): string {
+  const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlDecode(value: string): Uint8Array {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4);
+  const binary = atob(normalized);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function encodeTimelineCursor(entry: Pick<TimelineEntry, "occurredAt" | "id">, query: TimelineQuery, secret: string, memberId?: string): string {
+  const payload: TimelineCursor = { version: 1, occurredAt: entry.occurredAt, id: entry.id, memberId: memberId ?? null, filters: timelineFilterKey(query, memberId) };
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const signature = base64UrlEncode(createHmac("sha256", secret).update(encodedPayload).digest());
+  return `${encodedPayload}.${signature}`;
+}
+
+function validTimelineCursorShape(value: string): boolean {
+  return value.length <= 2048 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+}
+
+function decodeTimelineCursor(value: string, query: TimelineQuery, secret: string, memberId?: string): Readonly<{ occurredAt: string; id: string }> {
   try {
-    const normalized = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4);
-    const decoded: unknown = JSON.parse(atob(normalized));
+    if (!validTimelineCursorShape(value)) throw new Error("cursor encoding is invalid");
+    const separator = value.indexOf(".");
+    const encodedPayload = value.slice(0, separator);
+    const encodedSignature = value.slice(separator + 1);
+    const expectedSignature = createHmac("sha256", secret).update(encodedPayload).digest();
+    const actualSignature = base64UrlDecode(encodedSignature);
+    if (actualSignature.length !== expectedSignature.length || !timingSafeEqual(actualSignature, expectedSignature)) {
+      throw new Error("cursor signature is invalid");
+    }
+    const decoded: unknown = JSON.parse(new TextDecoder().decode(base64UrlDecode(encodedPayload)));
     if (typeof decoded !== "object" || decoded === null) throw new Error("cursor object required");
     const record = decoded as Record<string, unknown>;
-    if (typeof record.occurredAt !== "string" || !Number.isFinite(Date.parse(record.occurredAt)) || typeof record.id !== "string" || !record.id.trim()) {
+    if (record.version !== 1 || typeof record.occurredAt !== "string" || !Number.isFinite(Date.parse(record.occurredAt)) || typeof record.id !== "string" || !record.id.trim() || typeof record.filters !== "string" || (typeof record.memberId !== "string" && record.memberId !== null) || (typeof record.memberId === "string" && !record.memberId.trim())) {
       throw new Error("cursor fields are invalid");
     }
+    if (record.memberId !== (memberId ?? null) || record.filters !== timelineFilterKey(query, memberId)) throw new Error("cursor does not match query filters");
     return { occurredAt: new Date(record.occurredAt).toISOString(), id: record.id };
   } catch {
-    throw new TimelineQueryValidationError(["cursor must be an opaque valid Timeline cursor"]);
+    throw new TimelineQueryValidationError(["cursor must be an opaque valid Timeline cursor for these filters"]);
   }
+}
+
+function optionalTimelineFilter(value: unknown, field: string, issues: string[], maxLength: number): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    issues.push(`${field} must be a string`);
+    return undefined;
+  }
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  if (normalized.length > maxLength) issues.push(`${field} must be at most ${maxLength} characters`);
+  return normalized;
+}
+
+function optionalTimelineBoolean(value: unknown, field: string, issues: string[]): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (value === true || value === false) return value;
+  if (value === "true" || value === "false") return value === "true";
+  issues.push(`${field} must be true or false`);
+  return undefined;
 }
 
 export function parseTimelineQuery(input: unknown): TimelineQuery {
@@ -345,10 +443,32 @@ export function parseTimelineQuery(input: unknown): TimelineQuery {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) issues.push("limit must be an integer from 1 to 100");
   const rawCursor = record.cursor;
   if (rawCursor !== undefined && (typeof rawCursor !== "string" || !rawCursor.trim())) issues.push("cursor must be a non-empty string");
+  const rawKind = record.kind;
+  const kind = rawKind === undefined ? undefined : typeof rawKind === "string" && (SUPPORTED_RESOURCE_KINDS as readonly string[]).includes(rawKind) ? rawKind as SupportedResourceKind : undefined;
+  if (rawKind !== undefined && kind === undefined) issues.push(`kind must be one of ${SUPPORTED_RESOURCE_KINDS.join(", ")}`);
+  const namespace = optionalTimelineFilter(record.namespace, "namespace", issues, 63);
+  const name = optionalTimelineFilter(record.name, "name", issues, 253);
+  const rawState = record.state === undefined ? record.phase : record.state;
+  const state = optionalTimelineFilter(rawState, "state", issues, 50);
+  if (state && !(timelineStates as readonly string[]).includes(state)) issues.push("state must be a supported Pod phase");
+  const attention = optionalTimelineBoolean(record.attention, "attention", issues);
+  const unread = optionalTimelineBoolean(record.unread, "unread", issues);
+  if (unread === true && attention === false) issues.push("unread cannot be used with attention=false");
   if (issues.length > 0) throw new TimelineQueryValidationError(issues);
-  const cursor = typeof rawCursor === "string" ? rawCursor.trim() : undefined;
-  if (cursor) decodeTimelineCursor(cursor);
-  return { limit, ...(cursor ? { cursor } : {}) };
+  const query: TimelineQuery = {
+    limit,
+    ...(typeof rawCursor === "string" && rawCursor.trim() ? { cursor: rawCursor.trim() } : {}),
+    ...(kind ? { kind } : {}),
+    ...(namespace ? { namespace } : {}),
+    ...(name ? { name } : {}),
+    ...(state ? { state } : {}),
+    ...(attention === undefined ? {} : { attention }),
+    ...(unread === undefined ? {} : { unread }),
+  };
+  if (query.cursor && !validTimelineCursorShape(query.cursor)) {
+    throw new TimelineQueryValidationError(["cursor must be an opaque valid Timeline cursor for these filters"]);
+  }
+  return query;
 }
 
 export interface TimelineStore {
@@ -361,10 +481,16 @@ export interface TimelineStore {
   ): Promise<readonly ObservationPersistenceResult[]>;
   advanceIngestionCheckpoint?(checkpoint: IngestionCheckpointInput): Promise<IngestionCheckpoint | null>;
   clearIngestionCheckpoint?(checkpoint: Omit<IngestionCheckpointInput, "resourceVersion">): Promise<void>;
-  listTimelineEntries(workspaceId: string, query: TimelineQuery): Promise<TimelinePage>;
+  listTimelineEntries(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<TimelinePage>;
   getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null>;
   countObservations(workspaceId: string): Promise<number>;
   countTimelineEntries(workspaceId: string): Promise<number>;
+  unreadAttentionCount?(workspaceId: string, memberId: string): Promise<number>;
+  reviewAttentionItem?(workspaceId: string, memberId: string, entryId: string): Promise<AttentionReviewResult | null>;
+}
+
+export function isAttentionObservation(observation: Pick<NormalizedObservation, "attention">): boolean {
+  return observation.attention;
 }
 
 export type IngestionCheckpointInput = Readonly<{
@@ -422,19 +548,32 @@ function timelineEntryFor(observation: NormalizedObservation): TimelineEntry {
     attentionReason: observation.attentionReason,
     recoveryOf: observation.recoveryOf,
     observation,
+    attention: observation.attention,
+    attentionUnread: false,
   };
 }
 
-function pageFromEntries(entries: readonly TimelineEntry[], query: TimelineQuery): TimelinePage {
-  const sorted = [...entries].sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id));
-  const cursor = query.cursor ? decodeTimelineCursor(query.cursor) : null;
+function entryMatchesQuery(entry: TimelineEntry, query: TimelineQuery): boolean {
+  const observation = entry.observation;
+  const state = observation.kind === "Pod" ? observation.phase : null;
+  return (query.kind === undefined || observation.kind === query.kind)
+    && (query.namespace === undefined || observation.namespace === query.namespace)
+    && (query.name === undefined || observation.name === query.name)
+    && (query.state === undefined || state === query.state)
+    && (query.attention === undefined || entry.attentionItem === query.attention)
+    && (query.unread === undefined || (query.unread ? entry.attentionItem && entry.attentionUnread : !entry.attentionUnread));
+}
+
+function pageFromEntries(entries: readonly TimelineEntry[], query: TimelineQuery, cursorSecret: string, memberId?: string): TimelinePage {
+  const sorted = entries.filter((entry) => entryMatchesQuery(entry, query)).sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id));
+  const cursor = query.cursor ? decodeTimelineCursor(query.cursor, query, cursorSecret, memberId) : null;
   const afterCursor = cursor
     ? sorted.filter((entry) => entry.occurredAt > cursor.occurredAt || (entry.occurredAt === cursor.occurredAt && entry.id > cursor.id))
     : sorted;
   const page = afterCursor.slice(0, query.limit);
   return {
     entries: page.map(cloneEntry),
-    nextCursor: afterCursor.length > query.limit && page.length > 0 ? encodeTimelineCursor(page[page.length - 1] as TimelineEntry) : null,
+    nextCursor: afterCursor.length > query.limit && page.length > 0 ? encodeTimelineCursor(page[page.length - 1] as TimelineEntry, query, cursorSecret, memberId) : null,
   };
 }
 
@@ -444,6 +583,11 @@ export class MemoryObservationStore implements TimelineStore {
   private readonly ingestionOrders = new Map<string, bigint>();
   private nextIngestionOrder = 0n;
   private readonly checkpoints = new Map<string, IngestionCheckpoint>();
+  private readonly attentionReviews = new Set<string>();
+
+  constructor(private readonly cursorSecret: string = DEFAULT_TIMELINE_CURSOR_SECRET) {
+    if (!cursorSecret.trim()) throw new Error("Timeline cursor secret is required");
+  }
 
   async recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult> {
     const results = await this.recordObservations([observation]);
@@ -532,13 +676,33 @@ export class MemoryObservationStore implements TimelineStore {
     this.checkpoints.delete(checkpointKey(checkpoint));
   }
 
-  async listTimelineEntries(workspaceId: string, query: TimelineQuery): Promise<TimelinePage> {
-    return pageFromEntries([...this.entries.values()].filter((entry) => entry.workspaceId === workspaceId), query);
+  async listTimelineEntries(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<TimelinePage> {
+    if (query.unread !== undefined && memberId === undefined) {
+      throw new TimelineQueryValidationError(["member is required for unread Attention filtering"]);
+    }
+    const entries = [...this.entries.values()]
+      .filter((entry) => entry.workspaceId === workspaceId)
+      .map((entry) => ({ ...entry, attentionUnread: memberId !== undefined && entry.attentionItem && !this.attentionReviews.has(`${entry.id}\u0000${memberId}`) }));
+    const page = pageFromEntries(entries, query, this.cursorSecret, memberId);
+    return memberId ? { ...page, unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) } : page;
   }
 
   async getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null> {
     const entry = this.entries.get(id);
     return entry?.workspaceId === workspaceId ? cloneEntry(entry) : null;
+  }
+
+  async unreadAttentionCount(workspaceId: string, memberId: string): Promise<number> {
+    return [...this.entries.values()].filter((entry) => entry.workspaceId === workspaceId && entry.attentionItem && !this.attentionReviews.has(`${entry.id}\u0000${memberId}`)).length;
+  }
+
+  async reviewAttentionItem(workspaceId: string, memberId: string, entryId: string): Promise<AttentionReviewResult | null> {
+    const entry = this.entries.get(entryId);
+    if (!entry || entry.workspaceId !== workspaceId || !entry.attentionItem) return null;
+    const key = `${entryId}\u0000${memberId}`;
+    const reviewed = !this.attentionReviews.has(key);
+    this.attentionReviews.add(key);
+    return { entryId, reviewed, unreadCount: await this.unreadAttentionCount(workspaceId, memberId) };
   }
 
   async countObservations(workspaceId: string): Promise<number> {
@@ -641,6 +805,8 @@ type TimelineJoinRow = Readonly<{
   facts: Record<string, unknown>;
   observed_at: string | Date;
   ingestion_order: string | number;
+  attention_item?: boolean;
+  attention_unread?: boolean;
 }>;
 
 type CheckpointRow = Readonly<{
@@ -760,10 +926,12 @@ function timelineEntryFromRow(row: TimelineJoinRow): TimelineEntry {
     clusterId: row.entry_cluster_id,
     entryType: "observation",
     occurredAt: timestamp(row.occurred_at) ?? new Date(0).toISOString(),
-    attentionItem: observation.attention,
+    attentionItem: row.attention_item ?? observation.attention,
     attentionReason: observation.attentionReason,
     recoveryOf: observation.recoveryOf,
     observation,
+    attention: row.attention_item ?? observation.attention,
+    attentionUnread: row.attention_unread === true,
   };
 }
 
@@ -771,9 +939,12 @@ const timelineSelect = `
   SELECT t.id AS entry_id, t.workspace_id AS entry_workspace_id, t.cluster_id AS entry_cluster_id,
          t.entry_type, t.occurred_at, o.id AS observation_id, o.workspace_id, o.cluster_id,
          o.kind, o.source_identity, o.source_key, o.uid, o.name, o.namespace,
-         o.resource_version, o.facts, o.observed_at, o.ingestion_order
+         o.resource_version, o.facts, o.observed_at, o.ingestion_order,
+         (ai.entry_id IS NOT NULL) AS attention_item,
+         false AS attention_unread
     FROM tracegarden_timeline_entries t
-    JOIN tracegarden_observations o ON o.id = t.observation_id`;
+    JOIN tracegarden_observations o ON o.id = t.observation_id
+    LEFT JOIN tracegarden_attention_items ai ON ai.entry_id = t.id`;
 
 const observationSelect = `
   SELECT id, workspace_id, cluster_id, kind, source_identity, source_key, uid, name, namespace,
@@ -792,7 +963,9 @@ function checkpointFromRow(row: CheckpointRow): IngestionCheckpoint {
 }
 
 export class PostgresObservationStore implements TimelineStore {
-  constructor(private readonly poolProvider: PoolProvider) {}
+  constructor(private readonly poolProvider: PoolProvider, private readonly cursorSecret: string = DEFAULT_TIMELINE_CURSOR_SECRET) {
+    if (!cursorSecret.trim()) throw new Error("Timeline cursor secret is required");
+  }
 
   private async recordObservationInTransaction(
     client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
@@ -834,6 +1007,15 @@ export class PostgresObservationStore implements TimelineStore {
        ON CONFLICT (observation_id) DO NOTHING`,
       [randomUUID(), observation.workspaceId, observation.clusterId, observationId, storedObservation.observedAt],
     );
+    if (!duplicate && isAttentionObservation(observation)) {
+      await client.query(
+        `INSERT INTO tracegarden_attention_items (entry_id, workspace_id)
+         SELECT id, workspace_id FROM tracegarden_timeline_entries
+          WHERE observation_id = $1
+         ON CONFLICT (entry_id) DO NOTHING`,
+        [observationId],
+      );
+    }
     const result = await client.query<TimelineJoinRow>(`${timelineSelect} WHERE t.observation_id = $1`, [observationId]);
     const row = result.rows[0];
     if (!row) throw new Error("Timeline persistence returned no row");
@@ -1009,21 +1191,52 @@ export class PostgresObservationStore implements TimelineStore {
     }
   }
 
-  async listTimelineEntries(workspaceId: string, query: TimelineQuery): Promise<TimelinePage> {
-    const cursor = query.cursor ? decodeTimelineCursor(query.cursor) : null;
+  async listTimelineEntries(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<TimelinePage> {
+    if (query.unread !== undefined && memberId === undefined) {
+      throw new TimelineQueryValidationError(["member is required for unread Attention filtering"]);
+    }
+    const cursor = query.cursor ? decodeTimelineCursor(query.cursor, query, this.cursorSecret, memberId) : null;
     const pool = await this.poolProvider();
     const values: unknown[] = [workspaceId];
     let condition = "t.workspace_id = $1";
+    let joins = " LEFT JOIN tracegarden_attention_reviews ar ON false";
+    if (memberId !== undefined) {
+      values.push(memberId);
+      joins = ` LEFT JOIN tracegarden_attention_reviews ar ON ar.entry_id = ai.entry_id AND ar.member_id = $${values.length}`;
+    }
     if (cursor) {
       values.push(cursor.occurredAt, cursor.id);
       condition += ` AND (t.occurred_at, t.id) > ($${values.length - 1}::timestamptz, $${values.length})`;
     }
+    if (query.kind) {
+      values.push(query.kind);
+      condition += ` AND o.kind = $${values.length}`;
+    }
+    if (query.namespace) {
+      values.push(query.namespace);
+      condition += ` AND o.namespace = $${values.length}`;
+    }
+    if (query.name) {
+      values.push(query.name);
+      condition += ` AND o.name = $${values.length}`;
+    }
+    if (query.state) {
+      values.push(query.state);
+      condition += ` AND o.facts->>'phase' = $${values.length}`;
+    }
+    if (query.attention !== undefined) condition += query.attention ? " AND ai.entry_id IS NOT NULL" : " AND ai.entry_id IS NULL";
+    if (query.unread !== undefined) condition += query.unread ? " AND ai.entry_id IS NOT NULL AND ar.entry_id IS NULL" : " AND (ai.entry_id IS NULL OR ar.entry_id IS NOT NULL)";
     values.push(query.limit + 1);
-    const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE ${condition} ORDER BY t.occurred_at, t.id LIMIT $${values.length}`, values);
+    const attentionUnreadSelect = memberId === undefined
+      ? "false AS attention_unread"
+      : "(ai.entry_id IS NOT NULL AND ar.entry_id IS NULL) AS attention_unread";
+    const listSelect = timelineSelect.replace("         false AS attention_unread", `         ${attentionUnreadSelect}`) + joins;
+    const result = await pool.query<TimelineJoinRow>(`${listSelect} WHERE ${condition} ORDER BY t.occurred_at, t.id LIMIT $${values.length}`, values);
     const entries = result.rows.slice(0, query.limit).map(timelineEntryFromRow);
     return {
       entries,
-      nextCursor: result.rows.length > query.limit && entries.length > 0 ? encodeTimelineCursor(entries[entries.length - 1] as TimelineEntry) : null,
+      nextCursor: result.rows.length > query.limit && entries.length > 0 ? encodeTimelineCursor(entries[entries.length - 1] as TimelineEntry, query, this.cursorSecret, memberId) : null,
+      ...(memberId === undefined ? {} : { unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) }),
     };
   }
 
@@ -1031,6 +1244,58 @@ export class PostgresObservationStore implements TimelineStore {
     const pool = await this.poolProvider();
     const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.workspace_id = $1 AND t.id = $2`, [workspaceId, id]);
     return result.rows[0] ? timelineEntryFromRow(result.rows[0]) : null;
+  }
+
+  async unreadAttentionCount(workspaceId: string, memberId: string): Promise<number> {
+    const pool = await this.poolProvider();
+    const result = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM tracegarden_attention_items ai
+         JOIN tracegarden_timeline_entries t ON t.id = ai.entry_id
+        WHERE ai.workspace_id = $1
+          AND NOT EXISTS (SELECT 1 FROM tracegarden_attention_reviews ar WHERE ar.entry_id = ai.entry_id AND ar.member_id = $2)`,
+      [workspaceId, memberId],
+    );
+    return Number(result.rows[0]?.count ?? "0");
+  }
+
+  async reviewAttentionItem(workspaceId: string, memberId: string, entryId: string): Promise<AttentionReviewResult | null> {
+    if (!workspaceId.trim() || !memberId.trim() || !entryId.trim()) throw new Error("Attention review identifiers are required");
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const item = await client.query<{ entry_id: string }>(
+        `SELECT ai.entry_id
+           FROM tracegarden_attention_items ai
+           JOIN tracegarden_timeline_entries t ON t.id = ai.entry_id
+          WHERE ai.workspace_id = $1 AND t.workspace_id = $1 AND ai.entry_id = $2`,
+        [workspaceId, entryId],
+      );
+      if (!item.rows[0]) {
+        await client.query("COMMIT");
+        return null;
+      }
+      const reviewed = await client.query(
+        `INSERT INTO tracegarden_attention_reviews (entry_id, member_id)
+         VALUES ($1, $2) ON CONFLICT (entry_id, member_id) DO NOTHING`,
+        [entryId, memberId],
+      );
+      const count = await client.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM tracegarden_attention_items ai
+          WHERE ai.workspace_id = $1
+            AND NOT EXISTS (SELECT 1 FROM tracegarden_attention_reviews ar WHERE ar.entry_id = ai.entry_id AND ar.member_id = $2)`,
+        [workspaceId, memberId],
+      );
+      await client.query("COMMIT");
+      return { entryId, reviewed: reviewed.rowCount === 1, unreadCount: Number(count.rows[0]?.count ?? "0") };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw new Error("Tracegarden Attention review failed", { cause: error });
+    } finally {
+      client.release();
+    }
   }
 
   async countObservations(workspaceId: string): Promise<number> {
@@ -1449,11 +1714,16 @@ export class PostgresDatabase implements DatabaseBoundary {
   readonly clusterScope: ClusterScopeStore;
   readonly timeline: TimelineStore;
 
-  constructor(private readonly connectionString: string, bootstrapIdentity: BootstrapIdentity = DEFAULT_LOCAL_BOOTSTRAP) {
+  constructor(
+    private readonly connectionString: string,
+    bootstrapIdentity: BootstrapIdentity = DEFAULT_LOCAL_BOOTSTRAP,
+    cursorSecret: string = DEFAULT_TIMELINE_CURSOR_SECRET,
+  ) {
+    if (!cursorSecret.trim()) throw new Error("Timeline cursor secret is required");
     const poolProvider = () => this.getPool();
     this.admission = new PostgresAdmissionStore(poolProvider, bootstrapIdentity);
     this.clusterScope = new PostgresClusterScopeStore(poolProvider);
-    this.timeline = new PostgresObservationStore(poolProvider);
+    this.timeline = new PostgresObservationStore(poolProvider, cursorSecret);
   }
 
   private async getPool(): Promise<Pool> {
@@ -1576,5 +1846,9 @@ export function createDatabase(environment: Record<string, string | undefined>):
     throw new Error("DATABASE_URL is required; use DATABASE_MODE=memory only for local smoke tests");
   }
   const bootstrapIdentity = environment.NODE_ENV === "production" ? configuredBootstrapIdentity(environment) : DEFAULT_LOCAL_BOOTSTRAP;
-  return new PostgresDatabase(connectionString, bootstrapIdentity);
+  const cursorSecret = environment.TIMELINE_CURSOR_SECRET?.trim();
+  if (environment.NODE_ENV === "production" && !cursorSecret) {
+    throw new Error("TIMELINE_CURSOR_SECRET is required in production");
+  }
+  return new PostgresDatabase(connectionString, bootstrapIdentity, cursorSecret ?? DEFAULT_TIMELINE_CURSOR_SECRET);
 }

@@ -77,6 +77,29 @@ export type Messages = Readonly<{
   resourceKindJob: string;
   resourceKindCronJob: string;
   resourceKindEvent: string;
+  timelineStatePending: string;
+  timelineStateRunning: string;
+  timelineStateSucceeded: string;
+  timelineStateFailed: string;
+  timelineStateUnknown: string;
+  timelineNamespace: string;
+  timelineName: string;
+  timelineState: string;
+  timelineAllStates: string;
+  timelineAttention: string;
+  timelineAllAttention: string;
+  timelineAttentionOnly: string;
+  timelineUnreadOnly: string;
+  filterTimeline: string;
+  attentionUnread: string;
+  reviewAttention: string;
+  attentionReviewed: string;
+  unreadAttentionCount: string;
+  nextTimelinePage: string;
+  timelineInvalid: string;
+  attentionReviewUnavailable: string;
+  attentionReviewInvalid: string;
+  attentionNotFound: string;
   recentLogsTitle: string;
   recentLogsDescription: string;
   logCluster: string;
@@ -180,6 +203,29 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     resourceKindJob: "Job",
     resourceKindCronJob: "CronJob",
     resourceKindEvent: "Event",
+    timelineStatePending: "待处理",
+    timelineStateRunning: "运行中",
+    timelineStateSucceeded: "已成功",
+    timelineStateFailed: "失败",
+    timelineStateUnknown: "未知",
+    timelineNamespace: "命名空间",
+    timelineName: "资源名称",
+    timelineState: "状态",
+    timelineAllStates: "全部状态",
+    timelineAttention: "待关注项",
+    timelineAllAttention: "全部条目",
+    timelineAttentionOnly: "仅待关注项",
+    timelineUnreadOnly: "仅未读待关注项",
+    filterTimeline: "筛选 Timeline",
+    attentionUnread: "未读",
+    reviewAttention: "标记为已查看",
+    attentionReviewed: "已标记为已查看。",
+    unreadAttentionCount: "未读待关注项",
+    nextTimelinePage: "下一页",
+    timelineInvalid: "Timeline 筛选或游标无效。",
+    attentionReviewUnavailable: "待关注项 review 当前不可用。",
+    attentionReviewInvalid: "待关注项 review 请求无效。",
+    attentionNotFound: "待关注项不存在。",
     recentLogsTitle: "Recent Log Window",
     recentLogsDescription: "Owner 可以通过独立的 Kubernetes 身份查看一个 Pod 容器的有限近期日志。日志不会被 Tracegarden 保存。",
     logCluster: "Cluster ID",
@@ -281,6 +327,29 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     resourceKindJob: "Job",
     resourceKindCronJob: "CronJob",
     resourceKindEvent: "Event",
+    timelineStatePending: "Pending",
+    timelineStateRunning: "Running",
+    timelineStateSucceeded: "Succeeded",
+    timelineStateFailed: "Failed",
+    timelineStateUnknown: "Unknown",
+    timelineNamespace: "Namespace",
+    timelineName: "Resource name",
+    timelineState: "State",
+    timelineAllStates: "All states",
+    timelineAttention: "Attention Item",
+    timelineAllAttention: "All entries",
+    timelineAttentionOnly: "Attention Items only",
+    timelineUnreadOnly: "Unread Attention Items only",
+    filterTimeline: "Filter Timeline",
+    attentionUnread: "Unread",
+    reviewAttention: "Mark reviewed",
+    attentionReviewed: "Marked reviewed.",
+    unreadAttentionCount: "Unread Attention Items",
+    nextTimelinePage: "Next page",
+    timelineInvalid: "The Timeline filter or cursor is invalid.",
+    attentionReviewUnavailable: "Attention Item review is currently unavailable.",
+    attentionReviewInvalid: "The Attention Item review request is invalid.",
+    attentionNotFound: "The Attention Item was not found.",
     recentLogsTitle: "Recent Log Window",
     recentLogsDescription: "The owner can view a bounded recent window for one Pod container through a separate Kubernetes identity. Tracegarden never saves log bodies.",
     logCluster: "Cluster ID",

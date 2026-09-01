@@ -3,6 +3,7 @@ const failures = [];
 if (major !== 26 || minor !== 8) failures.push(`Node.js 26.8.x is required (found ${process.version})`);
 if (process.env.NODE_ENV === "production" && !process.env.DATABASE_URL) failures.push("DATABASE_URL is required in production");
 if (process.env.NODE_ENV === "production" && (!process.env.BETTER_AUTH_SECRET?.trim() || !process.env.BETTER_AUTH_URL?.trim())) failures.push("BETTER_AUTH_SECRET and BETTER_AUTH_URL are required in production");
+if (process.env.NODE_ENV === "production" && !process.env.TIMELINE_CURSOR_SECRET?.trim()) failures.push("TIMELINE_CURSOR_SECRET is required in production");
 if (process.env.NODE_ENV === "production" && (!process.env.GOOGLE_CLIENT_ID?.trim() || !process.env.GOOGLE_CLIENT_SECRET?.trim() || !process.env.GOOGLE_REDIRECT_URI?.trim())) {
   failures.push("GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI are required in production");
 }

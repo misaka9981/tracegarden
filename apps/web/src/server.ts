@@ -8,6 +8,8 @@ import {
   TimelineQueryValidationError,
   type DatabaseBoundary,
   type TimelineEntry,
+  type TimelinePage,
+  type TimelineQuery,
   type TimelineStore,
 } from "../../../packages/db/src/index.js";
 import {
@@ -271,14 +273,42 @@ function attentionReasonLabel(entry: TimelineEntry, messages: Messages): string 
   return entry.attentionReason ? messages.attentionReasonLabels[entry.attentionReason] ?? messages.timelineUnknownState : messages.timelineUnknownState;
 }
 
-function renderTimelineSection(messages: Messages, entries: readonly TimelineEntry[]): string {
-  const rows = entries.map((entry) => {
+function timelineQueryValue(query: TimelineQuery, field: "namespace" | "name" | "state"): string {
+  return query[field] ?? "";
+}
+
+function timelineStateLabel(messages: Messages, state: string): string {
+  return ({
+    Pending: messages.timelineStatePending,
+    Running: messages.timelineStateRunning,
+    Succeeded: messages.timelineStateSucceeded,
+    Failed: messages.timelineStateFailed,
+    Unknown: messages.timelineStateUnknown,
+  } as Readonly<Record<string, string>>)[state] ?? state;
+}
+
+function timelineNextPageUrl(language: Language, query: TimelineQuery, cursor: string): string {
+  const params = new URLSearchParams({ lang: language, limit: String(query.limit), cursor });
+  if (query.kind) params.set("kind", query.kind);
+  if (query.namespace) params.set("namespace", query.namespace);
+  if (query.name) params.set("name", query.name);
+  if (query.state) params.set("state", query.state);
+  if (query.attention !== undefined) params.set("attention", String(query.attention));
+  if (query.unread !== undefined) params.set("unread", String(query.unread));
+  return `/app?${params.toString()}`;
+}
+
+function renderTimelineSection(language: Language, messages: Messages, page: TimelinePage, query: TimelineQuery, reviewed = false): string {
+  const rows = page.entries.map((entry) => {
     const observation = entry.observation;
     const owners = (observation.ownerReferences ?? []).map((owner) => `${owner.kind}/${owner.name}`).join(", ");
+    const attention = entry.attentionItem
+      ? `<p><strong>${escapeHtml(messages.attentionItem)}</strong> ${entry.attentionUnread ? escapeHtml(messages.attentionUnread) : escapeHtml(messages.attentionReviewed)}</p>${entry.attentionUnread ? `<form method="post" action="/timeline/entries/${encodeURIComponent(entry.id)}/review?lang=${language}"><button type="submit">${escapeHtml(messages.reviewAttention)}</button></form>` : ""}`
+      : "";
     return `<article data-entry-id="${escapeHtml(entry.id)}">
         <h3>${escapeHtml(resourceKindLabel(observation.kind, messages))} · ${escapeHtml(observationStateLabel(entry, messages))}</h3>
         <p>${escapeHtml(observation.namespace)}/${escapeHtml(observation.name)} · ${escapeHtml(observationDetail(entry, messages))}</p>
-        ${entry.attentionItem ? `<p class="error"><strong>${escapeHtml(messages.attentionItem)}:</strong> ${escapeHtml(attentionReasonLabel(entry, messages))}</p>` : ""}
+        ${attention}
         ${entry.recoveryOf || observation.classification === "recovery" ? `<p class="notice">${escapeHtml(messages.recovery)}</p>` : ""}
         <dl>
           <dt>${escapeHtml(messages.clusterName)}</dt><dd>${escapeHtml(entry.clusterId)}</dd>
@@ -289,10 +319,27 @@ function renderTimelineSection(messages: Messages, entries: readonly TimelineEnt
         </dl>
       </article>`;
   }).join("");
+  const next = page.nextCursor ? `<p><a href="${escapeHtml(timelineNextPageUrl(language, query, page.nextCursor))}">${escapeHtml(messages.nextTimelinePage)}</a></p>` : "";
+  const attentionFilter = query.unread ? "unread" : query.attention ? "attention" : "";
   return `<section aria-labelledby="timeline-title">
       <h2 id="timeline-title">${escapeHtml(messages.timelineTitle)}</h2>
       <p>${escapeHtml(messages.timelineDescription)}</p>
+      ${reviewed ? `<p class="notice" role="status">${escapeHtml(messages.attentionReviewed)}</p>` : ""}
+      ${page.unreadAttentionCount === undefined ? "" : `<p class="notice" data-unread-attention-count="true">${escapeHtml(messages.unreadAttentionCount)}: ${page.unreadAttentionCount}</p>`}
+      <form method="get" action="/app">
+        <input type="hidden" name="lang" value="${language}">
+        <label for="timeline-namespace">${escapeHtml(messages.timelineNamespace)}</label>
+        <input id="timeline-namespace" name="namespace" value="${escapeHtml(timelineQueryValue(query, "namespace"))}" maxlength="63">
+        <label for="timeline-name">${escapeHtml(messages.timelineName)}</label>
+        <input id="timeline-name" name="name" value="${escapeHtml(timelineQueryValue(query, "name"))}" maxlength="253">
+        <label for="timeline-state">${escapeHtml(messages.timelineState)}</label>
+        <select id="timeline-state" name="state"><option value="">${escapeHtml(messages.timelineAllStates)}</option>${["Pending", "Running", "Succeeded", "Failed", "Unknown"].map((stateValue) => `<option value="${stateValue}"${query.state === stateValue ? " selected" : ""}>${escapeHtml(timelineStateLabel(messages, stateValue))}</option>`).join("")}</select>
+        <label for="timeline-attention">${escapeHtml(messages.timelineAttention)}</label>
+        <select id="timeline-attention" name="attention"><option value="">${escapeHtml(messages.timelineAllAttention)}</option><option value="true"${attentionFilter === "attention" ? " selected" : ""}>${escapeHtml(messages.timelineAttentionOnly)}</option><option value="unread"${attentionFilter === "unread" ? " selected" : ""}>${escapeHtml(messages.timelineUnreadOnly)}</option></select>
+        <button type="submit">${escapeHtml(messages.filterTimeline)}</button>
+      </form>
       ${rows || `<p>${escapeHtml(messages.noTimelineEntries)}</p>`}
+      ${next}
     </section>`;
 }
 
@@ -300,8 +347,10 @@ export function renderApplicationPage(
   language: Language,
   session: AuthenticatedSession,
   scope: ClusterScope | null = null,
-  feedback?: Readonly<{ saved?: boolean; error?: string; logResult?: RecentLogWindow; logError?: string }>,
+  feedback?: Readonly<{ saved?: boolean; error?: string; logResult?: RecentLogWindow; logError?: string; attentionReviewed?: boolean }>,
   timelineEntries: readonly TimelineEntry[] = [],
+  timelinePage?: TimelinePage,
+  timelineQuery?: TimelineQuery,
 ): string {
   const messages = messagesFor(language);
   const member = session.member;
@@ -327,7 +376,7 @@ export function renderApplicationPage(
       <ul class="capabilities">${capabilityList}</ul>
       ${membershipLink}
       ${renderClusterSection(language, messages, member, scope, feedback)}
-      ${hasCapability(member, capabilities.timelineRead) ? renderTimelineSection(messages, timelineEntries) : ""}
+      ${hasCapability(member, capabilities.timelineRead) ? renderTimelineSection(language, messages, timelinePage ?? { entries: timelineEntries, nextCursor: null }, timelineQuery ?? { limit: 100 }, feedback?.attentionReviewed) : ""}
       ${renderRecentLogsSection(language, messages, member, scope, feedback)}
       <form method="post" action="/auth/logout?lang=${language}">
         <button type="submit">${escapeHtml(messages.signOut)}</button>
@@ -581,6 +630,10 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   if (environment.NODE_ENV === "production" && database.kind === "memory") {
     throw new Error("Memory database is not allowed in production");
   }
+  if (environment.NODE_ENV === "production" && !environment.TIMELINE_CURSOR_SECRET?.trim()) {
+    await database.close();
+    throw new Error("TIMELINE_CURSOR_SECRET is required in production");
+  }
   const identityAdapter = options.identityAdapter ?? createIdentityAdapter(environment);
   const logAdapter = options.logAdapter ?? createKubernetesLogAdapter(environment);
   if (environment.NODE_ENV === "production" && options.logAdapter) {
@@ -597,6 +650,10 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     if (options.clusterScopeStore || !database.clusterScope) {
       await database.close();
       throw new Error("Production Cluster scope must use the database-owned durable store");
+    }
+    if (options.timelineStore || !database.timeline) {
+      await database.close();
+      throw new Error("Production Timeline must use the database-owned durable store");
     }
     admissionStore = database.admission;
     clusterScopeStore = database.clusterScope;
@@ -733,6 +790,20 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     tail: Number(form.get("tail") ?? ""),
   });
 
+  const timelineQueryInput = (url: URL, allowInternalFlash = false): Record<string, unknown> => {
+    const attention = url.searchParams.get("attention");
+    return {
+      ...(url.searchParams.get("limit") === null ? {} : { limit: url.searchParams.get("limit") }),
+      ...(url.searchParams.get("cursor") === null ? {} : { cursor: url.searchParams.get("cursor") }),
+      ...(url.searchParams.get("kind") === null ? {} : { kind: url.searchParams.get("kind") }),
+      ...(url.searchParams.get("namespace") === null ? {} : { namespace: url.searchParams.get("namespace") }),
+      ...(url.searchParams.get("name") === null ? {} : { name: url.searchParams.get("name") }),
+      ...(url.searchParams.get("state") !== null ? { state: url.searchParams.get("state") } : url.searchParams.get("phase") === null ? {} : { phase: url.searchParams.get("phase") }),
+      ...(attention === null || attention === "" || (allowInternalFlash && attention === "reviewed") ? {} : { attention: attention === "unread" ? "true" : attention, ...(attention === "unread" ? { unread: "true" } : {}) }),
+      ...(url.searchParams.get("unread") === null ? {} : { unread: url.searchParams.get("unread") }),
+    };
+  };
+
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
     void (async () => {
       const requestUrl = new URL(request.url ?? "/", "http://localhost");
@@ -846,11 +917,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           return;
         }
         try {
-          const query = parseTimelineQuery({
-            ...(requestUrl.searchParams.get("limit") === null ? {} : { limit: requestUrl.searchParams.get("limit") }),
-            ...(requestUrl.searchParams.get("cursor") === null ? {} : { cursor: requestUrl.searchParams.get("cursor") }),
-          });
-          sendJson(response, 200, await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, query));
+          const query = parseTimelineQuery(timelineQueryInput(requestUrl));
+          sendJson(response, 200, await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, query, lookup.session.member.id));
         } catch (error: unknown) {
           if (error instanceof TimelineQueryValidationError) {
             sendJson(response, 400, { error: "invalid_timeline_query", issues: error.issues });
@@ -858,6 +926,44 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           }
           throw error;
         }
+        return;
+      }
+      const attentionReviewMatch = requestUrl.pathname.match(/^\/api\/timeline\/entries\/([^/]+)\/review$/);
+      if (attentionReviewMatch) {
+        const lookup = await sessionForRequest(request);
+        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (!hasTimelineAccess(lookup.session)) {
+          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
+          return;
+        }
+        if (method !== "POST") {
+          sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        if (!timelineStore?.reviewAttentionItem) {
+          sendJson(response, 503, { error: "attention_store_unavailable" });
+          return;
+        }
+        let entryId: string;
+        try {
+          entryId = decodeURIComponent(attentionReviewMatch[1] ?? "");
+        } catch {
+          sendJson(response, 400, { error: "invalid_attention_review" });
+          return;
+        }
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(entryId)) {
+          sendJson(response, 400, { error: "invalid_attention_review" });
+          return;
+        }
+        const result = await timelineStore.reviewAttentionItem(lookup.session.member.workspaceId, lookup.session.member.id, entryId);
+        if (!result) {
+          sendJson(response, 404, { error: "attention_item_not_found" });
+          return;
+        }
+        sendJson(response, 200, result);
         return;
       }
       if (requestUrl.pathname === "/api/logs/recent") {
@@ -957,6 +1063,54 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
             logError: error instanceof RecentLogWindowValidationError ? messages.recentLogsInvalid : messages.recentLogsUnavailable,
           }));
         }
+        return;
+      }
+      const attentionReviewPageMatch = requestUrl.pathname.match(/^\/timeline\/entries\/([^/]+)\/review$/);
+      if (attentionReviewPageMatch && method === "POST") {
+        const lookup = await sessionForRequest(request);
+        const messages = messagesFor(language);
+        if (!lookup.session) {
+          response.statusCode = lookup.rejection ? 403 : 302;
+          if (lookup.rejection) {
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderRejectionPage(language, lookup.rejection));
+          } else {
+            response.setHeader("location", `/?lang=${language}`);
+            response.end();
+          }
+          return;
+        }
+        const scope = await scopeForSession(lookup.session);
+        if (!hasTimelineAccess(lookup.session)) {
+          response.statusCode = 403;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.attentionReviewInvalid }));
+          return;
+        }
+        if (!timelineStore?.reviewAttentionItem) {
+          response.statusCode = 503;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.attentionReviewUnavailable }));
+          return;
+        }
+        let entryId = "";
+        try { entryId = decodeURIComponent(attentionReviewPageMatch[1] ?? ""); } catch { /* invalid id handled below */ }
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(entryId)) {
+          response.statusCode = 400;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.attentionReviewInvalid }));
+          return;
+        }
+        const result = await timelineStore.reviewAttentionItem(lookup.session.member.workspaceId, lookup.session.member.id, entryId);
+        if (!result) {
+          response.statusCode = 404;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.attentionNotFound }));
+          return;
+        }
+        response.statusCode = 303;
+        response.setHeader("location", `/app?lang=${language}&attention=reviewed`);
+        response.end();
         return;
       }
       if (requestUrl.pathname === "/api/cluster" || requestUrl.pathname === "/api/cluster/scope") {
@@ -1225,14 +1379,34 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           response.end(renderRejectionPage(language, "admission_required"));
           return;
         }
-        const timelineEntries = timelineStore && hasTimelineAccess(lookup.session)
-          ? (await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, { limit: 100 })).entries
-          : [];
+        let timelineQuery: TimelineQuery;
+        try {
+          timelineQuery = parseTimelineQuery(timelineQueryInput(requestUrl, true));
+        } catch (error: unknown) {
+          if (!(error instanceof TimelineQueryValidationError)) throw error;
+          response.statusCode = 400;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
+          return;
+        }
+        let timelinePage: TimelinePage;
+        try {
+          timelinePage = timelineStore && hasTimelineAccess(lookup.session)
+            ? await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, timelineQuery, lookup.session.member.id)
+            : { entries: [], nextCursor: null };
+        } catch (error: unknown) {
+          if (!(error instanceof TimelineQueryValidationError)) throw error;
+          response.statusCode = 400;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
+          return;
+        }
         response.statusCode = 200;
         response.setHeader("content-type", "text/html; charset=utf-8");
         response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
           saved: requestUrl.searchParams.get("cluster") === "saved",
-        }, timelineEntries));
+          attentionReviewed: requestUrl.searchParams.get("attention") === "reviewed",
+        }, timelinePage.entries, timelinePage, timelineQuery));
         return;
       }
       if (requestUrl.pathname === "/") {
@@ -1248,10 +1422,29 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           response.end(renderRejectionPage(language, "admission_required"));
         } else {
           if (lookup.session) {
-            const timelineEntries = timelineStore && hasTimelineAccess(lookup.session)
-              ? (await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, { limit: 100 })).entries
-              : [];
-            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), undefined, timelineEntries));
+            let timelineQuery: TimelineQuery;
+            try {
+              timelineQuery = parseTimelineQuery(timelineQueryInput(requestUrl, true));
+            } catch (error: unknown) {
+              if (!(error instanceof TimelineQueryValidationError)) throw error;
+              response.statusCode = 400;
+              response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
+              return;
+            }
+            let timelinePage: TimelinePage;
+            try {
+              timelinePage = timelineStore && hasTimelineAccess(lookup.session)
+                ? await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, timelineQuery, lookup.session.member.id)
+                : { entries: [], nextCursor: null };
+            } catch (error: unknown) {
+              if (!(error instanceof TimelineQueryValidationError)) throw error;
+              response.statusCode = 400;
+              response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
+              return;
+            }
+            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
+              attentionReviewed: requestUrl.searchParams.get("attention") === "reviewed",
+            }, timelinePage.entries, timelinePage, timelineQuery));
           } else {
             response.end(renderLoginPage(language, current.checks.database === "ready", identityAdapter));
           }

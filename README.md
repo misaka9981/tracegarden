@@ -26,7 +26,7 @@ NODE_ENV=test DATABASE_MODE=memory pnpm start
 
 For PostgreSQL-backed development, copy `.env.example`, start `postgres:18.3-alpine` with `docker compose up -d postgres`, and run the web process with `DATABASE_URL` set. `pnpm db:migrate` applies the repository-owned migration after a build. The web process applies migrations before listening; a migration or readiness failure exits without serving requests. Start the independent collector with `DATABASE_URL` set; it applies migrations and performs its initial scoped collection before reporting ready. Without explicit Kubernetes settings its adapter remains inert and does not contact a Cluster.
 
-`pnpm env:check` requires Node.js 26.8.x and validates production database configuration. The current development host may report this check as unavailable until Node 26 is installed.
+`pnpm env:check` requires Node.js 26.8.x and validates production database and `TIMELINE_CURSOR_SECRET` configuration. The current development host may report this check as unavailable until Node 26 is installed.
 
 ## Agreed baseline
 

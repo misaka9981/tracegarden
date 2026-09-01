@@ -67,7 +67,13 @@ declare module "node:assert/strict" {
 }
 
 declare module "node:crypto" {
+  export interface Hmac {
+    update(data: string): Hmac;
+    digest(): Uint8Array;
+  }
+  export function createHmac(algorithm: string, key: string): Hmac;
   export function randomUUID(): string;
+  export function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean;
 }
 
 declare module "pg" {

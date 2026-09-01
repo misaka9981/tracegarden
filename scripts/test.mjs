@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../dist/apps/web/src/server.js";
-import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore } from "../dist/packages/db/src/index.js";
+import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
 import {
@@ -126,6 +126,7 @@ const productionRuntime = await createWebRuntime({
     kind: "postgres",
     admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "test-google-subject" }),
     clusterScope: new MemoryClusterScopeStore(),
+    timeline: new MemoryObservationStore("production-test-cursor-secret"),
     migrate: async () => {},
     ping: async () => true,
     close: async () => {},
@@ -142,6 +143,7 @@ const productionRuntime = await createWebRuntime({
     GOOGLE_CLIENT_SECRET: "test-secret",
     GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
     BETTER_AUTH_SECRET: "test-secret-secret",
+    TIMELINE_CURSOR_SECRET: "test-timeline-cursor-secret",
     BETTER_AUTH_URL: "https://tracegarden.test",
     TRACEGARDEN_BOOTSTRAP_ISSUER: GOOGLE_ISSUER,
     TRACEGARDEN_BOOTSTRAP_SUBJECT: "test-google-subject",
@@ -165,6 +167,55 @@ try {
 }
 await assert.rejects(
   createWebRuntime({
+    database: {
+      kind: "postgres",
+      admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "test-google-subject" }),
+      clusterScope: new MemoryClusterScopeStore(),
+      migrate: async () => {},
+      ping: async () => true,
+      close: async () => {},
+    },
+    timelineStore: new MemoryObservationStore("injected-test-cursor-secret"),
+    environment: {
+      NODE_ENV: "production",
+      GOOGLE_CLIENT_ID: "test-client",
+      GOOGLE_CLIENT_SECRET: "test-secret",
+      GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
+      BETTER_AUTH_SECRET: "test-secret-secret",
+      TIMELINE_CURSOR_SECRET: "test-timeline-cursor-secret",
+      BETTER_AUTH_URL: "https://tracegarden.test",
+      TRACEGARDEN_BOOTSTRAP_ISSUER: GOOGLE_ISSUER,
+      TRACEGARDEN_BOOTSTRAP_SUBJECT: "test-google-subject",
+    },
+  }),
+  /Production Timeline must use the database-owned durable store/,
+);
+await assert.rejects(
+  createWebRuntime({
+    database: {
+      kind: "postgres",
+      admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "missing-timeline" }),
+      clusterScope: new MemoryClusterScopeStore(),
+      migrate: async () => {},
+      ping: async () => true,
+      close: async () => {},
+    },
+    environment: {
+      NODE_ENV: "production",
+      GOOGLE_CLIENT_ID: "test-client",
+      GOOGLE_CLIENT_SECRET: "test-secret",
+      GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
+      BETTER_AUTH_SECRET: "test-secret-secret",
+      TIMELINE_CURSOR_SECRET: "test-timeline-cursor-secret",
+      BETTER_AUTH_URL: "https://tracegarden.test",
+      TRACEGARDEN_BOOTSTRAP_ISSUER: GOOGLE_ISSUER,
+      TRACEGARDEN_BOOTSTRAP_SUBJECT: "missing-timeline",
+    },
+  }),
+  /Production Timeline must use the database-owned durable store/,
+);
+await assert.rejects(
+  createWebRuntime({
     database: { kind: "postgres", migrate: async () => {}, ping: async () => true, close: async () => {} },
     environment: {
       NODE_ENV: "production",
@@ -172,6 +223,7 @@ await assert.rejects(
       GOOGLE_CLIENT_SECRET: "test-secret",
       GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
       BETTER_AUTH_SECRET: "test-secret-secret",
+      TIMELINE_CURSOR_SECRET: "test-timeline-cursor-secret",
       BETTER_AUTH_URL: "https://tracegarden.test",
       TRACEGARDEN_BOOTSTRAP_ISSUER: GOOGLE_ISSUER,
       TRACEGARDEN_BOOTSTRAP_SUBJECT: "google-subject",
@@ -196,6 +248,7 @@ await assert.rejects(
       GOOGLE_CLIENT_SECRET: "test-secret",
       GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
       BETTER_AUTH_SECRET: "test-secret-secret",
+      TIMELINE_CURSOR_SECRET: "test-timeline-cursor-secret",
       BETTER_AUTH_URL: "https://tracegarden.test",
       TRACEGARDEN_BOOTSTRAP_ISSUER: GOOGLE_ISSUER,
       TRACEGARDEN_BOOTSTRAP_SUBJECT: "google-subject",
@@ -233,6 +286,7 @@ const callbackRuntime = await createWebRuntime({
     kind: "postgres",
     admission: callbackAdmissionStore,
     clusterScope: new MemoryClusterScopeStore(),
+    timeline: new MemoryObservationStore("production-test-cursor-secret"),
     migrate: async () => {},
     ping: async () => true,
     close: async () => {},
@@ -244,6 +298,7 @@ const callbackRuntime = await createWebRuntime({
     GOOGLE_CLIENT_SECRET: "test-secret",
     GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
     BETTER_AUTH_SECRET: "test-secret-secret",
+    TIMELINE_CURSOR_SECRET: "test-timeline-cursor-secret",
     BETTER_AUTH_URL: "https://tracegarden.test",
     TRACEGARDEN_BOOTSTRAP_ISSUER: GOOGLE_ISSUER,
     TRACEGARDEN_BOOTSTRAP_SUBJECT: "google-subject",
@@ -269,6 +324,7 @@ await assert.rejects(
       kind: "postgres",
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" }),
       clusterScope: new MemoryClusterScopeStore(),
+      timeline: new MemoryObservationStore("production-test-cursor-secret"),
       migrate: async () => {},
       ping: async () => true,
       close: async () => {},
@@ -279,6 +335,7 @@ await assert.rejects(
       GOOGLE_CLIENT_SECRET: "test-secret",
       GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
       BETTER_AUTH_SECRET: "test-secret-secret",
+      TIMELINE_CURSOR_SECRET: "test-timeline-cursor-secret",
       BETTER_AUTH_URL: "http://127.0.0.1:43207",
       TRACEGARDEN_BOOTSTRAP_ISSUER: GOOGLE_ISSUER,
       TRACEGARDEN_BOOTSTRAP_SUBJECT: "google-subject",
@@ -522,6 +579,57 @@ try {
   assert.equal(duplicatePersist[0]?.duplicate, true);
   assert.equal(await memoryTimeline.countObservations("workspace-single"), 1);
   assert.equal(await memoryTimeline.countTimelineEntries("workspace-single"), 1);
+  const duplicateAttentionObservation = savedScope ? normalizePodObservation(savedScope, {
+    kind: "Pod",
+    metadata: { name: "in-scope", namespace: "tracegarden", uid: "pod-uid-1", resourceVersion: "1" },
+    status: { phase: "Pending", conditions: [{ type: "Ready", status: "False" }] },
+  }, "2099-01-01T00:00:00.000Z") : null;
+  const duplicateAttentionResult = duplicateAttentionObservation ? await memoryTimeline.recordObservation(duplicateAttentionObservation) : null;
+  assert.equal(duplicateAttentionResult?.duplicate, true);
+  assert.equal(duplicateAttentionResult?.entry.attention, false);
+  const attentionObservation = savedScope ? normalizePodObservation(savedScope, {
+    kind: "Pod",
+    metadata: { name: "pending-review", namespace: "tracegarden", uid: "pod-uid-review", resourceVersion: "2" },
+    status: { phase: "Pending", conditions: [{ type: "Ready", status: "False" }] },
+  }, "2099-01-01T00:00:00.000Z") : null;
+  const attentionResult = attentionObservation ? await memoryTimeline.recordObservation(attentionObservation) : null;
+  assert.equal(attentionResult?.entry.attention, true);
+  const memoryMemberlessPage = await memoryTimeline.listTimelineEntries("workspace-single", { limit: 100 });
+  assert.ok(memoryMemberlessPage.entries.some(({ attention }) => attention));
+  assert.ok(memoryMemberlessPage.entries.every(({ attentionUnread }) => !attentionUnread));
+  const memoryPage = await memoryTimeline.listTimelineEntries("workspace-single", { limit: 1 }, ownerActor.id);
+  assert.ok(memoryPage.nextCursor);
+  const memoryNextPage = await memoryTimeline.listTimelineEntries("workspace-single", { limit: 1, cursor: memoryPage.nextCursor }, ownerActor.id);
+  assert.equal(memoryNextPage.entries[0]?.observation.name, "pending-review");
+  if (memoryPage.nextCursor) {
+    const [encodedPayload, encodedSignature] = memoryPage.nextCursor.split(".");
+    assert.ok(encodedPayload && encodedSignature);
+    const alteredPayload = `${encodedPayload.slice(0, -1)}${encodedPayload.endsWith("A") ? "B" : "A"}`;
+    await assert.rejects(
+      memoryTimeline.listTimelineEntries("workspace-single", { limit: 1, cursor: `${alteredPayload}.${encodedSignature}` }, ownerActor.id),
+      (error) => error instanceof TimelineQueryValidationError,
+    );
+    const alteredSignature = `${encodedSignature.slice(0, -1)}${encodedSignature.endsWith("A") ? "B" : "A"}`;
+    await assert.rejects(
+      memoryTimeline.listTimelineEntries("workspace-single", { limit: 1, cursor: `${encodedPayload}.${alteredSignature}` }, ownerActor.id),
+      (error) => error instanceof TimelineQueryValidationError,
+    );
+    await assert.rejects(
+      memoryTimeline.listTimelineEntries("workspace-single", { limit: 1, cursor: memoryPage.nextCursor, namespace: "other" }, ownerActor.id),
+      (error) => error instanceof TimelineQueryValidationError,
+    );
+    if (invitedAdmission.admitted) {
+      await assert.rejects(
+        memoryTimeline.listTimelineEntries("workspace-single", { limit: 1, cursor: memoryPage.nextCursor }, invitedAdmission.session.member.id),
+        (error) => error instanceof TimelineQueryValidationError,
+      );
+    }
+  }
+  assert.equal(memoryNextPage.unreadAttentionCount, 1);
+  if (attentionResult) {
+    assert.deepEqual(await memoryTimeline.reviewAttentionItem("workspace-single", ownerActor.id, attentionResult.entry.id), { entryId: attentionResult.entry.id, reviewed: true, unreadCount: 0 });
+    assert.deepEqual(await memoryTimeline.reviewAttentionItem("workspace-single", ownerActor.id, attentionResult.entry.id), { entryId: attentionResult.entry.id, reviewed: false, unreadCount: 0 });
+  }
 } finally {
   await collectorWithPersistence.close();
 }
@@ -918,6 +1026,15 @@ try {
   productionMemoryRejected = true;
 }
 assert.equal(productionMemoryRejected, true);
+assert.throws(
+  () => createDatabase({
+    NODE_ENV: "production",
+    DATABASE_URL: "postgresql://tracegarden:local-only@127.0.0.1:5432/tracegarden",
+    TRACEGARDEN_BOOTSTRAP_ISSUER: GOOGLE_ISSUER,
+    TRACEGARDEN_BOOTSTRAP_SUBJECT: "bootstrap",
+  }),
+  /TIMELINE_CURSOR_SECRET is required in production/,
+);
 assert.throws(() => createDatabase({ DATABASE_MODE: "memory" }));
 await assert.rejects(
   createWebRuntime({ database: new MemoryDatabase(), environment: { NODE_ENV: "production" }, port: 0 }),

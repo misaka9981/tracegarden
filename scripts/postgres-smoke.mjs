@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createCollectorRuntime } from "../dist/apps/collector/src/main.js";
-import { DeterministicKubernetesAdapter, normalizeObservation } from "../dist/packages/cluster/src/index.js";
-import { PostgresDatabase } from "../dist/packages/db/src/index.js";
+import { DeterministicKubernetesAdapter, normalizeObservation, normalizePodObservation } from "../dist/packages/cluster/src/index.js";
+import { PostgresDatabase, TimelineQueryValidationError } from "../dist/packages/db/src/index.js";
 import { FakeKubernetesLogAdapter, requestRecentLogWindow } from "../dist/packages/logs/src/index.js";
 
 const name = `tracegarden-foundation-pg-${process.pid}`;
@@ -59,8 +59,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints');");
-  assert.equal(migrationCount, "9");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention');");
+  assert.equal(migrationCount, "10");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -223,6 +223,18 @@ try {
   assert.deepEqual(deploymentPersisted.map(({ observation }) => observation.classification), ["change", "attention", "recovery"]);
   assert.equal(deploymentPersisted[2].entry.recoveryOf, deploymentPersisted[1].observation.sourceKey);
   assert.equal(deploymentPersisted[1].observation.attentionReason, "deployment_replicas_unavailable");
+  const duplicateAttentionObservation = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "api", namespace: "tracegarden", uid: "pod-uid-1", resourceVersion: "7" },
+    status: { phase: "Pending", conditions: [{ type: "Ready", status: "False" }] },
+  }, "2099-09-01T00:00:00.000Z");
+  const duplicateAttentionResult = await collectorDatabase.timeline.recordObservation(duplicateAttentionObservation);
+  assert.equal(duplicateAttentionResult.duplicate, true);
+  assert.equal(duplicateAttentionResult.entry.attention, false);
+  assert.deepEqual(await collectorDatabase.timeline.listTimelineEntries("workspace-single", { limit: 10, name: "api" }), {
+    entries: [duplicateAttentionResult.entry],
+    nextCursor: null,
+  });
   docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "CREATE OR REPLACE FUNCTION tracegarden_test_fail_timeline() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'timeline write failed'; END; $$; CREATE TRIGGER tracegarden_test_fail_timeline BEFORE INSERT ON tracegarden_timeline_entries FOR EACH ROW EXECUTE FUNCTION tracegarden_test_fail_timeline();");
   const failingPodAdapter = new DeterministicKubernetesAdapter([{
     kind: "Pod",
@@ -323,6 +335,126 @@ try {
   assert.match(await timelinePage.text(), /Pod Observation/);
   const timelinePageChinese = await fetch(`http://127.0.0.1:${webPort}/app?lang=zh-CN`, { headers: { cookie: ownerCookie } });
   assert.match(await timelinePageChinese.text(), /已提交的 Kubernetes Observation 会出现在这里/);
+  const timelineStore = collectorDatabase.timeline;
+  const pendingObservation = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "pending", namespace: "tracegarden", uid: "pod-uid-pending", resourceVersion: "10" },
+    status: { phase: "Pending", conditions: [{ type: "Ready", status: "False", reason: "ContainersNotReady" }] },
+  }, "2099-10-01T00:00:01.000Z");
+  const firstHistory = await timelineStore.recordObservation(pendingObservation);
+  assert.equal(firstHistory.entry.attention, true);
+  const runningObservation = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "running-later", namespace: "tracegarden", uid: "pod-uid-later", resourceVersion: "11" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, "2099-10-01T00:00:02.000Z");
+  await timelineStore.recordObservation(runningObservation);
+  const historyPageOne = await timelineStore.listTimelineEntries("workspace-single", { limit: 1 }, sessionBody.member.id);
+  assert.equal(historyPageOne.entries.length, 1);
+  assert.ok(historyPageOne.nextCursor);
+  const historyPageTwo = await timelineStore.listTimelineEntries("workspace-single", { limit: 1, cursor: historyPageOne.nextCursor }, sessionBody.member.id);
+  assert.equal(historyPageTwo.entries.length, 1);
+  assert.notEqual(historyPageTwo.entries[0].id, historyPageOne.entries[0].id);
+  const historyCursor = historyPageOne.nextCursor;
+  assert.ok(historyCursor);
+  if (historyCursor) {
+    const [encodedPayload, encodedSignature] = historyCursor.split(".");
+    assert.ok(encodedPayload && encodedSignature);
+    const alteredPayload = `${encodedPayload.slice(0, -1)}${encodedPayload.endsWith("A") ? "B" : "A"}`;
+    await assert.rejects(
+      timelineStore.listTimelineEntries("workspace-single", { limit: 1, cursor: `${alteredPayload}.${encodedSignature}` }, sessionBody.member.id),
+      (error) => error instanceof TimelineQueryValidationError,
+    );
+    const alteredSignature = `${encodedSignature.slice(0, -1)}${encodedSignature.endsWith("A") ? "B" : "A"}`;
+    await assert.rejects(
+      timelineStore.listTimelineEntries("workspace-single", { limit: 1, cursor: `${encodedPayload}.${alteredSignature}` }, sessionBody.member.id),
+      (error) => error instanceof TimelineQueryValidationError,
+    );
+    await assert.rejects(
+      timelineStore.listTimelineEntries("workspace-single", { limit: 1, cursor: historyCursor, namespace: "different-namespace" }, sessionBody.member.id),
+      (error) => error instanceof TimelineQueryValidationError,
+    );
+    await assert.rejects(
+      timelineStore.listTimelineEntries("workspace-single", { limit: 1, cursor: historyCursor }, invitedSessionBody.member.id),
+      (error) => error instanceof TimelineQueryValidationError,
+    );
+  }
+  const insertedAfterBoundary = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "inserted-newer", namespace: "tracegarden", uid: "pod-uid-newer", resourceVersion: "12" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, "2099-10-01T00:00:03.000Z");
+  await timelineStore.recordObservation(insertedAfterBoundary);
+  const tieTimestamp = "2099-10-01T00:00:04.000Z";
+  const equalTimestampA = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "equal-a", namespace: "tracegarden", uid: "pod-uid-equal-a", resourceVersion: "13" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, tieTimestamp);
+  const equalTimestampB = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "equal-b", namespace: "tracegarden", uid: "pod-uid-equal-b", resourceVersion: "14" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, tieTimestamp);
+  const equalResultA = await timelineStore.recordObservation(equalTimestampA);
+  const equalResultB = await timelineStore.recordObservation(equalTimestampB);
+  const expectedEqualOrder = equalResultA.entry.id.localeCompare(equalResultB.entry.id) < 0 ? ["equal-a", "equal-b"] : ["equal-b", "equal-a"];
+  const traversedNames = [];
+  const traversedTimes = [];
+  let traversal = await timelineStore.listTimelineEntries("workspace-single", { limit: 1, namespace: "tracegarden" }, sessionBody.member.id);
+  while (true) {
+    const entry = traversal.entries[0];
+    if (!entry) break;
+    traversedNames.push(entry.observation.name);
+    traversedTimes.push(entry.occurredAt);
+    if (!traversal.nextCursor) break;
+    traversal = await timelineStore.listTimelineEntries("workspace-single", { limit: 1, namespace: "tracegarden", cursor: traversal.nextCursor }, sessionBody.member.id);
+  }
+  assert.equal(new Set(traversedNames).size, traversedNames.length);
+  assert.deepEqual(new Set(traversedNames), new Set(["api", "pending", "running-later", "inserted-newer", "equal-a", "equal-b"]));
+  const equalIndexes = [traversedNames.indexOf("equal-a"), traversedNames.indexOf("equal-b")].sort((left, right) => left - right);
+  assert.equal(equalIndexes[1] - equalIndexes[0], 1);
+  assert.deepEqual(traversedNames.slice(equalIndexes[0], equalIndexes[1] + 1), expectedEqualOrder);
+  assert.equal(traversedTimes[equalIndexes[0]], tieTimestamp);
+  assert.equal(traversedTimes[equalIndexes[1]], tieTimestamp);
+  const memberlessHistory = await timelineStore.listTimelineEntries("workspace-single", { limit: 10 });
+  assert.ok(memberlessHistory.entries.some(({ attention }) => attention));
+  assert.ok(memberlessHistory.entries.every(({ attentionUnread }) => !attentionUnread));
+  const historyPageTwoAgain = await timelineStore.listTimelineEntries("workspace-single", { limit: 1, cursor: historyPageOne.nextCursor }, sessionBody.member.id);
+  assert.equal(historyPageTwoAgain.entries[0].id, historyPageTwo.entries[0].id);
+  const attentionHistory = await timelineStore.listTimelineEntries("workspace-single", { limit: 10, attention: true, unread: true }, sessionBody.member.id);
+  assert.deepEqual(attentionHistory.entries.map(({ observation }) => observation.name), ["pending"]);
+  assert.equal(attentionHistory.unreadAttentionCount, 1);
+  const reviewedAttentionBeforeReview = await timelineStore.listTimelineEntries("workspace-single", { limit: 10, attention: true, unread: false }, sessionBody.member.id);
+  assert.deepEqual(reviewedAttentionBeforeReview.entries, []);
+  const reviewedAttention = await timelineStore.reviewAttentionItem("workspace-single", sessionBody.member.id, firstHistory.entry.id);
+  assert.deepEqual(reviewedAttention, { entryId: firstHistory.entry.id, reviewed: true, unreadCount: 0 });
+  const reviewedAgain = await timelineStore.reviewAttentionItem("workspace-single", sessionBody.member.id, firstHistory.entry.id);
+  assert.deepEqual(reviewedAgain, { entryId: firstHistory.entry.id, reviewed: false, unreadCount: 0 });
+  assert.equal((await timelineStore.unreadAttentionCount("workspace-single", invitedSessionBody.member.id)), 1);
+  const reviewedAttentionAfterReview = await timelineStore.listTimelineEntries("workspace-single", { limit: 10, attention: true, unread: false }, sessionBody.member.id);
+  assert.deepEqual(reviewedAttentionAfterReview.entries.map(({ observation }) => observation.name), ["pending"]);
+  const attentionApi = await fetch(`http://127.0.0.1:${webPort}/api/timeline?limit=10&attention=true&unread=true`, { headers: { cookie: ownerCookie } });
+  assert.equal(attentionApi.status, 200);
+  assert.equal((await attentionApi.json()).unreadAttentionCount, 0);
+  const reviewedAttentionApi = await fetch(`http://127.0.0.1:${webPort}/api/timeline?limit=10&attention=true&unread=false`, { headers: { cookie: ownerCookie } });
+  assert.equal(reviewedAttentionApi.status, 200);
+  assert.deepEqual((await reviewedAttentionApi.json()).entries.map(({ observation }) => observation.name), ["pending"]);
+  const reviewApi = await fetch(`http://127.0.0.1:${webPort}/api/timeline/entries/${encodeURIComponent(firstHistory.entry.id)}/review`, {
+    method: "POST",
+    headers: { cookie: ownerCookie },
+  });
+  assert.equal(reviewApi.status, 200);
+  assert.deepEqual(await reviewApi.json(), { entryId: firstHistory.entry.id, reviewed: false, unreadCount: 0 });
+  const invalidReviewApi = await fetch(`http://127.0.0.1:${webPort}/api/timeline/entries/not%20an%20id/review`, {
+    method: "POST",
+    headers: { cookie: ownerCookie },
+  });
+  assert.equal(invalidReviewApi.status, 400);
+  const invalidTimelineFilter = await fetch(`http://127.0.0.1:${webPort}/api/timeline?attention=maybe`, { headers: { cookie: ownerCookie } });
+  assert.equal(invalidTimelineFilter.status, 400);
+  const internalFlashApi = await fetch(`http://127.0.0.1:${webPort}/api/timeline?attention=reviewed`, { headers: { cookie: ownerCookie } });
+  assert.equal(internalFlashApi.status, 400);
   const rejected = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -381,6 +513,7 @@ try {
       NODE_ENV: "production",
       DATABASE_URL: databaseUrl,
       BETTER_AUTH_SECRET: "local-test-secret",
+      TIMELINE_CURSOR_SECRET: "local-test-timeline-cursor-secret",
       BETTER_AUTH_URL: "https://tracegarden.test",
       GOOGLE_CLIENT_ID: "local-test-client",
       GOOGLE_CLIENT_SECRET: "local-test-secret",
