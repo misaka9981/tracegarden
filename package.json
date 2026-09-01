@@ -1,0 +1,36 @@
+{
+  "name": "tracegarden",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=26.8.0 <26.9.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "clean": "node scripts/clean.mjs",
+    "db:migrate": "node scripts/migrate.mjs",
+    "predb:migrate": "pnpm build",
+    "collector": "node dist/apps/collector/src/main.js",
+    "dev": "node scripts/dev.mjs",
+    "env:check": "node scripts/env-check.mjs",
+    "format": "node scripts/format.mjs --write",
+    "format:check": "node scripts/format.mjs",
+    "lint": "node scripts/lint.mjs",
+    "start": "node dist/apps/web/src/main.js",
+    "pretest": "pnpm build",
+    "test": "node scripts/test.mjs",
+    "pretest:browser": "pnpm build && pnpm exec playwright install chromium",
+    "test:browser": "node scripts/browser-smoke.mjs",
+    "test:container": "node scripts/container-smoke.mjs",
+    "pretest:postgres": "pnpm build",
+    "test:postgres": "node scripts/postgres-smoke.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "pnpm env:check && pnpm format:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test && pnpm test:browser && pnpm test:container"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0",
+    "typescript": "7.0.2"
+  }
+}

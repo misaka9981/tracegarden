@@ -1,0 +1,74 @@
+declare const process: {
+  env: Record<string, string | undefined>;
+  argv: string[];
+  exitCode?: number;
+  version: string;
+};
+
+declare module "node:http" {
+  export interface IncomingMessage {
+    method?: string;
+    url?: string;
+    on(event: string, listener: (...args: unknown[]) => void): this;
+  }
+  export interface ServerResponse {
+    statusCode: number;
+    setHeader(name: string, value: string): void;
+    end(body?: string): void;
+    writeHead(statusCode: number, headers?: Record<string, string>): void;
+    write(chunk: string): boolean;
+  }
+  export interface Server {
+    listen(port: number, hostname?: string, callback?: () => void): this;
+    close(callback?: (error?: Error) => void): this;
+  }
+  export function createServer(
+    handler: (request: IncomingMessage, response: ServerResponse) => void,
+  ): Server;
+}
+
+declare module "node:url" {
+  export class URL {
+    constructor(input: string, base?: string);
+    readonly pathname: string;
+    readonly searchParams: URLSearchParams;
+  }
+  export function fileURLToPath(url: URL): string;
+}
+
+declare module "node:fs/promises" {
+  export function readFile(path: string, encoding: "utf8"): Promise<string>;
+}
+
+declare module "node:path" {
+  export function join(...paths: string[]): string;
+}
+
+declare module "node:child_process" {
+  export function spawn(command: string, args?: string[], options?: Record<string, unknown>): {
+    once(event: string, listener: (...args: unknown[]) => void): void;
+    on(event: string, listener: (...args: unknown[]) => void): void;
+    kill(signal?: string): void;
+  };
+}
+
+declare module "node:assert/strict" {
+  const assert: {
+    equal(actual: unknown, expected: unknown, message?: string): void;
+    ok(value: unknown, message?: string): void;
+    match(value: string, regexp: RegExp, message?: string): void;
+  };
+  export default assert;
+}
+
+declare module "pg" {
+  export interface QueryResult<T = Record<string, unknown>> {
+    rows: T[];
+    rowCount: number;
+  }
+  export class Pool {
+    constructor(options?: Record<string, unknown>);
+    query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
+    end(): Promise<void>;
+  }
+}
