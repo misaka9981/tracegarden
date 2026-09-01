@@ -19,6 +19,7 @@ FROM node:26.8-bookworm AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=build /workspace/dist ./dist
+COPY --from=build /workspace/node_modules ./node_modules
 USER node
 EXPOSE 3001
 CMD ["node", "dist/apps/collector/src/main.js"]
