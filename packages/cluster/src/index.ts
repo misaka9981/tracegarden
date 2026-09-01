@@ -99,6 +99,10 @@ export function isSupportedResourceKind(value: string): value is SupportedResour
   return (SUPPORTED_RESOURCE_KINDS as readonly string[]).includes(value);
 }
 
+export function isValidClusterId(value: string): boolean {
+  return clusterIdPattern.test(value);
+}
+
 export function isValidNamespace(value: string): boolean {
   return value.length <= 63 && namespacePattern.test(value);
 }

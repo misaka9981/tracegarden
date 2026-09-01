@@ -59,8 +59,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention');");
-  assert.equal(migrationCount, "10");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention', '0011_structured_experiments');");
+  assert.equal(migrationCount, "11");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -130,6 +130,77 @@ try {
   });
   assert.equal(clusterScope.status, 200);
   assert.equal((await clusterScope.json()).scope.clusterId, "local-postgres-smoke");
+  const experimentCreateResponse = await fetch(`http://127.0.0.1:${webPort}/api/experiments`, {
+    method: "POST",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({
+      hypothesis: "**Markdown hypothesis**",
+      change: "adjust Deployment",
+      observation: "Pod became ready",
+      conclusion: "",
+      state: "active",
+      tags: ["smoke", "markdown"],
+      workloads: [{ clusterId: "local-postgres-smoke", namespace: "tracegarden", kind: "Deployment", name: "api" }],
+      gitRevision: "abc123",
+    }),
+  });
+  assert.equal(experimentCreateResponse.status, 201);
+  const experiment = (await experimentCreateResponse.json()).experiment;
+  assert.equal(experiment.workspaceId, "workspace-single");
+  assert.equal(experiment.hypothesis, "**Markdown hypothesis**");
+  const invalidAssociation = await fetch(`http://127.0.0.1:${webPort}/api/experiments`, {
+    method: "POST",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ hypothesis: "invalid", change: "invalid", observation: "invalid", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "local-postgres-smoke", namespace: "bad namespace", kind: "Deployment", name: "bad name" }], gitRevision: "not a git revision" }),
+  });
+  assert.equal(invalidAssociation.status, 400);
+  docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "INSERT INTO tracegarden_workspaces (id, name) VALUES ('workspace-other', 'Other Workspace') ON CONFLICT (id) DO NOTHING; INSERT INTO tracegarden_clusters (id, workspace_id, name, endpoint) VALUES ('other-workspace-cluster', 'workspace-other', 'Other Cluster', 'https://other-cluster.example.test') ON CONFLICT (id) DO NOTHING;");
+  try {
+    const crossWorkspaceAssociation = await fetch(`http://127.0.0.1:${webPort}/api/experiments`, {
+      method: "POST",
+      headers: { cookie: ownerCookie, "content-type": "application/json" },
+      body: JSON.stringify({ hypothesis: "cross workspace", change: "cross workspace", observation: "cross workspace", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "other-workspace-cluster", namespace: "tracegarden", kind: "Deployment", name: "api" }] }),
+    });
+    assert.equal(crossWorkspaceAssociation.status, 400);
+  } finally {
+    docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "DELETE FROM tracegarden_clusters WHERE id = 'other-workspace-cluster'; DELETE FROM tracegarden_workspaces WHERE id = 'workspace-other';");
+  }
+  const experimentUpdateResponse = await fetch(`http://127.0.0.1:${webPort}/api/experiments/${experiment.id}`, {
+    method: "PATCH",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({
+      conclusion: "verified",
+      state: "concluded",
+      tags: ["verified"],
+      workloads: [{ clusterId: "local-postgres-smoke", namespace: "tracegarden", kind: "Deployment", name: "worker" }],
+    }),
+  });
+  assert.equal(experimentUpdateResponse.status, 200);
+  const updatedExperiment = (await experimentUpdateResponse.json()).experiment;
+  assert.equal(updatedExperiment.id, experiment.id);
+  assert.equal(updatedExperiment.timelineEntryId, experiment.timelineEntryId);
+  assert.deepEqual(updatedExperiment.workloads, [{ clusterId: "local-postgres-smoke", namespace: "tracegarden", kind: "Deployment", name: "worker" }]);
+  const invalidExperimentTransition = await fetch(`http://127.0.0.1:${webPort}/api/experiments/${experiment.id}`, {
+    method: "PATCH",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ state: "active" }),
+  });
+  assert.equal(invalidExperimentTransition.status, 409);
+  docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "CREATE OR REPLACE FUNCTION tracegarden_test_fail_experiment_timeline() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'experiment timeline write failed'; END; $$; CREATE TRIGGER tracegarden_test_fail_experiment_timeline BEFORE INSERT ON tracegarden_timeline_entries FOR EACH ROW WHEN (NEW.entry_type = 'experiment') EXECUTE FUNCTION tracegarden_test_fail_experiment_timeline();");
+  try {
+    const failedExperimentCreate = await fetch(`http://127.0.0.1:${webPort}/api/experiments`, {
+      method: "POST",
+      headers: { cookie: ownerCookie, "content-type": "application/json" },
+      body: JSON.stringify({ hypothesis: "rollback", change: "rollback", observation: "rollback", conclusion: "", state: "active", tags: [], workloads: [] }),
+    });
+    assert.equal(failedExperimentCreate.status, 503);
+  } finally {
+    docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "DROP TRIGGER tracegarden_test_fail_experiment_timeline ON tracegarden_timeline_entries; DROP FUNCTION tracegarden_test_fail_experiment_timeline();");
+  }
+  const experimentCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_experiments;");
+  assert.equal(experimentCount, "1");
+  const retrievedExperiment = await fetch(`http://127.0.0.1:${webPort}/api/experiments/${experiment.id}`, { headers: { cookie: ownerCookie } });
+  assert.equal((await retrievedExperiment.json()).experiment.id, experiment.id);
   logDatabase = new PostgresDatabase(databaseUrl);
   const postgresLogBody = "postgres-protected-log-body";
   const postgresLog = await requestRecentLogWindow({
@@ -207,7 +278,7 @@ try {
   const duplicateObservation = await collector.collectObservations();
   assert.equal(duplicateObservation[0].duplicate, true);
   assert.equal(await collectorDatabase.timeline.countObservations("workspace-single"), 1);
-  assert.equal(await collectorDatabase.timeline.countTimelineEntries("workspace-single"), 1);
+  assert.equal(await collectorDatabase.timeline.countTimelineEntries("workspace-single"), 2);
   const deploymentScope = { ...observationScope, resourceKinds: ["Deployment"] };
   const deploymentStates = [
     { availableReplicas: 2, readyReplicas: 2 },
@@ -247,7 +318,7 @@ try {
     docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "DROP TRIGGER tracegarden_test_fail_timeline ON tracegarden_timeline_entries; DROP FUNCTION tracegarden_test_fail_timeline();");
   }
   assert.equal(await collectorDatabase.timeline.countObservations("workspace-single"), 4);
-  assert.equal(await collectorDatabase.timeline.countTimelineEntries("workspace-single"), 4);
+  assert.equal(await collectorDatabase.timeline.countTimelineEntries("workspace-single"), 5);
   // Checkpoint writes remain transactional and compare opaque and large numeric versions safely.
   await collectorDatabase.timeline.recordObservationsAndCheckpoint([firstObservation[0].observation], {
     workspaceId: observationScope.workspaceId,
@@ -328,9 +399,10 @@ try {
   const timelineResponse = await fetch(`http://127.0.0.1:${webPort}/api/timeline?limit=10`, { headers: { cookie: ownerCookie } });
   assert.equal(timelineResponse.status, 200);
   const timelineBody = await timelineResponse.json();
-  assert.equal(timelineBody.entries.length, 4);
+  assert.equal(timelineBody.entries.length, 5);
   assert.ok(timelineBody.entries.some(({ observation }) => observation.name === "api"));
   assert.ok(timelineBody.entries.some(({ observation }) => observation.name === "api-deployment" && observation.classification === "recovery"));
+  assert.ok(timelineBody.entries.some((entry) => entry.entryType === "experiment" && entry.experiment.id === experiment.id));
   const timelinePage = await fetch(`http://127.0.0.1:${webPort}/app?lang=en`, { headers: { cookie: ownerCookie } });
   assert.match(await timelinePage.text(), /Pod Observation/);
   const timelinePageChinese = await fetch(`http://127.0.0.1:${webPort}/app?lang=zh-CN`, { headers: { cookie: ownerCookie } });
@@ -549,7 +621,7 @@ try {
   assert.match(googleLocation, /client_id=local-test-client/);
   assert.match(googleLocation, /redirect_uri=https%3A%2F%2Ftracegarden.test%2Fapi%2Fauth%2Fcallback%2Fgoogle/);
   assert.doesNotMatch(googleLocation, /local-test-secret/);
-  console.log("PostgreSQL migration, admission, normalized Observation, Timeline, rollback, and Better Auth integration smoke passed");
+  console.log("PostgreSQL migration, admission, Experiment, normalized Observation, Timeline, rollback, and Better Auth integration smoke passed");
 } finally {
   await collector?.close();
   collectorProcess?.kill("SIGTERM");

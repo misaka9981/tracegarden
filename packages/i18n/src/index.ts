@@ -113,6 +113,29 @@ export type Messages = Readonly<{
   recentLogsUnavailable: string;
   recentLogsEmpty: string;
   recentLogsMetadata: string;
+  experimentsTitle: string;
+  experimentsDescription: string;
+  noExperiments: string;
+  createExperiment: string;
+  updateExperiment: string;
+  hypothesis: string;
+  change: string;
+  observation: string;
+  conclusion: string;
+  lifecycleState: string;
+  tags: string;
+  workloads: string;
+  gitRevision: string;
+  workloadFormat: string;
+  experimentDraft: string;
+  experimentActive: string;
+  experimentConcluded: string;
+  experimentAbandoned: string;
+  experimentCreated: string;
+  experimentUpdated: string;
+  experimentWriteDenied: string;
+  experimentInvalid: string;
+  experimentUnavailable: string;
 }>;
 
 export const catalogs: Readonly<Record<Language, Messages>> = {
@@ -238,7 +261,30 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     recentLogsInvalid: "Recent Log Window 请求无效，请检查 Cluster、命名空间、Pod、容器和行数。",
     recentLogsUnavailable: "Recent Log Window 当前不可用。",
     recentLogsEmpty: "没有可显示的近期日志。",
-    recentLogsMetadata: "结果限制：最多 200 行或 1 MiB；此响应不会被保存。"
+    recentLogsMetadata: "结果限制：最多 200 行或 1 MiB；此响应不会被保存。",
+    experimentsTitle: "Experiments",
+    experimentsDescription: "使用结构化字段记录假设、变更、观察和结论；Markdown 会保留在各自字段中。",
+    noExperiments: "暂无 Experiment。",
+    createExperiment: "创建 Experiment",
+    updateExperiment: "更新 Experiment",
+    hypothesis: "假设",
+    change: "变更",
+    observation: "观察",
+    conclusion: "结论",
+    lifecycleState: "生命周期状态",
+    tags: "标签（每行一个）",
+    workloads: "关联 Workload（每行：Cluster ID | 命名空间 | 类型 | 名称）",
+    gitRevision: "Git revision（可选）",
+    workloadFormat: "Cluster ID | 命名空间 | 类型 | 名称",
+    experimentDraft: "草稿",
+    experimentActive: "进行中",
+    experimentConcluded: "已结束",
+    experimentAbandoned: "已放弃",
+    experimentCreated: "Experiment 已创建。",
+    experimentUpdated: "Experiment 已更新。",
+    experimentWriteDenied: "你没有创建或更新 Experiment 的 Capability。",
+    experimentInvalid: "Experiment 请求无效，请检查结构化字段。",
+    experimentUnavailable: "Experiment 当前不可用。"
   },
   en: {
     appName: "Tracegarden",
@@ -362,7 +408,30 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     recentLogsInvalid: "The Recent Log Window request is invalid. Check the Cluster, namespace, Pod, container, and tail.",
     recentLogsUnavailable: "The Recent Log Window is currently unavailable.",
     recentLogsEmpty: "No recent logs are available.",
-    recentLogsMetadata: "Bounded to 200 lines or 1 MiB; this response is not saved."
+    recentLogsMetadata: "Bounded to 200 lines or 1 MiB; this response is not saved.",
+    experimentsTitle: "Experiments",
+    experimentsDescription: "Record hypothesis, change, observation, and conclusion in separate fields; Markdown stays inside those fields.",
+    noExperiments: "No Experiments yet.",
+    createExperiment: "Create Experiment",
+    updateExperiment: "Update Experiment",
+    hypothesis: "Hypothesis",
+    change: "Change",
+    observation: "Observation",
+    conclusion: "Conclusion",
+    lifecycleState: "Lifecycle state",
+    tags: "Tags (one per line)",
+    workloads: "Associated workloads (one per line: Cluster ID | namespace | kind | name)",
+    gitRevision: "Git revision (optional)",
+    workloadFormat: "Cluster ID | namespace | kind | name",
+    experimentDraft: "Draft",
+    experimentActive: "Active",
+    experimentConcluded: "Concluded",
+    experimentAbandoned: "Abandoned",
+    experimentCreated: "Experiment created.",
+    experimentUpdated: "Experiment updated.",
+    experimentWriteDenied: "You do not have the Capability to create or update Experiments.",
+    experimentInvalid: "The Experiment request is invalid. Check the structured fields.",
+    experimentUnavailable: "The Experiment is currently unavailable."
   },
 };
 

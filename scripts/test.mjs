@@ -4,6 +4,7 @@ import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../di
 import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
+import { createExperiment, ExperimentLifecycleError, ExperimentValidationError, hasExperimentWrite, parseExperimentInput } from "../dist/packages/domain/src/index.js";
 import {
   boundRecentLogWindow,
   ConfiguredKubernetesLogAdapter,
@@ -567,6 +568,48 @@ if (ownerAdmission.admitted && savedScope) {
   assert.doesNotMatch(completedJobPage, /Attention Item/);
 }
 const memoryTimeline = new MemoryObservationStore();
+const experimentInput = {
+  hypothesis: "**markdown hypothesis**",
+  change: "scale the workload",
+  observation: "the Pod recovered",
+  conclusion: "",
+  state: "active",
+  tags: ["recovery", "markdown"],
+  workloads: [{ clusterId: "lab-cluster", namespace: "tracegarden", kind: "Deployment", name: "api" }],
+  gitRevision: "abc123",
+};
+assert.equal(parseExperimentInput(experimentInput).hypothesis, "**markdown hypothesis**");
+assert.throws(
+  () => parseExperimentInput({ ...experimentInput, workloads: [{ clusterId: "lab cluster", namespace: "tracegarden", kind: "Deployment", name: "api" }] }),
+  (error) => error instanceof ExperimentValidationError && error.issues.some(({ field }) => field === "workloads"),
+);
+assert.throws(
+  () => parseExperimentInput({ ...experimentInput, gitRevision: "not a git revision" }),
+  (error) => error instanceof ExperimentValidationError && error.issues.some(({ field }) => field === "gitRevision"),
+);
+assert.equal(hasExperimentWrite(ownerMember ?? { capabilities: [] }), true);
+if (ownerMember) {
+  const scopedExperimentTimeline = new MemoryObservationStore(scopeStore);
+  await assert.rejects(
+    () => scopedExperimentTimeline.createExperiment(ownerMember.workspaceId, ownerMember.id, {
+      ...experimentInput,
+      workloads: [{ ...experimentInput.workloads[0], clusterId: "unknown-cluster" }],
+    }),
+    (error) => error instanceof ExperimentValidationError && error.issues.some(({ field }) => field === "workloads"),
+  );
+  await assert.rejects(
+    () => scopedExperimentTimeline.createExperiment("workspace-other", ownerMember.id, experimentInput),
+    (error) => error instanceof ExperimentValidationError && error.issues.some(({ field }) => field === "workloads"),
+  );
+  const experimentTimeline = new MemoryObservationStore();
+  const memoryExperiment = await createExperiment(ownerMember, experimentTimeline, experimentInput);
+  assert.equal(memoryExperiment.workspaceId, "workspace-single");
+  const memoryExperimentUpdate = await experimentTimeline.updateExperiment(ownerMember.workspaceId, memoryExperiment.id, { conclusion: "verified", state: "concluded", tags: ["verified"] });
+  assert.equal(memoryExperimentUpdate?.id, memoryExperiment.id);
+  assert.equal(memoryExperimentUpdate?.timelineEntryId, memoryExperiment.timelineEntryId);
+  assert.deepEqual(memoryExperimentUpdate?.workloads, memoryExperiment.workloads);
+  await assert.rejects(() => experimentTimeline.updateExperiment(ownerMember.workspaceId, memoryExperiment.id, { state: "active" }), (error) => error instanceof ExperimentLifecycleError);
+}
 const collectorWithPersistence = await createCollectorRuntime({ port: 43203, host: "127.0.0.1", scope: savedScope ?? undefined, adapter: deterministic, observationStore: memoryTimeline });
 try {
   const firstPersist = await collectorWithPersistence.collectObservations();
@@ -945,13 +988,74 @@ try {
   assert.match(await app.text(), /Timeline/);
   const appChinese = await fetch("http://127.0.0.1:43208/app?lang=zh-CN", { headers: { cookie } });
   assert.match(await appChinese.text(), /Timeline/);
+  const multilineExperimentForm = await fetch("http://127.0.0.1:43208/experiments?lang=en", {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      hypothesis: "multiline hypothesis",
+      change: "multiline change",
+      observation: "multiline observation",
+      conclusion: "",
+      state: "active",
+      tags: "first\r\nsecond",
+      workloads: "lab-cluster | tracegarden | Deployment | api\r\nlab-cluster | default | Pod | worker-0",
+      gitRevision: "abc123",
+    }),
+  });
+  assert.equal(multilineExperimentForm.status, 303);
+  const multilineExperiments = await fetch("http://127.0.0.1:43208/api/experiments", { headers: { cookie } });
+  const multilineExperiment = (await multilineExperiments.json()).experiments.find(({ hypothesis }) => hypothesis === "multiline hypothesis");
+  assert.deepEqual(multilineExperiment.tags, ["first", "second"]);
+  assert.deepEqual(multilineExperiment.workloads, [
+    { clusterId: "lab-cluster", namespace: "tracegarden", kind: "Deployment", name: "api" },
+    { clusterId: "lab-cluster", namespace: "default", kind: "Pod", name: "worker-0" },
+  ]);
+  for (const workloads of [
+    "lab-cluster | tracegarden | Deployment | api | extra",
+    "lab-cluster | tracegarden | Deployment",
+  ]) {
+    const malformedWorkloadForm = await fetch("http://127.0.0.1:43208/experiments?lang=en", {
+      method: "POST",
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ hypothesis: "malformed", change: "malformed", observation: "malformed", conclusion: "", state: "active", tags: "", workloads, gitRevision: "" }),
+    });
+    assert.equal(malformedWorkloadForm.status, 400);
+  }
+  const invalidExperimentResponse = await fetch("http://127.0.0.1:43208/api/experiments", {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ hypothesis: "invalid", change: "invalid", observation: "invalid", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "lab-cluster", namespace: "not approved", kind: "Pod", name: "bad name" }], gitRevision: "not a git revision" }),
+  });
+  assert.equal(invalidExperimentResponse.status, 400);
+  const createdExperimentResponse = await fetch("http://127.0.0.1:43208/api/experiments", {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ hypothesis: "**transport**", change: "change", observation: "observation", conclusion: "", state: "active", tags: ["transport"], workloads: [], gitRevision: null }),
+  });
+  assert.equal(createdExperimentResponse.status, 201);
+  const createdExperiment = (await createdExperimentResponse.json()).experiment;
+  const updatedExperimentResponse = await fetch(`http://127.0.0.1:43208/api/experiments/${createdExperiment.id}`, {
+    method: "PATCH",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({
+      conclusion: "concluded",
+      state: "concluded",
+      workloads: [{ clusterId: "lab-cluster", namespace: "default", kind: "Deployment", name: "worker" }],
+    }),
+  });
+  assert.equal(updatedExperimentResponse.status, 200);
+  const updatedExperiment = (await updatedExperimentResponse.json()).experiment;
+  assert.deepEqual(updatedExperiment.workloads, [{ clusterId: "lab-cluster", namespace: "default", kind: "Deployment", name: "worker" }]);
+  const retrievedExperimentResponse = await fetch(`http://127.0.0.1:43208/api/experiments/${createdExperiment.id}`, { headers: { cookie } });
+  assert.equal((await retrievedExperimentResponse.json()).experiment.id, createdExperiment.id);
 } finally {
   await scopeRuntime.close();
 }
 
 const viewerToken = "viewer-cluster-token";
 const viewerScopeRuntime = await createWebRuntime({
-  database: new MemoryDatabase(),
+  database: scopeDatabase,
   admissionStore: {
     admit: async () => ({ admitted: false, reason: "admission_required" }),
     getSession: async (token) => token === viewerToken ? {
@@ -1003,8 +1107,27 @@ try {
   const viewerAppEnBody = await viewerAppEn.text();
   assert.match(viewerAppEnBody, /do not have the Capability to configure/);
   assert.match(viewerAppEnBody, /do not have the Capability to read the Recent Log Window/);
+  assert.doesNotMatch(viewerAppEnBody, /name="hypothesis"/);
+  assert.doesNotMatch(viewerAppEnBody, /Create Experiment/);
   const viewerTimeline = await fetch("http://127.0.0.1:43209/api/timeline", { headers: { cookie: viewerCookie } });
   assert.equal(viewerTimeline.status, 200);
+  const viewerExperiments = await fetch("http://127.0.0.1:43209/api/experiments", { headers: { cookie: viewerCookie } });
+  assert.equal(viewerExperiments.status, 200);
+  const viewerExperimentsBody = await viewerExperiments.json();
+  assert.equal(viewerExperimentsBody.experiments.length, 2);
+  const viewerExperimentId = viewerExperimentsBody.experiments[0].id;
+  const viewerCreateExperiment = await fetch("http://127.0.0.1:43209/api/experiments", {
+    method: "POST",
+    headers: { cookie: viewerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ hypothesis: "viewer", change: "viewer", observation: "viewer", conclusion: "", state: "active", tags: [], workloads: [] }),
+  });
+  assert.equal(viewerCreateExperiment.status, 403);
+  const viewerUpdateExperiment = await fetch(`http://127.0.0.1:43209/api/experiments/${viewerExperimentId}`, {
+    method: "PATCH",
+    headers: { cookie: viewerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ hypothesis: "viewer" }),
+  });
+  assert.equal(viewerUpdateExperiment.status, 403);
 } finally {
   await viewerScopeRuntime.close();
 }
@@ -1040,4 +1163,4 @@ await assert.rejects(
   createWebRuntime({ database: new MemoryDatabase(), environment: { NODE_ENV: "production" }, port: 0 }),
   /Memory database is not allowed in production/,
 );
-console.log("unit, Cluster scope, and collector readiness checks passed");
+console.log("unit, Experiment, Cluster scope, and collector readiness checks passed");

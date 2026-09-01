@@ -46,6 +46,14 @@ import {
   SUPPORTED_RESOURCE_KINDS,
   markRecovery,
 } from "../../cluster/src/index.js";
+import {
+  createExperimentRecord,
+  ExperimentValidationError,
+  updateExperimentRecord,
+  type ExperimentRecord,
+  type ExperimentState,
+  type ExperimentWorkload,
+} from "../../domain/src/index.js";
 
 export type DatabaseStatus = "ready" | "not-ready";
 
@@ -54,6 +62,7 @@ export interface DatabaseBoundary {
   readonly admission?: AdmissionStore;
   readonly clusterScope?: ClusterScopeStore;
   readonly timeline?: TimelineStore;
+  readonly experiments?: ExperimentStore;
   migrate(): Promise<void>;
   ping(): Promise<boolean>;
   close(): Promise<void>;
@@ -69,6 +78,7 @@ export const RECENT_LOGS_MIGRATION_ID = "0007_recent_logs";
 export const NORMALIZED_OBSERVATION_MIGRATION_ID = "0008_normalized_observations";
 export const OBSERVATION_CHECKPOINTS_MIGRATION_ID = "0009_observation_checkpoints";
 export const TIMELINE_ATTENTION_MIGRATION_ID = "0010_timeline_attention";
+export const STRUCTURED_EXPERIMENTS_MIGRATION_ID = "0011_structured_experiments";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -83,6 +93,7 @@ const migrations: readonly Migration[] = [
   { id: NORMALIZED_OBSERVATION_MIGRATION_ID, path: "../migrations/0008_normalized_observations.sql" },
   { id: OBSERVATION_CHECKPOINTS_MIGRATION_ID, path: "../migrations/0009_observation_checkpoints.sql" },
   { id: TIMELINE_ATTENTION_MIGRATION_ID, path: "../migrations/0010_timeline_attention.sql" },
+  { id: STRUCTURED_EXPERIMENTS_MIGRATION_ID, path: "../migrations/0011_structured_experiments.sql" };
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -282,7 +293,7 @@ export type TimelineQuery = Readonly<{
   unread?: boolean;
 }>;
 
-export type TimelineEntry = Readonly<{
+export type ObservationTimelineEntry = Readonly<{
   id: string;
   workspaceId: string;
   clusterId: string;
@@ -295,6 +306,17 @@ export type TimelineEntry = Readonly<{
   attention: boolean;
   attentionUnread: boolean;
 }>;
+
+export type ExperimentTimelineEntry = Readonly<{
+  id: string;
+  workspaceId: string;
+  clusterId: string | null;
+  entryType: "experiment";
+  occurredAt: string;
+  experiment: ExperimentRecord;
+}>;
+
+export type TimelineEntry = ObservationTimelineEntry | ExperimentTimelineEntry;
 
 export type ObservationPersistenceResult = Readonly<{
   observation: NormalizedObservation;
@@ -471,6 +493,13 @@ export function parseTimelineQuery(input: unknown): TimelineQuery {
   return query;
 }
 
+export interface ExperimentStore {
+  createExperiment(workspaceId: string, createdByMemberId: string, input: unknown): Promise<ExperimentRecord>;
+  updateExperiment(workspaceId: string, id: string, input: unknown): Promise<ExperimentRecord | null>;
+  getExperiment(workspaceId: string, id: string): Promise<ExperimentRecord | null>;
+  listExperiments(workspaceId: string): Promise<readonly ExperimentRecord[]>;
+}
+
 export interface TimelineStore {
   recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult>;
   recordObservations?(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]>;
@@ -533,8 +562,18 @@ function cloneObservation(observation: NormalizedObservation): NormalizedObserva
   };
 }
 
+function cloneExperiment(experiment: ExperimentRecord): ExperimentRecord {
+  return {
+    ...experiment,
+    tags: [...experiment.tags],
+    workloads: experiment.workloads.map((workload) => ({ ...workload })),
+  };
+}
+
 function cloneEntry(entry: TimelineEntry): TimelineEntry {
-  return { ...entry, observation: cloneObservation(entry.observation) };
+  return entry.entryType === "observation"
+    ? { ...entry, observation: cloneObservation(entry.observation) }
+    : { ...entry, experiment: cloneExperiment(entry.experiment) };
 }
 
 function timelineEntryFor(observation: NormalizedObservation): TimelineEntry {
@@ -554,6 +593,10 @@ function timelineEntryFor(observation: NormalizedObservation): TimelineEntry {
 }
 
 function entryMatchesQuery(entry: TimelineEntry, query: TimelineQuery): boolean {
+  if (entry.entryType === "experiment") {
+    return query.kind === undefined && query.namespace === undefined && query.name === undefined && query.state === undefined
+      && query.attention !== true && query.unread !== true;
+  }
   const observation = entry.observation;
   const state = observation.kind === "Pod" ? observation.phase : null;
   return (query.kind === undefined || observation.kind === query.kind)
@@ -579,14 +622,36 @@ function pageFromEntries(entries: readonly TimelineEntry[], query: TimelineQuery
 
 export class MemoryObservationStore implements TimelineStore {
   private readonly observations = new Map<string, NormalizedObservation>();
+  private readonly experiments = new Map<string, ExperimentRecord>();
   private readonly entries = new Map<string, TimelineEntry>();
   private readonly ingestionOrders = new Map<string, bigint>();
   private nextIngestionOrder = 0n;
   private readonly checkpoints = new Map<string, IngestionCheckpoint>();
   private readonly attentionReviews = new Set<string>();
 
-  constructor(private readonly cursorSecret: string = DEFAULT_TIMELINE_CURSOR_SECRET) {
-    if (!cursorSecret.trim()) throw new Error("Timeline cursor secret is required");
+  private readonly cursorSecret: string;
+  private readonly clusterScopeStore?: ClusterScopeStore;
+
+  constructor(cursorSecretOrClusterScopeStore: string | ClusterScopeStore = DEFAULT_TIMELINE_CURSOR_SECRET, clusterScopeStore?: ClusterScopeStore) {
+    if (typeof cursorSecretOrClusterScopeStore === "string") {
+      if (!cursorSecretOrClusterScopeStore.trim()) throw new Error("Timeline cursor secret is required");
+      this.cursorSecret = cursorSecretOrClusterScopeStore;
+      this.clusterScopeStore = clusterScopeStore;
+    } else {
+      this.cursorSecret = DEFAULT_TIMELINE_CURSOR_SECRET;
+      this.clusterScopeStore = cursorSecretOrClusterScopeStore;
+    }
+  }
+
+  private async validateExperimentClusters(workspaceId: string, workloads: readonly ExperimentWorkload[]): Promise<void> {
+    if (workloads.length === 0 || !this.clusterScopeStore) return;
+    const scope = await this.clusterScopeStore.get(workspaceId);
+    if (!scope || workloads.some((workload) => workload.clusterId !== scope.clusterId)) {
+      throw new ExperimentValidationError([{
+        field: "workloads",
+        message: "must reference the Cluster configured for the Workspace",
+      }]);
+    }
   }
 
   async recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult> {
@@ -609,7 +674,10 @@ export class MemoryObservationStore implements TimelineStore {
       const key = observationKey(observation);
       const existing = pendingObservations.get(key);
       if (existing) {
-        const entry = [...pendingEntries.values()].find((candidate) => candidate.observation.sourceKey === observation.sourceKey && candidate.workspaceId === observation.workspaceId && candidate.clusterId === observation.clusterId);
+        const entry = [...pendingEntries.values()].find((candidate) => candidate.entryType === "observation"
+          && candidate.observation.sourceKey === observation.sourceKey
+          && candidate.workspaceId === observation.workspaceId
+          && candidate.clusterId === observation.clusterId);
         if (!entry) throw new Error("Timeline entry is missing for an existing Observation");
         results.push({ observation: cloneObservation(existing), entry: cloneEntry(entry), duplicate: true });
         continue;
@@ -676,15 +744,60 @@ export class MemoryObservationStore implements TimelineStore {
     this.checkpoints.delete(checkpointKey(checkpoint));
   }
 
+  async createExperiment(workspaceId: string, createdByMemberId: string, input: unknown): Promise<ExperimentRecord> {
+    const timelineEntryId = randomUUID();
+    const experiment = createExperimentRecord(workspaceId, createdByMemberId, timelineEntryId, input);
+    await this.validateExperimentClusters(workspaceId, experiment.workloads);
+    const entry: ExperimentTimelineEntry = {
+      id: timelineEntryId,
+      workspaceId,
+      clusterId: experiment.workloads[0]?.clusterId ?? null,
+      entryType: "experiment",
+      occurredAt: experiment.createdAt,
+      experiment,
+    };
+    this.experiments.set(experiment.id, experiment);
+    this.entries.set(entry.id, entry);
+    return cloneExperiment(experiment);
+  }
+
+  async updateExperiment(workspaceId: string, id: string, input: unknown): Promise<ExperimentRecord | null> {
+    const current = this.experiments.get(id);
+    if (!current || current.workspaceId !== workspaceId) return null;
+    const updated = updateExperimentRecord(current, input);
+    await this.validateExperimentClusters(workspaceId, updated.workloads);
+    const entry = this.entries.get(current.timelineEntryId);
+    if (!entry || entry.entryType !== "experiment") throw new Error("Timeline entry is missing for an Experiment");
+    const replacement: ExperimentTimelineEntry = { ...entry, clusterId: updated.workloads[0]?.clusterId ?? null, experiment: updated };
+    this.experiments.set(id, updated);
+    this.entries.set(updated.timelineEntryId, replacement);
+    return cloneExperiment(updated);
+  }
+
+  async getExperiment(workspaceId: string, id: string): Promise<ExperimentRecord | null> {
+    const experiment = this.experiments.get(id);
+    return experiment?.workspaceId === workspaceId ? cloneExperiment(experiment) : null;
+  }
+
+  async listExperiments(workspaceId: string): Promise<readonly ExperimentRecord[]> {
+    return Object.freeze([...this.experiments.values()]
+      .filter((experiment) => experiment.workspaceId === workspaceId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .map(cloneExperiment));
+  }
+
   async listTimelineEntries(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<TimelinePage> {
     if (query.unread !== undefined && memberId === undefined) {
       throw new TimelineQueryValidationError(["member is required for unread Attention filtering"]);
     }
     const entries = [...this.entries.values()]
       .filter((entry) => entry.workspaceId === workspaceId)
-      .map((entry) => ({ ...entry, attentionUnread: memberId !== undefined && entry.attentionItem && !this.attentionReviews.has(`${entry.id}\u0000${memberId}`) }));
+      .map((entry): TimelineEntry => entry.entryType === "observation"
+        ? { ...entry, attentionUnread: memberId !== undefined && entry.attentionItem && !this.attentionReviews.has(`${entry.id}\u0000${memberId}`) }
+        : entry);
     const page = pageFromEntries(entries, query, this.cursorSecret, memberId);
     return memberId ? { ...page, unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) } : page;
+  }
   }
 
   async getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null> {
@@ -789,24 +902,37 @@ type ObservationRow = Readonly<{
 type TimelineJoinRow = Readonly<{
   entry_id: string;
   entry_workspace_id: string;
-  entry_cluster_id: string;
-  entry_type: "observation";
+  entry_cluster_id: string | null;
+  entry_type: "observation" | "experiment";
   occurred_at: string | Date;
-  observation_id: string;
-  workspace_id: string;
-  cluster_id: string;
-  kind: NormalizedObservation["kind"];
-  source_identity: string;
-  source_key: string;
-  uid: string;
-  name: string;
-  namespace: string;
+  observation_id: string | null;
+  workspace_id: string | null;
+  cluster_id: string | null;
+  kind: NormalizedObservation["kind"] | null;
+  source_identity: string | null;
+  source_key: string | null;
+  uid: string | null;
+  name: string | null;
+  namespace: string | null;
   resource_version: string | null;
-  facts: Record<string, unknown>;
-  observed_at: string | Date;
-  ingestion_order: string | number;
+  facts: Record<string, unknown> | null;
+  observed_at: string | Date | null;
+  ingestion_order: string | number | null;
   attention_item?: boolean;
   attention_unread?: boolean;
+  experiment_id: string | null;
+  experiment_workspace_id: string | null;
+  experiment_created_by_member_id: string | null;
+  hypothesis: string | null;
+  change: string | null;
+  observation: string | null;
+  conclusion: string | null;
+  state: ExperimentState | null;
+  tags: string[] | null;
+  git_revision: string | null;
+  experiment_created_at: string | Date | null;
+  experiment_updated_at: string | Date | null;
+  experiment_workloads: readonly Record<string, unknown>[] | null;
 }>;
 
 type CheckpointRow = Readonly<{
@@ -904,7 +1030,57 @@ function observationFromRow(row: ObservationRow): NormalizedObservation {
   }
 }
 
+function workloadFromValue(value: Record<string, unknown>): ExperimentWorkload | null {
+  const clusterId = value.clusterId;
+  const namespace = value.namespace;
+  const kind = value.kind;
+  const name = value.name;
+  if (typeof clusterId !== "string" || typeof namespace !== "string" || typeof kind !== "string" || typeof name !== "string") return null;
+  return { clusterId, namespace, kind, name };
+}
+
+function experimentFromTimelineRow(row: TimelineJoinRow): ExperimentRecord {
+  if (!row.experiment_id || !row.experiment_workspace_id || !row.experiment_created_by_member_id
+    || row.hypothesis === null || row.change === null || row.observation === null || row.conclusion === null
+    || row.state === null || !row.experiment_created_at || !row.experiment_updated_at) {
+    throw new Error("Experiment Timeline entry is missing its Experiment");
+  }
+  const workloads = (row.experiment_workloads ?? []).flatMap((value) => {
+    const workload = workloadFromValue(value);
+    return workload ? [workload] : [];
+  });
+  return {
+    id: row.experiment_id,
+    workspaceId: row.experiment_workspace_id,
+    timelineEntryId: row.entry_id,
+    createdByMemberId: row.experiment_created_by_member_id,
+    hypothesis: row.hypothesis,
+    change: row.change,
+    observation: row.observation,
+    conclusion: row.conclusion,
+    state: row.state,
+    tags: [...(row.tags ?? [])],
+    workloads,
+    gitRevision: row.git_revision,
+    createdAt: timestamp(row.experiment_created_at) ?? new Date(0).toISOString(),
+    updatedAt: timestamp(row.experiment_updated_at) ?? new Date(0).toISOString(),
+  };
+}
+
 function timelineEntryFromRow(row: TimelineJoinRow): TimelineEntry {
+  if (row.entry_type === "experiment") {
+    return {
+      id: row.entry_id,
+      workspaceId: row.entry_workspace_id,
+      clusterId: row.entry_cluster_id,
+      entryType: "experiment",
+      occurredAt: timestamp(row.occurred_at) ?? new Date(0).toISOString(),
+      experiment: experimentFromTimelineRow(row),
+    };
+  }
+  if (!row.observation_id || !row.workspace_id || !row.cluster_id || !row.kind || !row.source_identity || !row.source_key || !row.uid || !row.name || !row.namespace || !row.facts || !row.observed_at) {
+    throw new Error("Observation Timeline entry is missing its Observation");
+  }
   const observation = observationFromRow({
     id: row.observation_id,
     workspace_id: row.workspace_id,
@@ -918,12 +1094,12 @@ function timelineEntryFromRow(row: TimelineJoinRow): TimelineEntry {
     resource_version: row.resource_version,
     facts: row.facts,
     observed_at: row.observed_at,
-    ingestion_order: row.ingestion_order,
+    ingestion_order: row.ingestion_order ?? 0,
   });
   return {
     id: row.entry_id,
     workspaceId: row.entry_workspace_id,
-    clusterId: row.entry_cluster_id,
+    clusterId: row.entry_cluster_id ?? row.cluster_id,
     entryType: "observation",
     occurredAt: timestamp(row.occurred_at) ?? new Date(0).toISOString(),
     attentionItem: row.attention_item ?? observation.attention,
@@ -941,9 +1117,18 @@ const timelineSelect = `
          o.kind, o.source_identity, o.source_key, o.uid, o.name, o.namespace,
          o.resource_version, o.facts, o.observed_at, o.ingestion_order,
          (ai.entry_id IS NOT NULL) AS attention_item,
-         false AS attention_unread
+         false AS attention_unread,
+         e.id AS experiment_id, e.workspace_id AS experiment_workspace_id,
+         e.created_by_member_id AS experiment_created_by_member_id, e.hypothesis, e.change,
+         e.observation, e.conclusion, e.state, e.tags, e.git_revision,
+         e.created_at AS experiment_created_at, e.updated_at AS experiment_updated_at,
+         COALESCE((SELECT jsonb_agg(jsonb_build_object(
+           'clusterId', ew.cluster_id, 'namespace', ew.namespace, 'kind', ew.kind, 'name', ew.name)
+           ORDER BY ew.cluster_id, ew.namespace, ew.kind, ew.name)
+           FROM tracegarden_experiment_workloads ew WHERE ew.experiment_id = e.id), '[]'::jsonb) AS experiment_workloads
     FROM tracegarden_timeline_entries t
-    JOIN tracegarden_observations o ON o.id = t.observation_id
+    LEFT JOIN tracegarden_observations o ON o.id = t.observation_id
+    LEFT JOIN tracegarden_experiments e ON e.id = t.experiment_id
     LEFT JOIN tracegarden_attention_items ai ON ai.entry_id = t.id`;
 
 const observationSelect = `
@@ -960,6 +1145,26 @@ function checkpointFromRow(row: CheckpointRow): IngestionCheckpoint {
     resourceVersion: row.resource_version,
     updatedAt: timestamp(row.updated_at) ?? new Date(0).toISOString(),
   };
+}
+
+async function validateExperimentClustersInDatabase(
+  client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
+  workspaceId: string,
+  workloads: readonly ExperimentWorkload[],
+): Promise<void> {
+  const clusterIds = [...new Set(workloads.map((workload) => workload.clusterId))];
+  if (clusterIds.length === 0) return;
+  const result = await client.query<{ id: string }>(
+    `SELECT id FROM tracegarden_clusters
+      WHERE workspace_id = $1 AND id = ANY($2::text[])`,
+    [workspaceId, clusterIds],
+  );
+  if (result.rows.length !== clusterIds.length) {
+    throw new ExperimentValidationError([{
+      field: "workloads",
+      message: "must reference the Cluster configured for the Workspace",
+    }]);
+  }
 }
 
 export class PostgresObservationStore implements TimelineStore {
@@ -1020,6 +1225,7 @@ export class PostgresObservationStore implements TimelineStore {
     const row = result.rows[0];
     if (!row) throw new Error("Timeline persistence returned no row");
     const entry = timelineEntryFromRow(row);
+    if (entry.entryType !== "observation") throw new Error("Observation persistence returned the wrong Timeline entry");
     return { observation: entry.observation, entry, duplicate };
   }
 
@@ -1189,6 +1395,126 @@ export class PostgresObservationStore implements TimelineStore {
     } finally {
       client.release();
     }
+  }
+
+  async createExperiment(workspaceId: string, createdByMemberId: string, input: unknown): Promise<ExperimentRecord> {
+    const timelineEntryId = randomUUID();
+    const experiment = createExperimentRecord(workspaceId, createdByMemberId, timelineEntryId, input);
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await validateExperimentClustersInDatabase(client, workspaceId, experiment.workloads);
+      await client.query(
+        `INSERT INTO tracegarden_experiments
+           (id, workspace_id, created_by_member_id, hypothesis, change, observation, conclusion, state, tags, git_revision, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)`,
+        [experiment.id, workspaceId, createdByMemberId, experiment.hypothesis, experiment.change, experiment.observation,
+          experiment.conclusion, experiment.state, experiment.tags, experiment.gitRevision, experiment.createdAt],
+      );
+      for (const workload of experiment.workloads) {
+        await client.query(
+          `INSERT INTO tracegarden_experiment_workloads
+             (experiment_id, workspace_id, cluster_id, namespace, kind, name)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [experiment.id, workspaceId, workload.clusterId, workload.namespace, workload.kind, workload.name],
+        );
+      }
+      await client.query(
+        `INSERT INTO tracegarden_timeline_entries
+           (id, workspace_id, cluster_id, entry_type, experiment_id, occurred_at)
+         VALUES ($1, $2, $3, 'experiment', $4, $5)`,
+        [timelineEntryId, workspaceId, experiment.workloads[0]?.clusterId ?? null, experiment.id, experiment.createdAt],
+      );
+      await client.query("COMMIT");
+      const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.id = $1`, [timelineEntryId]);
+      const row = result.rows[0];
+      if (!row) throw new Error("Experiment persistence returned no row");
+      const entry = timelineEntryFromRow(row);
+      if (entry.entryType !== "experiment") throw new Error("Experiment persistence returned the wrong Timeline entry");
+      return cloneExperiment(entry.experiment);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (error instanceof ExperimentValidationError) throw error;
+      throw new Error("Tracegarden Experiment persistence failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async updateExperiment(workspaceId: string, id: string, input: unknown): Promise<ExperimentRecord | null> {
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query<{ id: string }>(
+        "SELECT id FROM tracegarden_experiments WHERE id = $1 AND workspace_id = $2 FOR UPDATE",
+        [id, workspaceId],
+      );
+      if (!locked.rows[0]) {
+        await client.query("COMMIT");
+        return null;
+      }
+      const currentResult = await client.query<TimelineJoinRow>(`${timelineSelect} WHERE t.experiment_id = $1 AND t.workspace_id = $2`, [id, workspaceId]);
+      const currentRow = currentResult.rows[0];
+      if (!currentRow || currentRow.entry_type !== "experiment") throw new Error("Experiment Timeline entry is missing");
+      const current = experimentFromTimelineRow(currentRow);
+      const updated = updateExperimentRecord(current, input);
+      await validateExperimentClustersInDatabase(client, workspaceId, updated.workloads);
+      await client.query(
+        `UPDATE tracegarden_experiments
+            SET hypothesis = $1, change = $2, observation = $3, conclusion = $4,
+                state = $5, tags = $6, git_revision = $7, updated_at = $8
+          WHERE id = $9 AND workspace_id = $10`,
+        [updated.hypothesis, updated.change, updated.observation, updated.conclusion, updated.state,
+          updated.tags, updated.gitRevision, updated.updatedAt, id, workspaceId],
+      );
+      await client.query("DELETE FROM tracegarden_experiment_workloads WHERE experiment_id = $1", [id]);
+      for (const workload of updated.workloads) {
+        await client.query(
+          `INSERT INTO tracegarden_experiment_workloads
+             (experiment_id, workspace_id, cluster_id, namespace, kind, name)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [id, workspaceId, workload.clusterId, workload.namespace, workload.kind, workload.name],
+        );
+      }
+      await client.query(
+        "UPDATE tracegarden_timeline_entries SET cluster_id = $1 WHERE id = $2 AND workspace_id = $3",
+        [updated.workloads[0]?.clusterId ?? null, current.timelineEntryId, workspaceId],
+      );
+      await client.query("COMMIT");
+      const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.experiment_id = $1 AND t.workspace_id = $2`, [id, workspaceId]);
+      const row = result.rows[0];
+      if (!row) throw new Error("Experiment update returned no row");
+      const entry = timelineEntryFromRow(row);
+      if (entry.entryType !== "experiment") throw new Error("Experiment update returned the wrong Timeline entry");
+      return cloneExperiment(entry.experiment);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (error instanceof Error && (error.name === "ExperimentValidationError" || error.name === "ExperimentLifecycleError")) throw error;
+      throw new Error("Tracegarden Experiment update failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async getExperiment(workspaceId: string, id: string): Promise<ExperimentRecord | null> {
+    const pool = await this.poolProvider();
+    const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.workspace_id = $1 AND t.experiment_id = $2`, [workspaceId, id]);
+    const row = result.rows[0];
+    if (!row) return null;
+    const entry = timelineEntryFromRow(row);
+    return entry.entryType === "experiment" ? cloneExperiment(entry.experiment) : null;
+  }
+
+  async listExperiments(workspaceId: string): Promise<readonly ExperimentRecord[]> {
+    const pool = await this.poolProvider();
+    const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.workspace_id = $1 AND t.entry_type = 'experiment' ORDER BY t.occurred_at, t.id`, [workspaceId]);
+    return Object.freeze(result.rows.map((row) => {
+      const entry = timelineEntryFromRow(row);
+      if (entry.entryType !== "experiment") throw new Error("Experiment query returned the wrong Timeline entry");
+      return cloneExperiment(entry.experiment);
+    }));
   }
 
   async listTimelineEntries(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<TimelinePage> {
@@ -1712,7 +2038,8 @@ export class PostgresDatabase implements DatabaseBoundary {
   private pool: Pool | undefined;
   readonly admission: AdmissionStore;
   readonly clusterScope: ClusterScopeStore;
-  readonly timeline: TimelineStore;
+  readonly timeline: PostgresObservationStore;
+  readonly experiments: ExperimentStore;
 
   constructor(
     private readonly connectionString: string,
@@ -1724,6 +2051,7 @@ export class PostgresDatabase implements DatabaseBoundary {
     this.admission = new PostgresAdmissionStore(poolProvider, bootstrapIdentity);
     this.clusterScope = new PostgresClusterScopeStore(poolProvider);
     this.timeline = new PostgresObservationStore(poolProvider, cursorSecret);
+    this.experiments = this.timeline;
   }
 
   private async getPool(): Promise<Pool> {
@@ -1813,12 +2141,14 @@ export class MemoryDatabase implements DatabaseBoundary {
   readonly admission: MemoryAdmissionStore;
   readonly clusterScope: MemoryClusterScopeStore;
   readonly timeline: MemoryObservationStore;
+  readonly experiments: ExperimentStore;
   private migrationReady = false;
 
   constructor(bootstrapIdentity: BootstrapIdentity = DEFAULT_LOCAL_BOOTSTRAP) {
     this.admission = new MemoryAdmissionStore(bootstrapIdentity);
     this.clusterScope = new MemoryClusterScopeStore();
-    this.timeline = new MemoryObservationStore();
+    this.timeline = new MemoryObservationStore(this.clusterScope);
+    this.experiments = this.timeline;
   }
 
   async migrate(): Promise<void> {

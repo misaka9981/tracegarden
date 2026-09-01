@@ -27,7 +27,7 @@
     "pretest:postgres": "pnpm build",
     "test:postgres": "node scripts/postgres-smoke.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "check": "pnpm env:check && pnpm format:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test && pnpm test:browser && pnpm test:container"
+    "check": "pnpm env:check && pnpm format:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test && pnpm test:browser && pnpm test:postgres && pnpm test:container"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0",

@@ -7,6 +7,7 @@ import {
   parseTimelineQuery,
   TimelineQueryValidationError,
   type DatabaseBoundary,
+  type ExperimentStore,
   type TimelineEntry,
   type TimelinePage,
   type TimelineQuery,
@@ -42,6 +43,12 @@ import {
 } from "../../../packages/identity/src/index.js";
 import { messagesFor, parseLanguage, type Language, type Messages } from "../../../packages/i18n/src/index.js";
 import {
+  hasExperimentWrite,
+  ExperimentLifecycleError,
+  ExperimentValidationError,
+  type ExperimentRecord,
+} from "../../../packages/domain/src/index.js";
+import {
   createKubernetesLogAdapter,
   hasLogReadCapability,
   requestRecentLogWindow,
@@ -55,6 +62,7 @@ type WebOptions = Readonly<{
   admissionStore?: AdmissionStore;
   clusterScopeStore?: ClusterScopeStore;
   timelineStore?: TimelineStore;
+  experimentStore?: ExperimentStore;
   identityAdapter?: IdentityAdapter;
   logAdapter?: KubernetesLogAdapter;
   environment?: Record<string, string | undefined>;
@@ -298,8 +306,94 @@ function timelineNextPageUrl(language: Language, query: TimelineQuery, cursor: s
   return `/app?${params.toString()}`;
 }
 
+function experimentStateLabel(messages: Messages, state: ExperimentRecord["state"]): string {
+  return state === "draft" ? messages.experimentDraft
+    : state === "active" ? messages.experimentActive
+      : state === "concluded" ? messages.experimentConcluded
+        : messages.experimentAbandoned;
+}
+
+function workloadText(workload: ExperimentRecord["workloads"][number]): string {
+  return `${workload.clusterId} | ${workload.namespace} | ${workload.kind} | ${workload.name}`;
+}
+
+function renderExperimentForm(
+  language: Language,
+  messages: Messages,
+  experiment?: ExperimentRecord,
+): string {
+  const action = experiment ? `/experiments/${encodeURIComponent(experiment.id)}` : "/experiments";
+  const workloads = experiment?.workloads.map(workloadText).join("\n") ?? "";
+  const tags = experiment?.tags.join("\n") ?? "";
+  return `<form method="post" action="${action}?lang=${language}"${experiment ? ` data-experiment-form="${escapeHtml(experiment.id)}"` : ""}>
+      <input type="hidden" name="lang" value="${language}">
+      ${experiment ? `<input type="hidden" name="experimentId" value="${escapeHtml(experiment.id)}">` : ""}
+      <label for="experiment-hypothesis${experiment ? `-${escapeHtml(experiment.id)}` : ""}">${escapeHtml(messages.hypothesis)}</label>
+      <textarea id="experiment-hypothesis${experiment ? `-${escapeHtml(experiment.id)}` : ""}" name="hypothesis" rows="3" required>${escapeHtml(experiment?.hypothesis ?? "")}</textarea>
+      <label for="experiment-change${experiment ? `-${escapeHtml(experiment.id)}` : ""}">${escapeHtml(messages.change)}</label>
+      <textarea id="experiment-change${experiment ? `-${escapeHtml(experiment.id)}` : ""}" name="change" rows="3" required>${escapeHtml(experiment?.change ?? "")}</textarea>
+      <label for="experiment-observation${experiment ? `-${escapeHtml(experiment.id)}` : ""}">${escapeHtml(messages.observation)}</label>
+      <textarea id="experiment-observation${experiment ? `-${escapeHtml(experiment.id)}` : ""}" name="observation" rows="3" required>${escapeHtml(experiment?.observation ?? "")}</textarea>
+      <label for="experiment-conclusion${experiment ? `-${escapeHtml(experiment.id)}` : ""}">${escapeHtml(messages.conclusion)}</label>
+      <textarea id="experiment-conclusion${experiment ? `-${escapeHtml(experiment.id)}` : ""}" name="conclusion" rows="3">${escapeHtml(experiment?.conclusion ?? "")}</textarea>
+      <label for="experiment-state${experiment ? `-${escapeHtml(experiment.id)}` : ""}">${escapeHtml(messages.lifecycleState)}</label>
+      <select id="experiment-state${experiment ? `-${escapeHtml(experiment.id)}` : ""}" name="state">
+        ${(["draft", "active", "concluded", "abandoned"] as const).map((state) => `<option value="${state}"${state === (experiment?.state ?? "draft") ? " selected" : ""}>${escapeHtml(experimentStateLabel(messages, state))}</option>`).join("")}
+      </select>
+      <label for="experiment-tags${experiment ? `-${escapeHtml(experiment.id)}` : ""}">${escapeHtml(messages.tags)}</label>
+      <textarea id="experiment-tags${experiment ? `-${escapeHtml(experiment.id)}` : ""}" name="tags" rows="2">${escapeHtml(tags)}</textarea>
+      <label for="experiment-workloads${experiment ? `-${escapeHtml(experiment.id)}` : ""}">${escapeHtml(messages.workloads)}</label>
+      <textarea id="experiment-workloads${experiment ? `-${escapeHtml(experiment.id)}` : ""}" name="workloads" rows="2" placeholder="${escapeHtml(messages.workloadFormat)}">${escapeHtml(workloads)}</textarea>
+      <label for="experiment-git-revision${experiment ? `-${escapeHtml(experiment.id)}` : ""}">${escapeHtml(messages.gitRevision)}</label>
+      <input id="experiment-git-revision${experiment ? `-${escapeHtml(experiment.id)}` : ""}" name="gitRevision" value="${escapeHtml(experiment?.gitRevision ?? "")}" autocomplete="off">
+      <button type="submit">${escapeHtml(experiment ? messages.updateExperiment : messages.createExperiment)}</button>
+    </form>`;
+}
+
+function renderExperimentSummary(messages: Messages, experiment: ExperimentRecord): string {
+  return `<article data-experiment-id="${escapeHtml(experiment.id)}">
+      <h3>${escapeHtml(messages.experimentsTitle)} · ${escapeHtml(experimentStateLabel(messages, experiment.state))}</h3>
+      <dl>
+        <dt>${escapeHtml(messages.hypothesis)}</dt><dd><pre>${escapeHtml(experiment.hypothesis)}</pre></dd>
+        <dt>${escapeHtml(messages.change)}</dt><dd><pre>${escapeHtml(experiment.change)}</pre></dd>
+        <dt>${escapeHtml(messages.observation)}</dt><dd><pre>${escapeHtml(experiment.observation)}</pre></dd>
+        <dt>${escapeHtml(messages.conclusion)}</dt><dd><pre>${escapeHtml(experiment.conclusion)}</pre></dd>
+        <dt>${escapeHtml(messages.tags)}</dt><dd>${escapeHtml(experiment.tags.join(", ") || "—")}</dd>
+        <dt>${escapeHtml(messages.workloads)}</dt><dd>${escapeHtml(experiment.workloads.map(workloadText).join("; ") || "—")}</dd>
+        <dt>${escapeHtml(messages.gitRevision)}</dt><dd>${escapeHtml(experiment.gitRevision ?? "—")}</dd>
+      </dl>
+    </article>`;
+}
+
+function renderExperimentsSection(
+  language: Language,
+  messages: Messages,
+  member: AuthenticatedSession["member"],
+  experiments: readonly ExperimentRecord[],
+  feedback?: Readonly<{ saved?: "created" | "updated"; error?: string }>,
+): string {
+  const writable = hasExperimentWrite(member);
+  const forms = writable
+    ? `<h3>${escapeHtml(messages.createExperiment)}</h3>${renderExperimentForm(language, messages)}`
+    : `<p class="hint">${escapeHtml(messages.experimentWriteDenied)}</p>`;
+  const updates = writable ? experiments.map((experiment) => `<details><summary>${escapeHtml(messages.updateExperiment)}: ${escapeHtml(experiment.id)}</summary>${renderExperimentForm(language, messages, experiment)}</details>`).join("") : "";
+  return `<section aria-labelledby="experiments-title">
+      <h2 id="experiments-title">${escapeHtml(messages.experimentsTitle)}</h2>
+      <p>${escapeHtml(messages.experimentsDescription)}</p>
+      ${feedback?.saved === "created" ? `<p class="notice" role="status">${escapeHtml(messages.experimentCreated)}</p>` : ""}
+      ${feedback?.saved === "updated" ? `<p class="notice" role="status">${escapeHtml(messages.experimentUpdated)}</p>` : ""}
+      ${feedback?.error ? `<p class="error" role="alert">${escapeHtml(feedback.error)}</p>` : ""}
+      ${forms}
+      ${experiments.map((experiment) => renderExperimentSummary(messages, experiment)).join("") || `<p>${escapeHtml(messages.noExperiments)}</p>`}
+      ${updates}
+    </section>`;
+}
+
 function renderTimelineSection(language: Language, messages: Messages, page: TimelinePage, query: TimelineQuery, reviewed = false): string {
   const rows = page.entries.map((entry) => {
+    if (entry.entryType === "experiment") {
+      return `<article data-entry-id="${escapeHtml(entry.id)}"><h3>${escapeHtml(messages.experimentsTitle)} · ${escapeHtml(experimentStateLabel(messages, entry.experiment.state))}</h3><p>${escapeHtml(entry.experiment.hypothesis)}</p><p>${escapeHtml(entry.occurredAt)}</p></article>`;
+    }
     const observation = entry.observation;
     const owners = (observation.ownerReferences ?? []).map((owner) => `${owner.kind}/${owner.name}`).join(", ");
     const attention = entry.attentionItem
@@ -347,10 +441,11 @@ export function renderApplicationPage(
   language: Language,
   session: AuthenticatedSession,
   scope: ClusterScope | null = null,
-  feedback?: Readonly<{ saved?: boolean; error?: string; logResult?: RecentLogWindow; logError?: string; attentionReviewed?: boolean }>,
+  feedback?: Readonly<{ saved?: boolean; error?: string; logResult?: RecentLogWindow; logError?: string; attentionReviewed?: boolean; experimentSaved?: "created" | "updated"; experimentError?: string }>,
   timelineEntries: readonly TimelineEntry[] = [],
-  timelinePage?: TimelinePage,
+  timelinePageOrExperiments: TimelinePage | readonly ExperimentRecord[] = [],
   timelineQuery?: TimelineQuery,
+  experiments: readonly ExperimentRecord[] = [],
 ): string {
   const messages = messagesFor(language);
   const member = session.member;
@@ -376,7 +471,11 @@ export function renderApplicationPage(
       <ul class="capabilities">${capabilityList}</ul>
       ${membershipLink}
       ${renderClusterSection(language, messages, member, scope, feedback)}
-      ${hasCapability(member, capabilities.timelineRead) ? renderTimelineSection(language, messages, timelinePage ?? { entries: timelineEntries, nextCursor: null }, timelineQuery ?? { limit: 100 }, feedback?.attentionReviewed) : ""}
+      ${hasCapability(member, capabilities.timelineRead) ? renderTimelineSection(language, messages, Array.isArray(timelinePageOrExperiments) ? { entries: timelineEntries, nextCursor: null } : timelinePageOrExperiments, timelineQuery ?? { limit: 100 }, feedback?.attentionReviewed) : ""}
+      ${hasCapability(member, capabilities.timelineRead) ? renderExperimentsSection(language, messages, member, Array.isArray(timelinePageOrExperiments) ? timelinePageOrExperiments : experiments, {
+        ...(feedback?.experimentSaved ? { saved: feedback.experimentSaved } : {}),
+        ...(feedback?.experimentError ? { error: feedback.experimentError } : {}),
+      }) : ""}
       ${renderRecentLogsSection(language, messages, member, scope, feedback)}
       <form method="post" action="/auth/logout?lang=${language}">
         <button type="submit">${escapeHtml(messages.signOut)}</button>
@@ -606,6 +705,15 @@ function hasLogAuditStore(value: AdmissionStore): value is AdmissionStore & LogA
   return typeof (value as Partial<LogAuditStore>).recordLogAccess === "function";
 }
 
+function hasExperimentStore(value: TimelineStore | null): value is TimelineStore & ExperimentStore {
+  if (!value) return false;
+  const candidate = value as Partial<ExperimentStore>;
+  return typeof candidate.createExperiment === "function"
+    && typeof candidate.updateExperiment === "function"
+    && typeof candidate.getExperiment === "function"
+    && typeof candidate.listExperiments === "function";
+}
+
 function requestHeaders(request: IncomingMessage): Headers {
   const headers = new Headers();
   for (const [name, value] of Object.entries(request.headers ?? {})) {
@@ -761,6 +869,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   };
   const membershipStore = hasMembershipStore(admissionStore) ? admissionStore : null;
   const timelineStore = options.timelineStore ?? database.timeline ?? null;
+  const experimentStore = options.experimentStore ?? database.experiments ?? (hasExperimentStore(timelineStore) ? timelineStore : null);
   const logAuditStore = hasLogAuditStore(admissionStore) ? admissionStore : undefined;
 
   const scopeForSession = (session: AuthenticatedSession): Promise<ClusterScope | null> => clusterScopeStore.get(session.member.workspaceId);
@@ -802,7 +911,32 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       ...(attention === null || attention === "" || (allowInternalFlash && attention === "reviewed") ? {} : { attention: attention === "unread" ? "true" : attention, ...(attention === "unread" ? { unread: "true" } : {}) }),
       ...(url.searchParams.get("unread") === null ? {} : { unread: url.searchParams.get("unread") }),
     };
-  };
+  const formExperimentInput = (form: URLSearchParams): Record<string, unknown> => ({
+    hypothesis: form.get("hypothesis") ?? "",
+    change: form.get("change") ?? "",
+    observation: form.get("observation") ?? "",
+    conclusion: form.get("conclusion") ?? "",
+    state: form.get("state") ?? "draft",
+    tags: (form.get("tags") ?? "").split(/\r?\n|,/).map((value) => value.trim()).filter(Boolean),
+    workloads: (form.get("workloads") ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
+      const parts = line.split("|").map((value) => value.trim());
+      if (parts.length !== 4) return line;
+      const [clusterId = "", namespace = "", kind = "", name = ""] = parts;
+      return { clusterId, namespace, kind, name };
+    }),
+    gitRevision: form.get("gitRevision")?.trim() || null,
+  });
+
+  const parseExperimentRequest = async (request: IncomingMessage): Promise<unknown> => {
+    const body = await requestBody(request);
+    if (request.headers?.["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() === "application/json") {
+      try {
+        return JSON.parse(body) as unknown;
+      } catch {
+        return null;
+      }
+    }
+    return formExperimentInput(new URLSearchParams(body));
 
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
     void (async () => {
@@ -966,6 +1100,70 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         sendJson(response, 200, result);
         return;
       }
+      const experimentMatch = requestUrl.pathname.match(/^\/api\/experiments\/([^/]+)$/);
+      if (requestUrl.pathname === "/api/experiments" || experimentMatch) {
+        const lookup = await sessionForRequest(request);
+        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (!hasTimelineAccess(lookup.session)) {
+          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
+          return;
+        }
+        if (!experimentStore) {
+          sendJson(response, 503, { error: "experiment_store_unavailable" });
+          return;
+        }
+        if (method === "GET") {
+          if (experimentMatch) {
+            const experiment = await experimentStore.getExperiment(lookup.session.member.workspaceId, experimentMatch[1] ?? "");
+            if (!experiment) {
+              sendJson(response, 404, { error: "experiment_not_found" });
+              return;
+            }
+            sendJson(response, 200, { experiment });
+          } else {
+            sendJson(response, 200, { experiments: await experimentStore.listExperiments(lookup.session.member.workspaceId) });
+          }
+          return;
+        }
+        const creating = requestUrl.pathname === "/api/experiments" && method === "POST";
+        const updating = Boolean(experimentMatch) && (method === "PATCH" || method === "PUT");
+        if (!creating && !updating) {
+          sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        if (!hasExperimentWrite(lookup.session.member)) {
+          sendJson(response, 403, { error: "missing_capability", capability: capabilities.experimentWrite });
+          return;
+        }
+        const input = await parseExperimentRequest(request);
+        try {
+          if (creating) {
+            const experiment = await experimentStore.createExperiment(lookup.session.member.workspaceId, lookup.session.member.id, input);
+            sendJson(response, 201, { experiment });
+          } else {
+            const experiment = await experimentStore.updateExperiment(lookup.session.member.workspaceId, experimentMatch?.[1] ?? "", input);
+            if (!experiment) {
+              sendJson(response, 404, { error: "experiment_not_found" });
+              return;
+            }
+            sendJson(response, 200, { experiment });
+          }
+        } catch (error: unknown) {
+          if (error instanceof ExperimentValidationError) {
+            sendJson(response, 400, { error: "invalid_experiment", issues: error.issues });
+            return;
+          }
+          if (error instanceof ExperimentLifecycleError) {
+            sendJson(response, 409, { error: "invalid_experiment_lifecycle", from: error.from, to: error.to });
+            return;
+          }
+          throw error;
+        }
+        return;
+      }
       if (requestUrl.pathname === "/api/logs/recent") {
         response.setHeader("cache-control", "no-store");
         const lookup = await sessionForRequest(request);
@@ -1111,6 +1309,91 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         response.statusCode = 303;
         response.setHeader("location", `/app?lang=${language}&attention=reviewed`);
         response.end();
+        return;
+      }
+      const experimentPageMatch = requestUrl.pathname.match(/^\/experiments\/([^/]+)$/);
+      if (requestUrl.pathname === "/experiments" || experimentPageMatch) {
+        const lookup = await sessionForRequest(request);
+        const messages = messagesFor(language);
+        if (!lookup.session) {
+          response.statusCode = lookup.rejection ? 403 : 302;
+          if (lookup.rejection) {
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderRejectionPage(language, lookup.rejection));
+          } else {
+            response.setHeader("location", `/?lang=${language}`);
+            response.end();
+          }
+          return;
+        }
+        if (!hasWorkspaceAccess(lookup.session)) {
+          response.statusCode = 403;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderRejectionPage(language, "admission_required"));
+          return;
+        }
+        if (!experimentStore) {
+          response.statusCode = 503;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }));
+          return;
+        }
+        const experiments = await experimentStore.listExperiments(lookup.session.member.workspaceId);
+        if (method === "GET") {
+          if (experimentPageMatch && !experiments.some((experiment) => experiment.id === experimentPageMatch[1])) {
+            response.statusCode = 404;
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }, [], experiments));
+            return;
+          }
+          const timelineEntries = timelineStore && hasTimelineAccess(lookup.session)
+            ? (await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, { limit: 100 })).entries
+            : [];
+          response.statusCode = 200;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), undefined, timelineEntries, experiments));
+          return;
+        }
+        const creating = requestUrl.pathname === "/experiments" && method === "POST";
+        const updating = Boolean(experimentPageMatch) && method === "POST";
+        if (!creating && !updating) {
+          response.statusCode = 405;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }, [], experiments));
+          return;
+        }
+        if (!hasExperimentWrite(lookup.session.member)) {
+          response.statusCode = 403;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentWriteDenied }, [], experiments));
+          return;
+        }
+        try {
+          if (creating) {
+            await experimentStore.createExperiment(lookup.session.member.workspaceId, lookup.session.member.id, await parseExperimentRequest(request));
+            response.statusCode = 303;
+            response.setHeader("location", `/app?lang=${language}&experiment=created`);
+          } else {
+            const updated = await experimentStore.updateExperiment(lookup.session.member.workspaceId, experimentPageMatch?.[1] ?? "", await parseExperimentRequest(request));
+            if (!updated) {
+              response.statusCode = 404;
+              response.setHeader("content-type", "text/html; charset=utf-8");
+              response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }, [], experiments));
+              return;
+            }
+            response.statusCode = 303;
+            response.setHeader("location", `/app?lang=${language}&experiment=updated`);
+          }
+          response.end();
+        } catch (error: unknown) {
+          const message = error instanceof ExperimentValidationError || error instanceof ExperimentLifecycleError
+            ? `${messages.experimentInvalid} ${error.message}`
+            : messages.experimentUnavailable;
+          const latest = await experimentStore.listExperiments(lookup.session.member.workspaceId);
+          response.statusCode = error instanceof ExperimentLifecycleError ? 409 : 400;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: message }, [], latest));
+        }
         return;
       }
       if (requestUrl.pathname === "/api/cluster" || requestUrl.pathname === "/api/cluster/scope") {
@@ -1401,12 +1684,18 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
           return;
         }
+        const experiments = experimentStore && hasTimelineAccess(lookup.session)
+          ? await experimentStore.listExperiments(lookup.session.member.workspaceId)
+          : [];
+        const experimentNotice = requestUrl.searchParams.get("experiment");
         response.statusCode = 200;
         response.setHeader("content-type", "text/html; charset=utf-8");
         response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
           saved: requestUrl.searchParams.get("cluster") === "saved",
           attentionReviewed: requestUrl.searchParams.get("attention") === "reviewed",
-        }, timelinePage.entries, timelinePage, timelineQuery));
+          ...(experimentNotice === "created" ? { experimentSaved: "created" as const } : {}),
+          ...(experimentNotice === "updated" ? { experimentSaved: "updated" as const } : {}),
+        }, timelinePage.entries, timelinePage, timelineQuery, experiments));
         return;
       }
       if (requestUrl.pathname === "/") {
@@ -1442,9 +1731,12 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
               response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
               return;
             }
+            const experiments = experimentStore && hasTimelineAccess(lookup.session)
+              ? await experimentStore.listExperiments(lookup.session.member.workspaceId)
+              : [];
             response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
               attentionReviewed: requestUrl.searchParams.get("attention") === "reviewed",
-            }, timelinePage.entries, timelinePage, timelineQuery));
+            }, timelinePage.entries, timelinePage, timelineQuery, experiments));
           } else {
             response.end(renderLoginPage(language, current.checks.database === "ready", identityAdapter));
           }

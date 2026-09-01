@@ -77,6 +77,35 @@ try {
   assert.match(await page.locator("h1").innerText(), /Shared Workspace/);
   assert.match(await page.locator("body").innerText(), /workspace:read/);
 
+  await page.goto(`http://127.0.0.1:${port}/app?lang=zh-CN`, { waitUntil: "domcontentloaded" });
+  await page.getByLabel("假设").fill("**浏览器假设**");
+  await page.getByLabel("变更").fill("调整 Deployment");
+  await page.getByLabel("观察").fill("Pod 已恢复");
+  await page.getByLabel("结论").fill("");
+  await page.getByLabel("生命周期状态").selectOption("active");
+  await page.getByLabel("标签（每行一个）").fill("浏览器一\r\n浏览器二");
+  await page.getByRole("button", { name: "创建 Experiment" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Experiment 已创建/);
+  assert.match(await page.locator("body").innerText(), /浏览器假设/);
+  assert.match(await page.locator("body").innerText(), /浏览器一, 浏览器二/);
+  const experimentId = await page.locator("article[data-experiment-id]").first().getAttribute("data-experiment-id");
+  assert.ok(experimentId);
+  await page.goto(`http://127.0.0.1:${port}/experiments/${experimentId}?lang=en`, { waitUntil: "domcontentloaded" });
+  assert.equal(await page.locator("html").getAttribute("lang"), "en");
+  assert.match(await page.locator("body").innerText(), /Experiments/);
+  assert.match(await page.locator("body").innerText(), /\*\*浏览器假设\*\*/);
+  const updateForm = page.locator("details").first();
+  await updateForm.locator("summary").click();
+  await updateForm.locator('textarea[name="conclusion"]').fill("Verified in English");
+  await updateForm.locator('select[name="state"]').selectOption("concluded");
+  await updateForm.getByRole("button", { name: "Update Experiment" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Experiment updated/);
+  await page.goto(`http://127.0.0.1:${port}/experiments/${experimentId}?lang=zh-CN`, { waitUntil: "domcontentloaded" });
+  assert.equal(await page.locator("html").getAttribute("lang"), "zh-CN");
+  assert.match(await page.locator("body").innerText(), /Verified in English/);
+
   await page.goto(`http://127.0.0.1:${port}/members?lang=zh-CN`, { waitUntil: "domcontentloaded" });
   assert.equal(await page.locator("html").getAttribute("lang"), "zh-CN");
   assert.match(await page.locator("h1").innerText(), /成员管理/);
@@ -103,6 +132,8 @@ try {
   await page.waitForLoadState("domcontentloaded");
   assert.match(await page.locator("body").innerText(), /Shared Workspace/);
   assert.match(await page.locator("body").innerText(), /do not have the Capability to read the Recent Log Window/);
+  assert.equal(await page.locator('textarea[name="hypothesis"]').count(), 0);
+  assert.equal(await page.getByRole("button", { name: "Create Experiment" }).count(), 0);
   assert.equal(await page.locator('a[href^="/members"]').count(), 0);
   const viewerInvitationAttempt = await page.evaluate(async () => (await fetch("/api/invitations", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: "another@example.test" }) })).status);
   assert.equal(viewerInvitationAttempt, 403);
