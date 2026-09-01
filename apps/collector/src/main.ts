@@ -304,8 +304,11 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   }
   if (database) {
     try {
-      await database.migrate();
-      migrationReady = true;
+      if (database.verifyMigrations) await database.verifyMigrations();
+      else if (database.kind !== "memory" && database.migrationStatus?.() !== "ready") {
+        throw new Error("Tracegarden collector migration state cannot be verified");
+      }
+      migrationReady = database.migrationStatus?.() !== "failed";
       databaseReady = await database.ping();
       if (!databaseReady) throw new Error("Tracegarden collector database readiness check failed");
     } catch (error) {

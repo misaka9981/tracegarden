@@ -83,10 +83,35 @@ export interface DatabaseBoundary {
   readonly experiments?: ExperimentStore;
   readonly retention?: RetentionStore;
   migrate(): Promise<void>;
+  verifyMigrations?(): Promise<void>;
   ping(): Promise<boolean>;
   migrationStatus?(): DatabaseMigrationStatus;
   poolState?(): DatabasePoolState;
   close(): Promise<void>;
+}
+
+export async function waitForMigrations(
+  database: Pick<DatabaseBoundary, "verifyMigrations">,
+  timeoutMs: number,
+  retryMs: number,
+): Promise<void> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isFinite(retryMs) || retryMs <= 0) {
+    throw new Error("Migration readiness wait requires positive finite durations");
+  }
+  if (!database.verifyMigrations) throw new Error("Migration verification is unavailable");
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (true) {
+    try {
+      await database.verifyMigrations();
+      return;
+    } catch (error: unknown) {
+      lastError = error;
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new Error("Tracegarden database migrations readiness timeout", { cause: lastError });
+    await new Promise((resolve) => setTimeout(resolve, Math.min(retryMs, remainingMs)));
+  }
 }
 
 export const FOUNDATION_MIGRATION_ID = "0001_foundation";
@@ -2899,6 +2924,25 @@ export class PostgresDatabase implements DatabaseBoundary {
     return this.migrationState;
   }
 
+  async verifyMigrations(): Promise<void> {
+    const pool = await this.getPool();
+    try {
+      const result = await pool.query<{ id: string }>(
+        "SELECT id FROM tracegarden_schema_migrations",
+      );
+      const applied = new Set(result.rows.map((row) => row.id));
+      if (!migrations.every(({ id }) => applied.has(id))) {
+        this.migrationState = "pending";
+        throw new Error("Tracegarden database migrations are not complete");
+      }
+      this.migrationState = "ready";
+    } catch (error) {
+      if (error instanceof Error && error.message === "Tracegarden database migrations are not complete") throw error;
+      this.migrationState = "failed";
+      throw new Error("Tracegarden database migration state could not be verified", { cause: error });
+    }
+  }
+
   poolState(): DatabasePoolState {
     const pool = this.pool as (Pool & { totalCount?: number; idleCount?: number; waitingCount?: number }) | undefined;
     return {
@@ -2988,6 +3032,10 @@ export class MemoryDatabase implements DatabaseBoundary {
 
   async migrate(): Promise<void> {
     this.migrationReady = true;
+  }
+
+  async verifyMigrations(): Promise<void> {
+    if (!this.migrationReady) throw new Error("Tracegarden database migrations are not complete");
   }
 
   migrationStatus(): DatabaseMigrationStatus {

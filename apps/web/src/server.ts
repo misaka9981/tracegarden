@@ -1113,8 +1113,11 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   let databaseReady = false;
   let startupState: "starting" | "ready" | "failed" = "starting";
   try {
-    await database.migrate();
-    migrationReady = true;
+    if (database.verifyMigrations) await database.verifyMigrations();
+    else if (database.kind !== "memory" && database.migrationStatus?.() !== "ready") {
+      throw new Error("Tracegarden database migration state cannot be verified");
+    }
+    migrationReady = database.migrationStatus?.() !== "failed";
     databaseReady = await database.ping();
     if (!databaseReady) throw new Error("Tracegarden database readiness check failed");
   } catch (error) {

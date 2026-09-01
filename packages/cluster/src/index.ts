@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import {
+  AppsV1Api,
+  BatchV1Api,
   CoreV1Api,
+  EventsV1Api,
   KubeConfig,
   Observable,
   Watch,
@@ -888,22 +891,21 @@ export class InertKubernetesAdapter implements KubernetesObservationAdapter {
 
 export type KubernetesAdapterConfiguration = Readonly<{
   endpoint: string;
-  token: string;
+  identity: "observation";
 }>;
 
 export function productionKubernetesConfiguration(
   environment: Record<string, string | undefined>,
 ): KubernetesAdapterConfiguration | null {
   const endpoint = (environment.KUBERNETES_API_SERVER ?? environment.TRACEGARDEN_KUBERNETES_API_SERVER)?.trim();
-  const token = (environment.KUBERNETES_OBSERVATION_TOKEN ?? environment.TRACEGARDEN_KUBERNETES_TOKEN)?.trim();
-  if (!endpoint || !token) return null;
+  if (!endpoint) return null;
   try {
     const url = new URL(endpoint);
-    if (url.protocol !== "https:") return null;
+    if (url.protocol !== "https:" || url.username || url.password) return null;
   } catch {
     return null;
   }
-  return { endpoint, token };
+  return { endpoint, identity: "observation" };
 }
 
 function projectedMap(value: unknown): Readonly<Record<string, string>> | undefined {
@@ -1141,11 +1143,14 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
 
   private kubeConfigForScope(scope: ClusterScope): KubeConfig {
     const kubeConfig = new KubeConfig();
+    kubeConfig.loadFromCluster();
+    const cluster = kubeConfig.getCurrentCluster();
+    if (!cluster) throw new Error("Kubernetes in-cluster credentials are unavailable");
     kubeConfig.loadFromOptions({
-      clusters: [{ name: "tracegarden-observation", server: scope.endpoint.replace(/\/+$/, ""), skipTLSVerify: false }],
-      users: [{ name: "tracegarden-observer", token: this.configuration.token }],
-      contexts: [{ name: "tracegarden-observation", cluster: "tracegarden-observation", user: "tracegarden-observer" }],
-      currentContext: "tracegarden-observation",
+      clusters: [{ ...cluster, server: scope.endpoint.replace(/\/+$/, ""), skipTLSVerify: false }],
+      users: kubeConfig.getUsers(),
+      contexts: kubeConfig.getContexts(),
+      currentContext: kubeConfig.getCurrentContext(),
     });
     return kubeConfig;
   }
@@ -1153,31 +1158,45 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
   async listResult(scope: ClusterScope, signal?: AbortSignal): Promise<KubernetesListResult> {
     const resources: KubernetesResource[] = [];
     let listResourceVersion: string | null = null;
-    const coreApi = scope.resourceKinds.includes("Pod") ? this.kubeConfigForScope(scope).makeApiClient(CoreV1Api) : null;
+    const kubeConfig = this.kubeConfigForScope(scope);
+    const coreApi = kubeConfig.makeApiClient(CoreV1Api);
+    const appsApi = kubeConfig.makeApiClient(AppsV1Api);
+    const batchApi = kubeConfig.makeApiClient(BatchV1Api);
+    const eventsApi = kubeConfig.makeApiClient(EventsV1Api);
     for (const kind of SUPPORTED_RESOURCE_KINDS) {
       if (!scope.resourceKinds.includes(kind)) continue;
-      const apiEndpoint = this.endpointForScope(scope, kind);
+      this.endpointForScope(scope, kind);
       for (const namespace of scope.namespaces) {
         signal?.throwIfAborted();
         try {
           this.contacted = true;
           let body: unknown;
-          if (kind === "Pod" && coreApi) {
-            body = signal
-              ? await coreApi.listNamespacedPod({ namespace }, requestOptionsForSignal(signal))
-              : await coreApi.listNamespacedPod({ namespace });
-          } else {
-            const plural = kind === "Event" ? "events" : `${kind.toLowerCase()}s`;
-            const endpoint = new URL(`${apiEndpoint.pathname}/namespaces/${encodeURIComponent(namespace)}/${plural}`, apiEndpoint.origin);
-            const response = await fetch(endpoint, {
-              headers: { authorization: `Bearer ${this.configuration.token}`, accept: "application/json" },
-              ...(signal ? { signal } : {}),
-            });
-            if (!response.ok) {
-              if (response.status === 410) throw new KubernetesWatchGoneError(`Kubernetes ${kind} list resource version is gone`);
-              throw new Error(`Kubernetes ${kind} list failed with HTTP ${response.status}`);
-            }
-            body = await response.json();
+          const requestOptions = signal ? requestOptionsForSignal(signal) : undefined;
+          switch (kind) {
+            case "Pod":
+              body = await coreApi.listNamespacedPod({ namespace }, requestOptions);
+              break;
+            case "Deployment":
+              body = await appsApi.listNamespacedDeployment({ namespace }, requestOptions);
+              break;
+            case "StatefulSet":
+              body = await appsApi.listNamespacedStatefulSet({ namespace }, requestOptions);
+              break;
+            case "DaemonSet":
+              body = await appsApi.listNamespacedDaemonSet({ namespace }, requestOptions);
+              break;
+            case "ReplicaSet":
+              body = await appsApi.listNamespacedReplicaSet({ namespace }, requestOptions);
+              break;
+            case "Job":
+              body = await batchApi.listNamespacedJob({ namespace }, requestOptions);
+              break;
+            case "CronJob":
+              body = await batchApi.listNamespacedCronJob({ namespace }, requestOptions);
+              break;
+            case "Event":
+              body = await eventsApi.listNamespacedEvent({ namespace }, requestOptions);
+              break;
           }
           signal?.throwIfAborted();
           const metadata = objectValue(body)?.metadata;

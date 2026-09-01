@@ -16,6 +16,9 @@ pnpm test
 pnpm test:browser
 pnpm test:container
 pnpm test:postgres
+pnpm test:chart
+pnpm chart:render
+pnpm chart:validate
 ```
 
 Run the status page without a database for a local HTTP smoke run:
@@ -24,7 +27,7 @@ Run the status page without a database for a local HTTP smoke run:
 NODE_ENV=test DATABASE_MODE=memory pnpm start
 ```
 
-For PostgreSQL-backed development, copy `.env.example`, start `postgres:18.3-alpine` with `docker compose up -d postgres`, and run the web process with `DATABASE_URL` set. `pnpm db:migrate` applies the repository-owned migrations after a build. The production Compose path builds ARM64-pinned web, collector, and one-shot migration images; web and collector wait for the migration gate and still fail closed if migrations or readiness checks fail. Both application images run as `node` with a read-only root and `/tmp` as their only writable filesystem. Start the independent collector with `DATABASE_URL` set; without explicit Kubernetes settings its adapter remains inert and does not contact a Cluster.
+For PostgreSQL-backed development, copy `.env.example`, start `postgres:18.3-alpine` with `docker compose up -d postgres`, and run the web process with `DATABASE_URL` set. `pnpm db:migrate` applies the repository-owned migrations after a build. The production Compose path builds ARM64-pinned web, collector, and one-shot migration images; web and collector wait for the migration gate, verify its committed state without running migrations, and still fail closed if migrations or readiness checks fail. Both application images run as `node` with a read-only root and `/tmp` as their only writable filesystem. Start the independent collector with `DATABASE_URL` set; without explicit Kubernetes settings its adapter remains inert and does not contact a Cluster.
 
 `pnpm env:check` requires Node.js 26.8.x and validates production database and `TIMELINE_CURSOR_SECRET` configuration. The current development host may report this check as unavailable until Node 26 is installed.
 

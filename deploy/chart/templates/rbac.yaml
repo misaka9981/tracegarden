@@ -1,0 +1,100 @@
+{{ if not .Values.serviceAccount.create }}
+{{ if or (not .Values.serviceAccount.observationName) (not .Values.serviceAccount.logsName) }}
+{{ fail "serviceAccount.observationName and serviceAccount.logsName are required when serviceAccount.create is false" }}
+{{ end }}
+{{ end }}
+{{ range .Values.rbac.namespaces }}
+{{ $namespace := . }}
+{{ $suffix := $namespace | trunc 40 | trimSuffix "-" }}
+{{ $kinds := $.Values.rbac.resourceKinds }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ printf "%s-observation-%s" (include "tracegarden.fullname" $) $suffix | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{ include "tracegarden.labels" $ | nindent 4 }}
+rules:
+{{ if or (has "Deployment" $kinds) (has "StatefulSet" $kinds) (has "DaemonSet" $kinds) (has "ReplicaSet" $kinds) }}
+  - apiGroups: ["apps"]
+    resources:
+{{ if has "Deployment" $kinds }}
+      - deployments
+{{ end }}
+{{ if has "StatefulSet" $kinds }}
+      - statefulsets
+{{ end }}
+{{ if has "DaemonSet" $kinds }}
+      - daemonsets
+{{ end }}
+{{ if has "ReplicaSet" $kinds }}
+      - replicasets
+{{ end }}
+    verbs: ["get", "list", "watch"]
+{{ end }}
+{{ if has "Pod" $kinds }}
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+{{ end }}
+{{ if or (has "Job" $kinds) (has "CronJob" $kinds) }}
+  - apiGroups: ["batch"]
+    resources:
+{{ if has "Job" $kinds }}
+      - jobs
+{{ end }}
+{{ if has "CronJob" $kinds }}
+      - cronjobs
+{{ end }}
+    verbs: ["get", "list", "watch"]
+{{ end }}
+{{ if has "Event" $kinds }}
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+{{ end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ printf "%s-logs-reader-%s" (include "tracegarden.fullname" $) $suffix | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{ include "tracegarden.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ printf "%s-observation-%s" (include "tracegarden.fullname" $) $suffix | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{ include "tracegarden.labels" $ | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tracegarden.observationServiceAccount" $ }}
+    namespace: {{ $.Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ printf "%s-observation-%s" (include "tracegarden.fullname" $) $suffix | trunc 63 | trimSuffix "-" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ printf "%s-logs-reader-%s" (include "tracegarden.fullname" $) $suffix | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{ include "tracegarden.labels" $ | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tracegarden.logsServiceAccount" $ }}
+    namespace: {{ $.Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ printf "%s-logs-reader-%s" (include "tracegarden.fullname" $) $suffix | trunc 63 | trimSuffix "-" }}
+{{ end }}

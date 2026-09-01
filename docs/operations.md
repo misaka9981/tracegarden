@@ -17,7 +17,7 @@ Copying a dump to the same VM is not considered disaster recovery. Backup or OAu
 
 ## Recent Log Window
 
-Recent Log Window requests require the owner-only `logs:read` Capability and an approved Cluster namespace. Production log access is configured with `KUBERNETES_LOG_API_SERVER` and `KUBERNETES_LOG_TOKEN`, which are separate from the collector's `KUBERNETES_API_SERVER` and `KUBERNETES_OBSERVATION_TOKEN`. Responses are ephemeral and capped at 200 lines or 1 MiB. Only Cluster, namespace, Pod, container, tail, and result-size metadata is audited; bodies never enter PostgreSQL, caches, indexes, telemetry, analytics, or exception messages.
+Recent Log Window requests require the owner-only `logs:read` Capability and an approved Cluster namespace. Production log access is configured with `KUBERNETES_LOG_API_SERVER` and the web workload's automounted logs-reader ServiceAccount, which are separate from the collector's `KUBERNETES_API_SERVER` and automounted observation ServiceAccount. Responses are ephemeral and capped at 200 lines or 1 MiB. Only Cluster, namespace, Pod, container, tail, and result-size metadata is audited; bodies never enter PostgreSQL, caches, indexes, telemetry, analytics, or exception messages.
 
 ## Observability
 
@@ -38,7 +38,7 @@ No complete monitoring stack is installed by this project. Operators choose and 
 
 The web and collector Dockerfiles use the frozen pnpm lockfile and ARM64-pinned Node.js 26.8 base image. Runtime stages contain only compiled application JavaScript, migration SQL, and production dependencies; source files, development dependencies, and configuration are omitted. Compose runs each application as the non-root `node` user with a read-only root filesystem, `no-new-privileges`, all Linux capabilities dropped, and an explicitly sized `/tmp` tmpfs.
 
-The `migrate` service is a one-shot, credential-free (apart from its database connection) gate. Web and collector depend on its successful completion and also fail closed on their own migration/database startup checks. The collector receives no Google or Kubernetes credentials; with no explicit Kubernetes settings it reports `clusterContacted: false` and remains not ready.
+The `migrate` service is a one-shot, credential-free (apart from its database connection) gate. Web and collector depend on its successful completion and verify the committed migration state at startup without running migrations themselves. The collector receives no Google or Kubernetes credentials; with no explicit Kubernetes endpoint it reports `clusterContacted: false` and remains not ready.
 
 ## Failure handling
 

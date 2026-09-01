@@ -1,3 +1,4 @@
+import { CoreV1Api, KubeConfig } from "@kubernetes/client-node";
 import {
   capabilities,
   hasCapability,
@@ -133,7 +134,6 @@ export class InertKubernetesLogAdapter implements KubernetesLogAdapter {
 
 export type KubernetesLogAdapterConfiguration = Readonly<{
   endpoint: string;
-  token: string;
   identity: "logs-reader";
 }>;
 
@@ -152,22 +152,14 @@ export function productionKubernetesLogConfiguration(
     "KUBERNETES_LOG_API_SERVER",
     "TRACEGARDEN_KUBERNETES_LOG_API_SERVER",
   ]);
-  const token = configuredValue(environment, [
-    "KUBERNETES_LOG_TOKEN",
-    "TRACEGARDEN_KUBERNETES_LOG_TOKEN",
-  ]);
-  const observationToken = configuredValue(environment, [
-    "KUBERNETES_OBSERVATION_TOKEN",
-    "TRACEGARDEN_KUBERNETES_TOKEN",
-  ]);
-  if (!endpoint || !token || token === observationToken) return null;
+  if (!endpoint) return null;
   try {
     const url = new URL(endpoint);
     if (url.protocol !== "https:" || url.username || url.password) return null;
   } catch {
     return null;
   }
-  return { endpoint, token, identity: "logs-reader" };
+  return { endpoint, identity: "logs-reader" };
 }
 
 export type KubernetesLogFetcher = (input: string | URL, init?: RequestInit) => Promise<Response>;
@@ -210,32 +202,59 @@ async function readBoundedResponse(response: Response): Promise<string> {
 
 export class ConfiguredKubernetesLogAdapter implements KubernetesLogAdapter {
   readonly kind = "production" as const;
-  readonly contacted = false;
+  contacted = false;
 
   constructor(
     readonly configuration: KubernetesLogAdapterConfiguration,
-    private readonly fetcher: KubernetesLogFetcher = (input, init) => fetch(input, init),
+    private readonly fetcher?: KubernetesLogFetcher,
   ) {}
 
+  private kubeConfig(): KubeConfig {
+    const kubeConfig = new KubeConfig();
+    kubeConfig.loadFromCluster();
+    const cluster = kubeConfig.getCurrentCluster();
+    if (!cluster) throw new Error("Kubernetes in-cluster credentials are unavailable");
+    kubeConfig.loadFromOptions({
+      clusters: [{ ...cluster, server: this.configuration.endpoint.replace(/\/+$/, ""), skipTLSVerify: false }],
+      users: kubeConfig.getUsers(),
+      contexts: kubeConfig.getContexts(),
+      currentContext: kubeConfig.getCurrentContext(),
+    });
+    return kubeConfig;
+  }
+
   async read(request: RecentLogWindowInput): Promise<KubernetesLogPayload> {
-    const endpoint = new URL(this.configuration.endpoint);
-    const basePath = endpoint.pathname.replace(/\/$/, "");
-    endpoint.pathname = `${basePath}/api/v1/namespaces/${encodeURIComponent(request.namespace)}/pods/${encodeURIComponent(request.pod)}/log`;
-    endpoint.searchParams.set("container", request.container);
-    endpoint.searchParams.set("tailLines", String(request.tail));
-    let response: Response;
+    this.contacted = true;
+    if (this.fetcher) {
+      const endpoint = new URL(this.configuration.endpoint);
+      const basePath = endpoint.pathname.replace(/\/$/, "");
+      endpoint.pathname = `${basePath}/api/v1/namespaces/${encodeURIComponent(request.namespace)}/pods/${encodeURIComponent(request.pod)}/log`;
+      endpoint.searchParams.set("container", request.container);
+      endpoint.searchParams.set("tailLines", String(request.tail));
+      let response: Response;
+      try {
+        response = await this.fetcher(endpoint);
+      } catch {
+        throw new Error("Kubernetes log request failed");
+      }
+      if (!response.ok) throw new Error("Kubernetes log request was rejected");
+      try {
+        return readBoundedResponse(response);
+      } catch {
+        throw new Error("Kubernetes log response could not be read");
+      }
+    }
     try {
-      response = await this.fetcher(endpoint, {
-        headers: { authorization: `Bearer ${this.configuration.token}` },
+      const api = this.kubeConfig().makeApiClient(CoreV1Api);
+      return await api.readNamespacedPodLog({
+        name: request.pod,
+        namespace: request.namespace,
+        container: request.container,
+        tailLines: request.tail,
+        limitBytes: LOG_MAX_BYTES,
       });
     } catch {
       throw new Error("Kubernetes log request failed");
-    }
-    if (!response.ok) throw new Error("Kubernetes log request was rejected");
-    try {
-      return readBoundedResponse(response);
-    } catch {
-      throw new Error("Kubernetes log response could not be read");
     }
   }
 }

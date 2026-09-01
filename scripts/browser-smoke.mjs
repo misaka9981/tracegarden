@@ -32,6 +32,8 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
   }
+  timelineDatabase = new PostgresDatabase(databaseUrl);
+  await timelineDatabase.migrate();
   child = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
     env: { ...process.env, NODE_ENV: "test", DATABASE_URL: databaseUrl, PORT: String(port), HOST: "127.0.0.1" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -197,8 +199,6 @@ try {
   await page.waitForLoadState("domcontentloaded");
   assert.match(await page.locator("body").innerText(), /Sign in to Tracegarden/);
 
-  timelineDatabase = new PostgresDatabase(databaseUrl);
-  await timelineDatabase.migrate();
   const timelineScope = {
     workspaceId: "workspace-single",
     clusterId: "browser-cluster",

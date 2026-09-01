@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { ServerResponse } from "node:http";
 import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../dist/apps/web/src/server.js";
-import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError, parseTimelineNotification } from "../dist/packages/db/src/index.js";
+import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError, parseTimelineNotification, waitForMigrations } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
 import { confirmCorrelationSuggestion, correlationSignalsBetween, createExperiment, ExperimentLifecycleError, ExperimentValidationError, hasCorrelationReview, hasExperimentWrite, hasRetentionManagement, parseExperimentInput, rejectCorrelationSuggestion, runRetentionCleanup, suggestCorrelationCandidates, updateRetentionPolicy } from "../dist/packages/domain/src/index.js";
@@ -30,6 +30,12 @@ import {
   validateClusterScopeInput,
 } from "../dist/packages/cluster/src/index.js";
 import { createTelemetry } from "../dist/packages/telemetry/src/index.js";
+
+const readyMemoryDatabase = async () => {
+  const database = new MemoryDatabase();
+  await database.migrate();
+  return database;
+};
 
 const exporterFailureTelemetry = createTelemetry({
   serviceName: "tracegarden-test",
@@ -148,7 +154,7 @@ assert.equal(admissionStore.memberCount(), 2);
 const productionTimeline = new MemoryObservationStore("production-test-cursor-secret");
 const productionRuntime = await createWebRuntime({
   database: {
-    kind: "postgres",
+    kind: "postgres", verifyMigrations: async () => {},
     admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "test-google-subject" }),
     clusterScope: new MemoryClusterScopeStore(),
     timeline: productionTimeline,
@@ -194,7 +200,7 @@ try {
 await assert.rejects(
   createWebRuntime({
     database: {
-      kind: "postgres",
+      kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "injected-experiment" }),
       clusterScope: new MemoryClusterScopeStore(),
       timeline: productionTimeline,
@@ -221,7 +227,7 @@ await assert.rejects(
 await assert.rejects(
   createWebRuntime({
     database: {
-      kind: "postgres",
+      kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "test-google-subject" }),
       clusterScope: new MemoryClusterScopeStore(),
       migrate: async () => {},
@@ -246,7 +252,7 @@ await assert.rejects(
 await assert.rejects(
   createWebRuntime({
     database: {
-      kind: "postgres",
+      kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "missing-timeline" }),
       clusterScope: new MemoryClusterScopeStore(),
       migrate: async () => {},
@@ -269,7 +275,7 @@ await assert.rejects(
 );
 await assert.rejects(
   createWebRuntime({
-    database: { kind: "postgres", migrate: async () => {}, ping: async () => true, close: async () => {} },
+    database: { kind: "postgres", verifyMigrations: async () => {}, migrate: async () => {}, ping: async () => true, close: async () => {} },
     environment: {
       NODE_ENV: "production",
       GOOGLE_CLIENT_ID: "test-client",
@@ -287,7 +293,7 @@ await assert.rejects(
 await assert.rejects(
   createWebRuntime({
     database: {
-      kind: "postgres",
+      kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" }),
       clusterScope: new MemoryClusterScopeStore(),
       migrate: async () => {},
@@ -337,7 +343,7 @@ const callbackAdmissionStore = new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER,
 const callbackTimeline = new MemoryObservationStore("production-test-cursor-secret");
 const callbackRuntime = await createWebRuntime({
   database: {
-    kind: "postgres",
+    kind: "postgres", verifyMigrations: async () => {},
     admission: callbackAdmissionStore,
     clusterScope: new MemoryClusterScopeStore(),
     timeline: callbackTimeline,
@@ -376,7 +382,7 @@ try {
 await assert.rejects(
   createWebRuntime({
     database: {
-      kind: "postgres",
+      kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" }),
       clusterScope: new MemoryClusterScopeStore(),
       timeline: productionTimeline,
@@ -417,7 +423,7 @@ const restrictedStore = {
   getSession: async (token) => token === restrictedSession.token ? restrictedSession : null,
 };
 const restrictedRuntime = await createWebRuntime({
-  database: new MemoryDatabase(),
+  database: await readyMemoryDatabase(),
   admissionStore: restrictedStore,
   identityAdapter,
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
@@ -442,10 +448,24 @@ try {
 
 const database = new MemoryDatabase();
 assert.equal(await database.ping(), false);
+await assert.rejects(database.verifyMigrations(), /migrations are not complete/);
 await database.migrate();
+await database.verifyMigrations();
 assert.equal(await database.ping(), true);
+let verificationAttempts = 0;
+await waitForMigrations({
+  verifyMigrations: async () => {
+    verificationAttempts += 1;
+    if (verificationAttempts < 2) throw new Error("schema is pending");
+  },
+}, 50, 1);
+assert.equal(verificationAttempts, 2);
+await assert.rejects(
+  waitForMigrations({ verifyMigrations: async () => { throw new Error("schema is pending"); } }, 20, 1),
+  /migrations readiness timeout/,
+);
 const exporterWebRuntime = await createWebRuntime({
-  database: new MemoryDatabase(),
+  database: await readyMemoryDatabase(),
   identityAdapter: new LocalIdentityAdapter(),
   telemetry: exporterFailureTelemetry,
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
@@ -477,7 +497,7 @@ try {
 } finally {
   await exporterWebRuntime.close();
 }
-const dependencyDatabase = new MemoryDatabase();
+const dependencyDatabase = await readyMemoryDatabase();
 let dependencyReady = true;
 dependencyDatabase.ping = async () => dependencyReady;
 const dependencyRuntime = await createWebRuntime({
@@ -500,7 +520,7 @@ try {
 } finally {
   await dependencyRuntime.close();
 }
-const listenFailureDatabase = new MemoryDatabase();
+const listenFailureDatabase = await readyMemoryDatabase();
 listenFailureDatabase.timeline.subscribeTimeline = async () => { throw new Error("LISTEN unavailable"); };
 const listenFailureRuntime = await createWebRuntime({
   database: listenFailureDatabase,
@@ -528,7 +548,7 @@ try {
 const bindFailureWebTelemetry = createTelemetry({ serviceName: "tracegarden-web-bind-test" });
 const occupiedWebPort = 43221;
 const occupiedWebRuntime = await createWebRuntime({
-  database: new MemoryDatabase(),
+  database: await readyMemoryDatabase(),
   identityAdapter: new LocalIdentityAdapter(),
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
   port: occupiedWebPort,
@@ -536,7 +556,7 @@ const occupiedWebRuntime = await createWebRuntime({
 try {
   await assert.rejects(
     createWebRuntime({
-      database: new MemoryDatabase(),
+      database: await readyMemoryDatabase(),
       identityAdapter: new LocalIdentityAdapter(),
       telemetry: bindFailureWebTelemetry,
       environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
@@ -851,7 +871,7 @@ if (liveObservation) {
 }
 unsubscribeLiveTimeline();
 const backpressureRuntime = await createWebRuntime({
-  database: new MemoryDatabase(),
+  database: await readyMemoryDatabase(),
   identityAdapter: new LocalIdentityAdapter(),
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
   port: 43209,
@@ -1124,25 +1144,22 @@ await assert.rejects(fetch("http://127.0.0.1:43213/health/readiness"));
 const viewerMember = ownerMember ? { ...ownerMember, role: "viewer", capabilities: [capabilities.workspaceRead, capabilities.timelineRead] } : null;
 if (viewerMember) await assert.rejects(configureClusterScope(viewerMember, scopeStore, scopeInput), /cluster:configure/);
 assert.equal(productionKubernetesConfiguration({ NODE_ENV: "production" }), null);
+const observationConfiguration = productionKubernetesConfiguration({
+  NODE_ENV: "production",
+  KUBERNETES_API_SERVER: "https://observation.example.test:6443",
+});
+assert.deepEqual(observationConfiguration, { endpoint: "https://observation.example.test:6443", identity: "observation" });
 assert.equal(productionKubernetesLogConfiguration({
   NODE_ENV: "production",
   KUBERNETES_API_SERVER: "https://observation.example.test",
-  KUBERNETES_OBSERVATION_TOKEN: "observation-token",
-}), null);
-assert.equal(productionKubernetesLogConfiguration({
-  NODE_ENV: "production",
-  KUBERNETES_LOG_API_SERVER: "https://logs.example.test",
-  KUBERNETES_LOG_TOKEN: "observation-token",
-  KUBERNETES_OBSERVATION_TOKEN: "observation-token",
 }), null);
 const logConfiguration = productionKubernetesLogConfiguration({
   NODE_ENV: "production",
   KUBERNETES_LOG_API_SERVER: "https://logs.example.test",
-  KUBERNETES_LOG_TOKEN: "logs-token",
 });
 assert.equal(logConfiguration?.identity, "logs-reader");
 assert.equal(logConfiguration?.endpoint, "https://logs.example.test");
-assert.equal(logConfiguration?.token, "logs-token");
+assert.equal("token" in (logConfiguration ?? {}), false);
 assert.ok(logConfiguration);
 assert.equal(new ConfiguredKubernetesLogAdapter(logConfiguration).contacted, false);
 const streamedLogText = "first\r\n🙂\r\nlast\r\n";
@@ -1152,7 +1169,7 @@ const configuredLogAdapter = new ConfiguredKubernetesLogAdapter(logConfiguration
   assert.match(String(url), /api\/v1\/namespaces\/tracegarden\/pods\/api-0\/log/);
   assert.match(String(url), /container=app/);
   assert.match(String(url), /tailLines=2/);
-  assert.equal(init?.headers?.authorization, "Bearer logs-token");
+  assert.equal(init?.headers, undefined);
   return new Response(new ReadableStream({
     start(controller) {
       controller.enqueue(streamedLogBytes.slice(0, emojiCut));
@@ -1170,8 +1187,9 @@ const inertAdapter = createKubernetesAdapter({ NODE_ENV: "production" });
 assert.equal(inertAdapter.kind, "inert");
 assert.equal(inertAdapter.contacted, false);
 if (savedScope) assert.deepEqual(await collectScopedResources(savedScope, inertAdapter), []);
-const configuredAdapter = new ConfiguredKubernetesAdapter({ endpoint: "https://cluster.example.test/environment", token: "local-test-token" });
+const configuredAdapter = new ConfiguredKubernetesAdapter({ endpoint: "https://cluster.example.test/environment", identity: "observation" });
 assert.equal(configuredAdapter.contacted, false);
+assert.equal(createKubernetesAdapter({ NODE_ENV: "production", KUBERNETES_API_SERVER: "https://cluster.example.test:6443" }).kind, "production");
 assert.equal(configuredAdapter.configuration.endpoint, "https://cluster.example.test/environment");
 assert.equal(compareResourceVersions("9007199254740993", "9007199254740992"), 1);
 assert.equal(compareResourceVersions("9007199254740992", "9007199254740993"), -1);
@@ -1291,7 +1309,7 @@ try {
 } finally {
   await collectorRuntime.close();
 }
-const lostCollectorDatabase = new MemoryDatabase();
+const lostCollectorDatabase = await readyMemoryDatabase();
 let lostCollectorDatabaseReady = true;
 lostCollectorDatabase.ping = async () => lostCollectorDatabaseReady;
 const lostCollectorRuntime = await createCollectorRuntime({
@@ -1354,7 +1372,7 @@ try {
   await occupiedCollectorRuntime.close();
 }
 
-const scopeDatabase = new MemoryDatabase();
+const scopeDatabase = await readyMemoryDatabase();
 let transportLogReads = 0;
 const transportLogAdapter = {
   kind: "fake",
@@ -1688,7 +1706,7 @@ if (rejectionCandidate) {
 let migrationFailed = false;
 try {
   await createWebRuntime({
-    database: { kind: "postgres", clusterScope: new MemoryClusterScopeStore(), migrate: async () => { throw new Error("migration failed"); }, ping: async () => true, close: async () => {} },
+    database: { kind: "postgres", verifyMigrations: async () => { throw new Error("migration state is pending"); }, clusterScope: new MemoryClusterScopeStore(), migrate: async () => { throw new Error("migration runner must not be called"); }, ping: async () => true, close: async () => {} },
     port: 0,
   });
 } catch {

@@ -5,5 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./dist/index.js"
+  },
+  "dependencies": {
+    "@kubernetes/client-node": "2.0.0"
   }
 }

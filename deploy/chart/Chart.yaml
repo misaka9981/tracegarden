@@ -1,0 +1,7 @@
+apiVersion: v2
+name: tracegarden
+description: Production deployment for Tracegarden
+home: https://github.com/MISAKA3389/tracegarden
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

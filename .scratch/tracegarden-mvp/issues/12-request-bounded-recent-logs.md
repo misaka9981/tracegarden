@@ -17,7 +17,7 @@
 
 ## Answer
 
-Implemented the bounded Recent Log Window through the owner-only `logs:read` Capability. Transport and scope validation cover Cluster, namespace, Pod, container, and tail; the Kubernetes log adapter uses separate `KUBERNETES_LOG_API_SERVER` and `KUBERNETES_LOG_TOKEN` settings and bounded streaming. Responses are capped at 200 lines or 1 MiB, marked `Cache-Control: no-store`, and returned only ephemerally.
+Implemented the bounded Recent Log Window through the owner-only `logs:read` Capability. Transport and scope validation cover Cluster, namespace, Pod, container, and tail; the Kubernetes log adapter uses a separate `KUBERNETES_LOG_API_SERVER` and the web workload's automounted logs-reader ServiceAccount. Responses are capped at 200 lines or 1 MiB, marked `Cache-Control: no-store`, and returned only ephemerally.
 
 Audit persistence records only access metadata (`Cluster`, namespace, Pod, container, tail, and result size) through the immutable audit table. Log bodies are excluded from database state, audit records, structured logs, traces, metrics, analytics hooks, exception messages, and API/HTML errors. Simplified Chinese and English owner/denial workflows use the fake adapter in deterministic tests.
 
