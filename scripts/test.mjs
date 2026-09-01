@@ -579,6 +579,7 @@ const scopeInput = {
   resourceKinds: ["Pod", "Deployment"],
 };
 assert.equal(validateClusterScopeInput(scopeInput).valid, true);
+assert.equal(validateClusterScopeInput({ ...scopeInput, endpoint: "http://cluster.example.test" }).valid, false);
 assert.equal(validateClusterScopeInput({ ...scopeInput, namespaces: ["Not A Namespace"] }).valid, false);
 assert.equal(validateClusterScopeInput({ ...scopeInput, resourceKinds: ["Secret"] }).valid, false);
 const deterministic = new DeterministicKubernetesAdapter([
@@ -752,6 +753,14 @@ for (const [index, conditions] of deploymentConditionOrders.entries()) {
   assert.equal(deployment?.classification, "attention");
   assert.equal(deployment?.attentionReason, "condition_failed");
 }
+const healthyConditionDeployment = savedScope ? normalizeObservation(savedScope, {
+  kind: "Deployment",
+  metadata: { name: "healthy-conditions", namespace: "tracegarden", uid: "healthy-conditions" },
+  spec: { replicas: 2 },
+  status: { availableReplicas: 2, conditions: [{ type: "Failed", status: "False" }, { type: "Degraded", status: "False" }] },
+}, "2026-01-01T00:00:00.000Z") : null;
+assert.equal(healthyConditionDeployment?.attention, false);
+assert.equal(healthyConditionDeployment?.attentionReason, null);
 
 // Each supported family gets one behavior partition: meaningful change, attention, then recovery.
 const familyFixtures = [
@@ -1673,6 +1682,11 @@ await correlationStore.recordObservation(normalizePodObservation(correlationScop
   metadata: { name: "worker", namespace: "default", uid: "correlation-worker", resourceVersion: "2", labels: { app: "api" } },
   status: { phase: "Running" },
 }, "2026-01-01T00:01:00.000Z"));
+await correlationStore.recordObservation(normalizePodObservation(correlationScope, {
+  kind: "Pod",
+  metadata: { name: "api", namespace: "default", uid: "correlation-pod-restart", resourceVersion: "3", labels: { app: "api" } },
+  status: { phase: "Running" },
+}, "2026-01-01T00:02:00.000Z"));
 const correlationExperiment = await correlationStore.createExperiment("workspace-single", ownerActor.id, {
   hypothesis: "review",
   change: "adjust workload",
@@ -1685,7 +1699,9 @@ const correlationExperiment = await correlationStore.createExperiment("workspace
 });
 const pendingCorrelation = await correlationStore.listCorrelationSuggestions("workspace-single");
 assert.ok(pendingCorrelation.length > 0);
-const experimentCorrelation = pendingCorrelation.find((candidate) => candidate.leftEntryId === correlationExperiment.timelineEntryId || candidate.rightEntryId === correlationExperiment.timelineEntryId);
+const experimentCorrelation = pendingCorrelation.find((candidate) =>
+  [candidate.leftEntryId, candidate.rightEntryId].includes(correlationExperiment.timelineEntryId)
+  && [candidate.leftEntryId, candidate.rightEntryId].includes(correlationPersisted.entry.id));
 assert.ok(experimentCorrelation);
 assert.ok(hasCorrelationReview(ownerActor));
 const confirmedCorrelation = await confirmCorrelationSuggestion(ownerActor, correlationStore, experimentCorrelation.id);
@@ -1696,6 +1712,28 @@ assert.equal(linkedObservation?.confirmedLinks?.length, 1);
 const linkedExperiment = await correlationStore.getExperiment("workspace-single", correlationExperiment.id);
 assert.equal(linkedExperiment?.confirmedLinks?.length, 1);
 if (invitedAdmission.admitted) await assert.rejects(() => rejectCorrelationSuggestion(invitedAdmission.session.member, correlationStore, experimentCorrelation.id), /Missing capability/);
+const pendingBeforeExperimentUpdate = await correlationStore.listCorrelationSuggestions("workspace-single");
+const obsoletePending = pendingBeforeExperimentUpdate
+  .find((candidate) => candidate.id !== experimentCorrelation.id && (candidate.leftEntryId === correlationExperiment.timelineEntryId || candidate.rightEntryId === correlationExperiment.timelineEntryId));
+const rejectedPending = pendingBeforeExperimentUpdate
+  .find((candidate) => candidate.id !== experimentCorrelation.id && candidate.id !== obsoletePending?.id
+    && candidate.leftEntryId !== correlationExperiment.timelineEntryId && candidate.rightEntryId !== correlationExperiment.timelineEntryId);
+assert.ok(obsoletePending);
+assert.ok(rejectedPending);
+if (obsoletePending && rejectedPending) {
+  const confirmedEvidenceBeforeUpdate = await correlationStore.getCorrelationSuggestion("workspace-single", experimentCorrelation.id);
+  const rejectedResult = await rejectCorrelationSuggestion(ownerActor, correlationStore, rejectedPending.id);
+  assert.equal(rejectedResult?.suggestion.status, "rejected");
+  const rejectedEvidenceBeforeUpdate = await correlationStore.getCorrelationSuggestion("workspace-single", rejectedPending.id);
+  await correlationStore.updateExperiment("workspace-single", correlationExperiment.id, {
+    workloads: [{ clusterId: "lab-cluster", namespace: "default", kind: "Deployment", name: "unrelated" }],
+  });
+  assert.equal((await correlationStore.listCorrelationSuggestions("workspace-single")).some((candidate) => candidate.id === obsoletePending.id), false);
+  const confirmedEvidenceAfterUpdate = await correlationStore.getCorrelationSuggestion("workspace-single", experimentCorrelation.id);
+  assert.deepEqual(confirmedEvidenceAfterUpdate, confirmedEvidenceBeforeUpdate);
+  const rejectedEvidenceAfterUpdate = await correlationStore.getCorrelationSuggestion("workspace-single", rejectedPending.id);
+  assert.deepEqual(rejectedEvidenceAfterUpdate, rejectedEvidenceBeforeUpdate);
+}
 const rejectionCandidate = (await correlationStore.listCorrelationSuggestions("workspace-single")).find((candidate) => candidate.id !== experimentCorrelation.id);
 if (rejectionCandidate) {
   const rejectedCorrelation = await rejectCorrelationSuggestion(ownerActor, correlationStore, rejectionCandidate.id);

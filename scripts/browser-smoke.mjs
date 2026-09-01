@@ -81,6 +81,38 @@ try {
   assert.match(await page.locator("body").innerText(), /Observation 保留策略已保存/);
   assert.equal(await page.locator("#retention-days").inputValue(), "30");
 
+  let timelineScope = {
+    workspaceId: "workspace-single",
+    clusterId: "",
+    name: "Browser Cluster Updated",
+    endpoint: "https://cluster.example.test",
+    namespaces: ["tracegarden"],
+    resourceKinds: ["Pod"],
+  };
+  await page.locator("#cluster-name").fill("Browser Cluster");
+  await page.locator("#cluster-endpoint").fill(timelineScope.endpoint);
+  await page.locator("#cluster-namespaces").fill("tracegarden");
+  await page.locator('input[name="resourceKinds"][value="Pod"]').check();
+  await page.getByRole("button", { name: "保存 Cluster 范围" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Cluster 观测范围已保存/);
+  const savedTimelineScope = await timelineDatabase.clusterScope.get("workspace-single");
+  assert.ok(savedTimelineScope);
+  timelineScope = { ...timelineScope, clusterId: savedTimelineScope.clusterId };
+  await page.goto(`http://127.0.0.1:${port}/app?lang=en`, { waitUntil: "domcontentloaded" });
+  await page.locator("#cluster-name").fill(timelineScope.name);
+  await page.getByRole("button", { name: "Save Cluster scope" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Cluster observation scope saved/);
+  await page.locator("#cluster-endpoint").fill("http://cluster.example.test");
+  await page.getByRole("button", { name: "Save Cluster scope" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Cluster configuration is invalid/);
+  await page.locator("#cluster-endpoint").fill(timelineScope.endpoint);
+  await page.getByRole("button", { name: "Save Cluster scope" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Cluster observation scope saved/);
+
   await page.goto(`http://127.0.0.1:${port}/app?lang=en`, { waitUntil: "domcontentloaded" });
   assert.equal(await page.title(), "Tracegarden · Shared Workspace");
   assert.equal(await page.locator("html").getAttribute("lang"), "en");
@@ -143,6 +175,11 @@ try {
   await page.waitForLoadState("domcontentloaded");
   assert.match(await page.locator("body").innerText(), /Shared Workspace/);
   assert.match(await page.locator("body").innerText(), /do not have the Capability to read the Recent Log Window/);
+  assert.match(await page.locator("body").innerText(), /do not have the Capability to configure the Cluster observation scope/);
+  assert.equal(await page.getByRole("button", { name: "Save Cluster scope" }).count(), 0);
+  await page.goto(`http://127.0.0.1:${port}/app?lang=zh-CN`, { waitUntil: "domcontentloaded" });
+  assert.match(await page.locator("body").innerText(), /你没有配置 Cluster 观测范围的 Capability/);
+  await page.goto(`http://127.0.0.1:${port}/app?lang=en`, { waitUntil: "domcontentloaded" });
   assert.equal(await page.locator('textarea[name="hypothesis"]').count(), 0);
   assert.equal(await page.getByRole("button", { name: "Create Experiment" }).count(), 0);
   assert.equal(await page.locator('a[href^="/members"]').count(), 0);
@@ -200,15 +237,6 @@ try {
   await page.waitForLoadState("domcontentloaded");
   assert.match(await page.locator("body").innerText(), /Sign in to Tracegarden/);
 
-  const timelineScope = {
-    workspaceId: "workspace-single",
-    clusterId: "browser-cluster",
-    name: "Browser Cluster",
-    endpoint: "https://cluster.example.test",
-    namespaces: ["tracegarden"],
-    resourceKinds: ["Pod"],
-  };
-  await timelineDatabase.clusterScope.save(timelineScope);
   await timelineDatabase.timeline.recordObservation(normalizePodObservation(timelineScope, {
     kind: "Pod",
     metadata: { name: "pending-review", namespace: "tracegarden", uid: "browser-pending", resourceVersion: "1" },
@@ -301,14 +329,14 @@ try {
   await page.waitForLoadState("domcontentloaded");
   assert.match(await page.locator("body").innerText(), /Marked reviewed/);
   assert.match(await page.locator("body").innerText(), /Unread Attention Items: 0/);
-  const correlationExperiment = await page.evaluate(async () => {
+  const correlationExperiment = await page.evaluate(async (clusterId) => {
     const response = await fetch("/api/experiments", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ hypothesis: "浏览器关系", change: "检查 Pod", observation: "等待审核", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "browser-cluster", namespace: "tracegarden", kind: "Pod", name: "pending-review" }] }),
+      body: JSON.stringify({ hypothesis: "浏览器关系", change: "检查 Pod", observation: "等待审核", conclusion: "", state: "active", tags: [], workloads: [{ clusterId, namespace: "tracegarden", kind: "Pod", name: "pending-review" }] }),
     });
     return { status: response.status, experiment: (await response.json()).experiment };
-  });
+  }, timelineScope.clusterId);
   assert.equal(correlationExperiment.status, 201);
   assert.ok(correlationExperiment.experiment.timelineEntryId);
   await page.goto(`http://127.0.0.1:${port}/app?lang=zh-CN`, { waitUntil: "domcontentloaded" });
@@ -321,14 +349,14 @@ try {
   assert.ok(correlationSuggestionId);
   const correlationCard = page.locator(`[data-correlation-suggestion-id="${correlationSuggestionId}"]`);
   assert.match(await correlationCard.innerText(), /浏览器关系|pending-review/);
-  const createPendingRejectionExperiment = async (hypothesis) => page.evaluate(async (value) => {
+  const createPendingRejectionExperiment = async (hypothesis) => page.evaluate(async ({ value, clusterId }) => {
     const response = await fetch("/api/experiments", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ hypothesis: value, change: "检查 Pod", observation: "保持待审核", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "browser-cluster", namespace: "tracegarden", kind: "Pod", name: "pending-review" }] }),
+      body: JSON.stringify({ hypothesis: value, change: "检查 Pod", observation: "保持待审核", conclusion: "", state: "active", tags: [], workloads: [{ clusterId, namespace: "tracegarden", kind: "Pod", name: "pending-review" }] }),
     });
     return { status: response.status, experiment: (await response.json()).experiment };
-  }, hypothesis);
+  }, { value: hypothesis, clusterId: timelineScope.clusterId });
   const chineseRejectionExperiment = await createPendingRejectionExperiment("浏览器拒绝关系");
   const englishRejectionExperiment = await createPendingRejectionExperiment("Browser rejection relationship");
   assert.equal(chineseRejectionExperiment.status, 201);

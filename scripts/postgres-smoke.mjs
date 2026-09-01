@@ -785,6 +785,118 @@ try {
     await concurrencyClient.query("ROLLBACK").catch(() => undefined);
     await concurrencyClient.end();
   }
+
+  const scopeOrderingObservation = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "scope-ordering", namespace: "tracegarden", uid: `scope-ordering-${process.pid}`, resourceVersion: "scope-ordering-1" },
+    status: { phase: "Running" },
+  }, "2099-11-02T00:00:00.000Z");
+  const scopeOrderingCheckpoint = {
+    workspaceId: observationScope.workspaceId,
+    clusterId: observationScope.clusterId,
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: `scope-ordering-${process.pid}`,
+  };
+  const previousScopeOrderingCheckpoint = await timelineStore.getIngestionCheckpoint("workspace-single", observationScope.clusterId, "Pod", "tracegarden");
+  const removedScope = { ...observationScope, namespaces: [], resourceKinds: [] };
+  const scopeLockClient = new pg.Client(databaseUrl);
+  const scopeProbeClient = new pg.Client(databaseUrl);
+  let blockedScopePersistence;
+  let pendingScopeRemoval;
+  try {
+    await scopeLockClient.connect();
+    await scopeProbeClient.connect();
+    await scopeLockClient.query("BEGIN");
+    await scopeLockClient.query("SELECT id FROM tracegarden_clusters WHERE workspace_id = $1 FOR UPDATE", [observationScope.workspaceId]);
+    blockedScopePersistence = timelineStore.recordObservationsAndCheckpoint([scopeOrderingObservation], scopeOrderingCheckpoint);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const waiting = await scopeProbeClient.query(
+        "SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%tracegarden_clusters%'",
+      );
+      if (Number(waiting.rows[0]?.count ?? 0) >= 1) break;
+      if (attempt === 99) throw new Error("scope persistence did not wait for the authoritative Cluster row lock");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    pendingScopeRemoval = collectorDatabase.clusterScope.save(removedScope);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const waiting = await scopeProbeClient.query(
+        "SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%tracegarden_clusters%'",
+      );
+      if (Number(waiting.rows[0]?.count ?? 0) >= 2) break;
+      if (attempt === 99) throw new Error("scope update did not wait behind in-flight scope validation");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await scopeLockClient.query("COMMIT");
+    const [scopeOrderingResults, savedRemovedScope] = await Promise.all([blockedScopePersistence, pendingScopeRemoval]);
+    assert.equal(scopeOrderingResults[0]?.duplicate, false);
+    assert.deepEqual(savedRemovedScope.namespaces, []);
+    assert.deepEqual(savedRemovedScope.resourceKinds, []);
+    assert.equal((await collectorDatabase.clusterScope.get(observationScope.workspaceId))?.namespaces.length, 0);
+    assert.equal((await timelineStore.getIngestionCheckpoint("workspace-single", observationScope.clusterId, "Pod", "tracegarden"))?.resourceVersion, scopeOrderingCheckpoint.resourceVersion);
+    const failClosedObservation = normalizePodObservation(observationScope, {
+      kind: "Pod",
+      metadata: { name: "scope-fail-closed", namespace: "tracegarden", uid: `scope-fail-closed-${process.pid}`, resourceVersion: "scope-fail-closed-1" },
+      status: { phase: "Running" },
+    }, "2099-11-02T00:00:01.000Z");
+    await assert.rejects(
+      timelineStore.recordObservationsAndCheckpoint([failClosedObservation], {
+        ...scopeOrderingCheckpoint,
+        resourceVersion: `scope-fail-closed-${process.pid}`,
+      }),
+      /observation checkpoint persistence failed/,
+    );
+    assert.equal((await timelineStore.getIngestionCheckpoint("workspace-single", observationScope.clusterId, "Pod", "tracegarden"))?.resourceVersion, scopeOrderingCheckpoint.resourceVersion);
+  } finally {
+    await scopeLockClient.query("ROLLBACK").catch(() => undefined);
+    await Promise.allSettled([blockedScopePersistence ?? Promise.resolve(), pendingScopeRemoval ?? Promise.resolve()]);
+    const rejectedScopeSourceIdentity = `${observationScope.clusterId}:scope-fail-closed-${process.pid}`;
+    const rejectedScopeCheckpointVersion = `scope-fail-closed-${process.pid}`;
+    const rejectedObservationRows = await scopeProbeClient.query(
+      "SELECT id FROM tracegarden_observations WHERE source_identity = $1",
+      [rejectedScopeSourceIdentity],
+    );
+    assert.equal(rejectedObservationRows.rowCount, 0);
+    const rejectedTimelineRows = await scopeProbeClient.query(
+      `SELECT t.id
+         FROM tracegarden_timeline_entries t
+         JOIN tracegarden_observations o ON o.id = t.observation_id
+        WHERE o.source_identity = $1`,
+      [rejectedScopeSourceIdentity],
+    );
+    assert.equal(rejectedTimelineRows.rowCount, 0);
+    const rejectedCheckpointRows = await scopeProbeClient.query(
+      `SELECT resource_version
+         FROM tracegarden_ingestion_checkpoints
+        WHERE workspace_id = $1 AND cluster_id = $2 AND namespace = $3 AND resource_kind = $4 AND resource_version = $5`,
+      [observationScope.workspaceId, observationScope.clusterId, "tracegarden", "Pod", rejectedScopeCheckpointVersion],
+    );
+    assert.equal(rejectedCheckpointRows.rowCount, 0);
+    await collectorDatabase.clusterScope.save(observationScope);
+    await timelineStore.clearIngestionCheckpoint(scopeOrderingCheckpoint).catch(() => undefined);
+    if (previousScopeOrderingCheckpoint) {
+      await timelineStore.recordObservationsAndCheckpoint([], {
+        workspaceId: previousScopeOrderingCheckpoint.workspaceId,
+        clusterId: previousScopeOrderingCheckpoint.clusterId,
+        namespace: previousScopeOrderingCheckpoint.namespace,
+        resourceKind: previousScopeOrderingCheckpoint.resourceKind,
+        resourceVersion: previousScopeOrderingCheckpoint.resourceVersion,
+      }).catch(() => undefined);
+    }
+    await scopeProbeClient.end().catch(() => undefined);
+    await scopeLockClient.end().catch(() => undefined);
+    const scopeOrderingCleanupClient = new pg.Client(databaseUrl);
+    await scopeOrderingCleanupClient.connect();
+    try {
+      const cleanupSources = [scopeOrderingObservation.sourceIdentity, rejectedScopeSourceIdentity];
+      await scopeOrderingCleanupClient.query("DELETE FROM tracegarden_observations WHERE source_identity = ANY($1::text[])", [cleanupSources]);
+      const remaining = await scopeOrderingCleanupClient.query("SELECT count(*)::int AS count FROM tracegarden_observations WHERE source_identity = ANY($1::text[])", [cleanupSources]);
+      assert.equal(Number(remaining.rows[0]?.count ?? 0), 0);
+    } finally {
+      await scopeOrderingCleanupClient.end();
+    }
+    assert.deepEqual((await collectorDatabase.clusterScope.get(observationScope.workspaceId))?.namespaces, observationScope.namespaces);
+  }
   unsubscribeTimeline();
   const pendingObservation = normalizePodObservation(observationScope, {
     kind: "Pod",
@@ -848,6 +960,7 @@ try {
   assert.equal(rejectedCorrelationResponse.status, 200);
   const remainingSuggestions = (await (await fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions`, { headers: { cookie: ownerCookie } })).json()).suggestions;
   assert.equal(remainingSuggestions.some((candidate) => candidate.id === rejectedCorrelationSuggestion.id), false);
+
   const viewerRoleResponse = await fetch(`http://127.0.0.1:${webPort}/api/members/${invitedSessionBody.member.id}/role`, {
     method: "PATCH",
     headers: { cookie: ownerCookie, "content-type": "application/json" },
@@ -1074,31 +1187,36 @@ try {
   assert.ok(await timelineStore.getTimelineEntry("workspace-single", refreshFailureEntryId));
 
   const concurrentNamespaces = ["concurrent-alpha", "concurrent-beta", "concurrent-gamma", "concurrent-delta", "concurrent-epsilon"];
-  const concurrentWrites = Promise.all(concurrentNamespaces.map((namespace, index) => {
-    const observation = normalizePodObservation({ ...observationScope, namespaces: [namespace] }, {
-      kind: "Pod",
-      metadata: { name: `concurrent-${index}`, namespace, uid: `pod-uid-concurrent-${index}`, resourceVersion: "1" },
-      status: { phase: "Running" },
-    }, "2099-12-02T00:00:00.000Z");
-    return timelineStore.recordObservationsAndCheckpoint([observation], {
-      workspaceId: observationScope.workspaceId,
-      clusterId: observationScope.clusterId,
-      namespace,
-      resourceKind: "Pod",
-      resourceVersion: "1",
-    });
-  }));
-  let concurrentTimeout;
-  const concurrentResults = await Promise.race([
-    concurrentWrites,
-    new Promise((_, reject) => {
-      concurrentTimeout = setTimeout(() => reject(new Error("concurrent namespace writes timed out")), 5000);
-    }),
-  ]);
-  clearTimeout(concurrentTimeout);
-  assert.equal(concurrentResults.length, concurrentNamespaces.length);
-  const concurrentCheckpoints = await Promise.all(concurrentNamespaces.map((namespace) => timelineStore.getIngestionCheckpoint("workspace-single", observationScope.clusterId, "Pod", namespace)));
-  assert.ok(concurrentCheckpoints.every((checkpoint) => checkpoint?.resourceVersion === "1"));
+  await collectorDatabase.clusterScope.save({ ...observationScope, namespaces: concurrentNamespaces });
+  try {
+    const concurrentWrites = Promise.all(concurrentNamespaces.map((namespace, index) => {
+      const observation = normalizePodObservation({ ...observationScope, namespaces: [namespace] }, {
+        kind: "Pod",
+        metadata: { name: `concurrent-${index}`, namespace, uid: `pod-uid-concurrent-${index}`, resourceVersion: "1" },
+        status: { phase: "Running" },
+      }, "2099-12-02T00:00:00.000Z");
+      return timelineStore.recordObservationsAndCheckpoint([observation], {
+        workspaceId: observationScope.workspaceId,
+        clusterId: observationScope.clusterId,
+        namespace,
+        resourceKind: "Pod",
+        resourceVersion: "1",
+      });
+    }));
+    let concurrentTimeout;
+    const concurrentResults = await Promise.race([
+      concurrentWrites,
+      new Promise((_, reject) => {
+        concurrentTimeout = setTimeout(() => reject(new Error("concurrent namespace writes timed out")), 5000);
+      }),
+    ]);
+    clearTimeout(concurrentTimeout);
+    assert.equal(concurrentResults.length, concurrentNamespaces.length);
+    const concurrentCheckpoints = await Promise.all(concurrentNamespaces.map((namespace) => timelineStore.getIngestionCheckpoint("workspace-single", observationScope.clusterId, "Pod", namespace)));
+    assert.ok(concurrentCheckpoints.every((checkpoint) => checkpoint?.resourceVersion === "1"));
+  } finally {
+    await collectorDatabase.clusterScope.save(observationScope);
+  }
 
   const originalExperimentRefreshCorrelationSuggestions = timelineStore.refreshCorrelationSuggestions;
   const originalExperimentConsoleError = console.error;
@@ -1237,6 +1355,38 @@ try {
   clearTimeout(concurrentExperimentUpdateTimeout);
   assert.equal(concurrentUpdatedExperiments.length, 5);
   assert.ok(concurrentUpdatedExperiments.every((experiment) => experiment?.state === "concluded"));
+
+  const parityObservations = await Promise.all(["a", "b", "c"].map((suffix, index) => timelineStore.recordObservation(normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "parity-api", namespace: "tracegarden", uid: `pod-uid-parity-${suffix}`, resourceVersion: `parity-${index + 1}` },
+    status: { phase: "Running" },
+  }, `2099-09-02T00:00:0${index}.000Z`))));
+  const parityExperiment = await timelineStore.createExperiment("workspace-single", sessionBody.member.id, {
+    hypothesis: "correlation reconciliation parity",
+    change: "inspect Pod",
+    observation: "preserve decided evidence",
+    conclusion: "",
+    state: "active",
+    tags: [],
+    workloads: [{ clusterId: observationScope.clusterId, namespace: "tracegarden", kind: "Pod", name: "parity-api" }],
+  });
+  const parityCandidateFor = async (entryId) => (await timelineStore.listCorrelationSuggestions("workspace-single"))
+    .find((candidate) => (candidate.leftEntryId === parityExperiment.timelineEntryId || candidate.rightEntryId === parityExperiment.timelineEntryId)
+      && (candidate.leftEntryId === entryId || candidate.rightEntryId === entryId));
+  const parityCandidates = await Promise.all(parityObservations.map(({ entry }) => parityCandidateFor(entry.id)));
+  assert.ok(parityCandidates.every((candidate) => candidate));
+  const parityConfirmedResult = await timelineStore.decideCorrelationSuggestion("workspace-single", parityCandidates[0].id, sessionBody.member.id, "confirm");
+  const parityRejectedResult = await timelineStore.decideCorrelationSuggestion("workspace-single", parityCandidates[1].id, sessionBody.member.id, "reject");
+  assert.equal(parityConfirmedResult?.suggestion.status, "confirmed");
+  assert.equal(parityRejectedResult?.suggestion.status, "rejected");
+  const confirmedParityEvidence = await timelineStore.getCorrelationSuggestion("workspace-single", parityCandidates[0].id);
+  const rejectedParityEvidence = await timelineStore.getCorrelationSuggestion("workspace-single", parityCandidates[1].id);
+  await timelineStore.updateExperiment("workspace-single", parityExperiment.id, {
+    workloads: [{ clusterId: observationScope.clusterId, namespace: "tracegarden", kind: "Deployment", name: "unrelated-parity" }],
+  });
+  assert.equal((await timelineStore.listCorrelationSuggestions("workspace-single")).some((candidate) => candidate.id === parityCandidates[2].id), false);
+  assert.deepEqual(await timelineStore.getCorrelationSuggestion("workspace-single", parityCandidates[0].id), confirmedParityEvidence);
+  assert.deepEqual(await timelineStore.getCorrelationSuggestion("workspace-single", parityCandidates[1].id), rejectedParityEvidence);
 
   productionWeb = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
     env: {

@@ -64,7 +64,7 @@ async function waitForHealthy(container, extraEnvironment) {
 }
 
 try {
-  compose(["up", "-d", "--build"]);
+  compose(["up", "-d", process.env.CONTAINER_SMOKE_NO_BUILD === "1" ? "--no-build" : "--build"]);
   const migrationContainer = compose(["ps", "-aq", "migrate"]);
   assert.ok(migrationContainer, "the one-shot migration gate must create a container");
   assert.equal(docker(["inspect", "-f", "{{.State.Status}}", migrationContainer]), "exited");

@@ -41,6 +41,8 @@ export const DEFAULT_COLLECTOR_BACKOFF: CollectorBackoffPolicy = {
   maxReconnectAttempts: 5,
 };
 
+export const DEFAULT_COLLECTOR_SCOPE_MONITOR_INTERVAL_MS = 1_000;
+
 export type CollectorSignals = Readonly<{
   lagSeconds: number;
   reconnects: number;
@@ -70,6 +72,7 @@ export type CollectorOptions = Readonly<{
   now?: () => Date;
   retentionCleanupIntervalMs?: number;
   retentionCleanupScheduler?: CollectorRetentionScheduler;
+  scopeMonitorIntervalMs?: number;
   telemetry?: TelemetryRuntime;
 }>;
 
@@ -86,6 +89,7 @@ export class CollectorRecoveryError extends Error {
 }
 
 class CollectorWatchBudgetExhaustedError extends CollectorRecoveryError {}
+class CollectorScopeChangedError extends CollectorRecoveryError {}
 
 export type CollectorRuntime = Readonly<{
   server: Server;
@@ -202,26 +206,43 @@ function backoffDelay(policy: CollectorBackoffPolicy, attempt: number): number {
   return Math.min(policy.maxDelayMs, policy.initialDelayMs * policy.multiplier ** attempt);
 }
 
-function namespaceScope(scope: ClusterScope, namespace: string): ClusterScope {
-  return { ...scope, namespaces: [namespace] };
+function cancellableTimer(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    if (signal.aborted) {
+      finish();
+      return;
+    }
+    signal.addEventListener("abort", finish, { once: true });
+    timer = setTimeout(finish, milliseconds);
+  });
 }
 
-function checkpointInput(scope: ClusterScope, namespace: string, resourceVersionValue: string): IngestionCheckpointInput {
+function collectionScope(scope: ClusterScope, namespace: string, resourceKind: string): ClusterScope {
+  return { ...scope, namespaces: [namespace], resourceKinds: [resourceKind as ClusterScope["resourceKinds"][number]] };
+}
+
+function checkpointInput(scope: ClusterScope, namespace: string, resourceKind: string, resourceVersionValue: string): IngestionCheckpointInput {
   return {
     workspaceId: scope.workspaceId,
     clusterId: scope.clusterId,
     namespace,
-    resourceKind: "Pod",
+    resourceKind,
     resourceVersion: resourceVersionValue,
   };
 }
 
-function checkpointIdentity(scope: ClusterScope, namespace: string): Omit<IngestionCheckpointInput, "resourceVersion"> {
+function checkpointIdentity(scope: ClusterScope, namespace: string, resourceKind: string): Omit<IngestionCheckpointInput, "resourceVersion"> {
   return {
     workspaceId: scope.workspaceId,
     clusterId: scope.clusterId,
     namespace,
-    resourceKind: "Pod",
+    resourceKind,
   };
 }
 
@@ -234,7 +255,19 @@ function hasRetentionStore(value: unknown): value is RetentionStore {
 }
 
 function hasCollectionPreconditions(scope: ClusterScope | null, adapter: KubernetesObservationAdapter): scope is ClusterScope {
-  return Boolean(scope && adapter.kind !== "inert" && scope.namespaces.length > 0 && scope.resourceKinds.includes("Pod"));
+  return Boolean(scope && adapter.kind !== "inert" && scope.namespaces.length > 0 && scope.resourceKinds.length > 0);
+}
+
+function sameScope(left: ClusterScope | null, right: ClusterScope | null): boolean {
+  if (!left || !right) return left === right;
+  return left.workspaceId === right.workspaceId
+    && left.clusterId === right.clusterId
+    && left.name === right.name
+    && left.endpoint === right.endpoint
+    && left.namespaces.length === right.namespaces.length
+    && left.namespaces.every((namespace, index) => namespace === right.namespaces[index])
+    && left.resourceKinds.length === right.resourceKinds.length
+    && left.resourceKinds.every((kind, index) => kind === right.resourceKinds[index]);
 }
 
 function isGone(error: unknown): boolean {
@@ -242,6 +275,10 @@ function isGone(error: unknown): boolean {
     || (typeof error === "object" && error !== null
       && (("statusCode" in error && (error as { statusCode?: unknown }).statusCode === 410)
         || ("code" in error && (error as { code?: unknown }).code === 410)));
+}
+
+function isScopeReadTimeout(error: unknown): boolean {
+  return error instanceof Error && error.name === "TimeoutError";
 }
 
 function watchEventStatusCode(event: KubernetesWatchEvent): number | undefined {
@@ -335,6 +372,10 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     ?? (environment.RETENTION_CLEANUP_INTERVAL_MS ? Number(environment.RETENTION_CLEANUP_INTERVAL_MS) : 24 * 60 * 60 * 1000);
   if (!Number.isSafeInteger(configuredRetentionInterval) || configuredRetentionInterval <= 0) {
     throw new Error("Invalid retention cleanup interval");
+  }
+  const configuredScopeMonitorInterval = options.scopeMonitorIntervalMs ?? DEFAULT_COLLECTOR_SCOPE_MONITOR_INTERVAL_MS;
+  if (!Number.isSafeInteger(configuredScopeMonitorInterval) || configuredScopeMonitorInterval <= 0) {
+    throw new Error("Invalid collector scope monitor interval");
   }
   const signalState = {
     lagSeconds: 0,
@@ -434,7 +475,18 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     return () => clearInterval(timer);
   });
 
-  const configuredScope = async (): Promise<ClusterScope | null> => options.scope ?? await database?.clusterScope?.get(WORKSPACE_ID) ?? null;
+  let persistedScopeSeen = false;
+  const configuredScope = async (signal?: AbortSignal): Promise<ClusterScope | null> => {
+    if (database?.clusterScope) {
+      const persisted = await database.clusterScope.get(WORKSPACE_ID, signal);
+      if (persisted) {
+        persistedScopeSeen = true;
+        return persisted;
+      }
+      if (persistedScopeSeen || database.kind === "postgres") return null;
+    }
+    return options.scope ?? null;
+  };
   try {
     const initialScope = await configuredScope();
     collectionReady = hasCollectionPreconditions(initialScope, adapter);
@@ -445,12 +497,16 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
 
   const list = async (scope: ClusterScope, signal?: AbortSignal): Promise<KubernetesListResult> => {
     signal?.throwIfAborted();
-    if (adapter.listResult) {
-      const result = await adapter.listResult(scope, signal);
-      return { ...result, resources: result.resources.filter((resource) => isResourceInScope(scope, resource)) };
+    const result = adapter.listResult
+      ? await adapter.listResult(scope, signal)
+      : { resources: await adapter.list(scope, signal) };
+    const outOfScope = result.resources.find((resource) => !isResourceInScope(scope, resource));
+    if (outOfScope) {
+      throw new CollectorRecoveryError(`Collector rejected ${outOfScope.kind || "Kubernetes"} object outside the approved scope`);
     }
-    const resources = (await adapter.list(scope, signal)).filter((resource) => isResourceInScope(scope, resource));
-    return { resources, resourceVersion: listResourceVersion({ resources }) };
+    return adapter.listResult
+      ? result
+      : { ...result, resourceVersion: listResourceVersion(result) };
   };
   const normalizeResources = (scope: ClusterScope, resources: readonly KubernetesResource[], observedAt?: string): NormalizedObservation[] => {
     const normalized: NormalizedObservation[] = [];
@@ -524,7 +580,8 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
 
   const collect = async (): Promise<readonly KubernetesResource[]> => {
     const scope = await configuredScope();
-    return scope ? collectScopedResources(scope, adapter) : [];
+    if (!hasCollectionPreconditions(scope, adapter)) return [];
+    return collectScopedResources(scope, adapter);
   };
 
   const collectObservations = async (): Promise<readonly ObservationPersistenceResult[]> => {
@@ -552,22 +609,24 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   const synchronizeList = async (
     scope: ClusterScope,
     namespace: string,
+    resourceKind: string,
     signal: AbortSignal,
   ): Promise<string> => {
-    const result = await list(namespaceScope(scope, namespace), signal);
+    const streamScope = collectionScope(scope, namespace, resourceKind);
+    const result = await list(streamScope, signal);
     const version = listResourceVersion(result);
     if (!version) {
       throw new CollectorRecoveryError("Collector recovery boundary: Kubernetes list did not return a resourceVersion");
     }
-    const normalized = normalizeResources(namespaceScope(scope, namespace), result.resources);
-    await persistWithCheckpoint(normalized, checkpointInput(scope, namespace, version));
+    const normalized = normalizeResources(streamScope, result.resources);
+    await persistWithCheckpoint(normalized, checkpointInput(scope, namespace, resourceKind, version));
     return version;
   };
 
-  const checkpoint = async (scope: ClusterScope, namespace: string): Promise<IngestionCheckpoint | null> => {
+  const checkpoint = async (scope: ClusterScope, namespace: string, resourceKind: string): Promise<IngestionCheckpoint | null> => {
     if (!observationStore?.getIngestionCheckpoint) return null;
     try {
-      return await observationStore.getIngestionCheckpoint(scope.workspaceId, scope.clusterId, "Pod", namespace);
+      return await observationStore.getIngestionCheckpoint(scope.workspaceId, scope.clusterId, resourceKind, namespace);
     } catch (error) {
       signalState.persistenceFailures += 1;
       telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: error instanceof Error ? error.name : "unknown" });
@@ -576,7 +635,7 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     }
   };
 
-  const clearCheckpoint = async (scope: ClusterScope, namespace: string): Promise<void> => {
+  const clearCheckpoint = async (scope: ClusterScope, namespace: string, resourceKind: string): Promise<void> => {
     if (!observationStore?.clearIngestionCheckpoint) {
       signalState.persistenceFailures += 1;
       telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: "unavailable" });
@@ -584,7 +643,7 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
       throw new CollectorRecoveryError("Collector recovery boundary: transactional checkpoint clearing is unavailable");
     }
     try {
-      await observationStore.clearIngestionCheckpoint(checkpointIdentity(scope, namespace));
+      await observationStore.clearIngestionCheckpoint(checkpointIdentity(scope, namespace, resourceKind));
     } catch (error) {
       signalState.persistenceFailures += 1;
       telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: error instanceof Error ? error.name : "unknown" });
@@ -602,6 +661,29 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     syncCollectorMetrics();
   };
 
+  const monitorPersistedScope = async (
+    scope: ClusterScope,
+    signal: AbortSignal,
+    abortIteration: () => void,
+  ): Promise<"changed" | "cancelled"> => {
+    if (!database?.clusterScope) return "cancelled";
+    while (!stopping && !signal.aborted) {
+      await cancellableTimer(configuredScopeMonitorInterval, signal);
+      if (stopping || signal.aborted) return "cancelled";
+      let latestScope: ClusterScope | null;
+      try {
+        latestScope = await configuredScope(signal);
+      } catch {
+        continue;
+      }
+      if (!sameScope(scope, latestScope)) {
+        abortIteration();
+        return "changed";
+      }
+    }
+    return "cancelled";
+  };
+
   const runWatch = async (watchOptions: CollectorWatchOptions = {}): Promise<void> => {
     const maxReconnectAttempts = watchOptions.maxReconnectAttempts ?? policy.maxReconnectAttempts;
     if (!Number.isSafeInteger(maxReconnectAttempts) || maxReconnectAttempts < 0) {
@@ -609,8 +691,8 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     }
     if (activeWatch) return activeWatch;
     const promise = (async (): Promise<void> => {
-      const scope = await configuredScope();
-      if (!hasCollectionPreconditions(scope, adapter)) {
+      const initialScope = await configuredScope();
+      if (!hasCollectionPreconditions(initialScope, adapter)) {
         collectionReady = false;
         syncCollectorMetrics();
         return;
@@ -632,101 +714,159 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
       watchOptions.signal?.addEventListener("abort", abortWatch, { once: true });
       if (shutdownController.signal.aborted || watchOptions.signal?.aborted) watchController.abort();
       const signal = watchController.signal;
-      const runNamespace = async (namespace: string): Promise<void> => {
-        const streamScope = namespaceScope(scope, namespace);
-        let currentVersion = (await checkpoint(scope, namespace))?.resourceVersion ?? null;
-        if (currentVersion) rememberResourceVersion(currentVersion);
-        let needsRelist = !currentVersion;
-        let recoveryAttempts = 0;
-        let backoffAttempts = 0;
+      try {
         while (!stopping && !signal.aborted) {
-          try {
-            if (needsRelist) {
-              currentVersion = await synchronizeList(scope, namespace, signal);
-              needsRelist = false;
-            }
-            const stream = await watch.call(adapter, streamScope, currentVersion, signal);
-            for await (const event of stream) {
-              if (stopping || signal.aborted) return;
-              if (event.type === "ERROR") {
-                const reason = watchEventReason(event);
-                if (watchEventStatusCode(event) === 410) throw new KubernetesWatchGoneError(reason ?? "Kubernetes watch resource version is gone");
-                throw new KubernetesWatchDisconnectedError(reason ?? "Kubernetes watch returned an error");
-              }
-              const eventVersion = typeof event.resourceVersion === "string" && event.resourceVersion.trim()
-                ? event.resourceVersion.trim()
-                : null;
-              const version = eventVersion ?? (event.resource ? resourceVersion(event.resource) : null);
-              updateLag(event.observedAt);
-              if (event.type === "BOOKMARK") {
-                if (version && shouldAdvanceResourceVersion(version, currentVersion)) {
-                  await persistWithCheckpoint([], checkpointInput(scope, namespace, version));
-                  collectionReady = true;
-                  currentVersion = version;
+          const scope = await configuredScope(signal);
+          if (!hasCollectionPreconditions(scope, adapter)) {
+            collectionReady = false;
+            syncCollectorMetrics();
+            return;
+          }
+          const budgetFailures: CollectorWatchBudgetExhaustedError[] = [];
+          const runCollection = async (namespace: string, resourceKind: string, streamSignal: AbortSignal): Promise<void> => {
+            const streamScope = collectionScope(scope, namespace, resourceKind);
+            let currentVersion = (await checkpoint(scope, namespace, resourceKind))?.resourceVersion ?? null;
+            if (currentVersion) rememberResourceVersion(currentVersion);
+            let needsRelist = !currentVersion;
+            let recoveryAttempts = 0;
+            let backoffAttempts = 0;
+            while (!stopping && !streamSignal.aborted) {
+              try {
+                const latestScope = await configuredScope(streamSignal);
+                if (!sameScope(scope, latestScope)) throw new CollectorScopeChangedError("Persisted Cluster scope changed");
+                if (needsRelist) {
+                  currentVersion = await synchronizeList(scope, namespace, resourceKind, streamSignal);
+                  needsRelist = false;
                 }
+                const stream = await watch.call(adapter, streamScope, currentVersion, streamSignal);
+                for await (const event of stream) {
+                  if (stopping || streamSignal.aborted) return;
+                  const eventScope = await configuredScope(streamSignal);
+                  if (!sameScope(scope, eventScope)) throw new CollectorScopeChangedError("Persisted Cluster scope changed");
+                  if (event.type === "ERROR") {
+                    const reason = watchEventReason(event);
+                    if (watchEventStatusCode(event) === 410) throw new KubernetesWatchGoneError(reason ?? "Kubernetes watch resource version is gone");
+                    throw new KubernetesWatchDisconnectedError(reason ?? "Kubernetes watch returned an error");
+                  }
+                  const eventVersion = typeof event.resourceVersion === "string" && event.resourceVersion.trim()
+                    ? event.resourceVersion.trim()
+                    : null;
+                  const version = eventVersion ?? (event.resource ? resourceVersion(event.resource) : null);
+                  updateLag(event.observedAt);
+                  if (event.type === "BOOKMARK") {
+                    if (version && shouldAdvanceResourceVersion(version, currentVersion)) {
+                      await persistWithCheckpoint([], checkpointInput(scope, namespace, resourceKind, version));
+                      collectionReady = true;
+                      currentVersion = version;
+                      recoveryAttempts = 0;
+                      backoffAttempts = 0;
+                    }
+                    continue;
+                  }
+                  if (!event.resource) throw new KubernetesWatchDisconnectedError("Kubernetes watch event has no resource");
+                  const observedAt = event.observedAt ?? now().toISOString();
+                  const normalized = normalizeResources(streamScope, [event.resource], observedAt);
+                  if (version && shouldAdvanceResourceVersion(version, currentVersion)) {
+                    await persistWithCheckpoint(normalized, checkpointInput(scope, namespace, resourceKind, version));
+                    collectionReady = true;
+                    currentVersion = version;
+                    recoveryAttempts = 0;
+                    backoffAttempts = 0;
+                  } else {
+                    await persistWithoutCheckpoint(normalized);
+                    collectionReady = true;
+                  }
+                  updateLag(observedAt);
+                }
+                throw new KubernetesWatchDisconnectedError();
+              } catch (error) {
+                if (stopping || streamSignal.aborted || watchOptions.signal?.aborted) return;
+                if (error instanceof CollectorScopeChangedError) throw error;
+                if (!(error instanceof CollectorRecoveryError) && !isScopeReadTimeout(error)) {
+                  const latestScope = await configuredScope(streamSignal);
+                  if (!sameScope(scope, latestScope)) throw new CollectorScopeChangedError("Persisted Cluster scope changed");
+                }
+                if (error instanceof CollectorRecoveryError) throw error;
+                if (recoveryAttempts >= maxReconnectAttempts) {
+                  throw new CollectorWatchBudgetExhaustedError("Collector recovery boundary: bounded Kubernetes watch reconnect/recovery attempts exhausted", { cause: error });
+                }
+                recoveryAttempts += 1;
+                if (isGone(error)) {
+                  signalState.relists += 1;
+                  telemetry.log("warn", "collector.watch.relist", telemetry.correlation("collector-watch"), { namespace, resource_kind: resourceKind, error_type: "resource_version_gone" });
+                  syncCollectorMetrics();
+                  currentVersion = null;
+                  needsRelist = true;
+                  await clearCheckpoint(scope, namespace, resourceKind);
+                  continue;
+                }
+                signalState.reconnects += 1;
+                const delay = backoffDelay(policy, backoffAttempts);
+                telemetry.log("warn", "collector.watch.reconnect", telemetry.correlation("collector-watch"), { namespace, resource_kind: resourceKind, attempt: recoveryAttempts, delay_ms: delay, error_type: error instanceof Error ? error.name : "unknown" });
+                backoffAttempts += 1;
+                signalState.backoffDelaysMs.push(delay);
+                syncCollectorMetrics();
+                await cancellableSleep(sleep, delay, streamSignal);
+              }
+            }
+          };
+          const runCollectionWithIsolation = async (namespace: string, resourceKind: string): Promise<boolean> => {
+            try {
+              await runCollection(namespace, resourceKind, iterationSignal);
+              return true;
+            } catch (error) {
+              if (error instanceof CollectorScopeChangedError) throw error;
+              if (!(error instanceof CollectorWatchBudgetExhaustedError)) throw error;
+              if (!signalState.failedNamespaces.includes(namespace)) signalState.failedNamespaces.push(namespace);
+              budgetFailures.push(error);
+              return false;
+            }
+          };
+          const collections = scope.namespaces.flatMap((namespace) => scope.resourceKinds.map((resourceKind) => [namespace, resourceKind] as const));
+          const iterationController = new AbortController();
+          const abortIteration = (): void => iterationController.abort();
+          signal.addEventListener("abort", abortIteration, { once: true });
+          const iterationSignal = iterationController.signal;
+          const collectionPromises = collections.map(([namespace, resourceKind]) => runCollectionWithIsolation(namespace, resourceKind));
+          const collectionResultsPromise = Promise.all(collectionPromises);
+          const scopeMonitorPromise = monitorPersistedScope(scope, iterationSignal, abortIteration);
+          try {
+            const outcome = await Promise.race([
+              collectionResultsPromise.then((results) => ({ type: "collections" as const, results })),
+              scopeMonitorPromise.then((result) => ({ type: "monitor" as const, result })),
+            ]);
+            if (outcome.type === "monitor") {
+              if (outcome.result === "changed") {
+                collectionReady = false;
+                await Promise.allSettled(collectionPromises);
                 continue;
               }
-              if (!event.resource) throw new KubernetesWatchDisconnectedError("Kubernetes watch event has no resource");
-              const observedAt = event.observedAt ?? now().toISOString();
-              const normalized = normalizeResources(streamScope, [event.resource], observedAt);
-              if (version && shouldAdvanceResourceVersion(version, currentVersion)) {
-                await persistWithCheckpoint(normalized, checkpointInput(scope, namespace, version));
-                collectionReady = true;
-                currentVersion = version;
-              } else {
-                await persistWithoutCheckpoint(normalized);
-                collectionReady = true;
-              }
-              updateLag(observedAt);
+              const collectionResults = await collectionResultsPromise;
+              collectionReady = collectionResults.every((result) => result);
+              if (collectionResults.every((result) => !result) && budgetFailures[0]) throw budgetFailures[0];
+              return;
             }
-            throw new KubernetesWatchDisconnectedError();
+            collectionReady = outcome.results.every((result) => result);
+            if (outcome.results.every((result) => !result) && budgetFailures[0]) throw budgetFailures[0];
+            return;
           } catch (error) {
-            if (error instanceof CollectorRecoveryError) throw error;
             if (stopping || signal.aborted || watchOptions.signal?.aborted) return;
-            if (recoveryAttempts >= maxReconnectAttempts) {
-              throw new CollectorWatchBudgetExhaustedError("Collector recovery boundary: bounded Kubernetes watch reconnect/recovery attempts exhausted", { cause: error });
-            }
-            recoveryAttempts += 1;
-            if (isGone(error)) {
-              signalState.relists += 1;
-              telemetry.log("warn", "collector.watch.relist", telemetry.correlation("collector-watch"), { namespace, error_type: "resource_version_gone" });
-              syncCollectorMetrics();
-              currentVersion = null;
-              needsRelist = true;
-              await clearCheckpoint(scope, namespace);
+            if (error instanceof CollectorScopeChangedError) {
+              collectionReady = false;
+              iterationController.abort();
+              await Promise.allSettled(collectionPromises);
               continue;
             }
-            signalState.reconnects += 1;
-            const delay = backoffDelay(policy, backoffAttempts);
-            telemetry.log("warn", "collector.watch.reconnect", telemetry.correlation("collector-watch"), { namespace, attempt: recoveryAttempts, delay_ms: delay, error_type: error instanceof Error ? error.name : "unknown" });
-            backoffAttempts += 1;
-            signalState.backoffDelaysMs.push(delay);
-            syncCollectorMetrics();
-            await cancellableSleep(sleep, delay, signal);
+            collectionReady = false;
+            telemetry.log("error", "collector.watch.failure", telemetry.correlation("collector-watch"), { error_type: error instanceof Error ? error.name : "unknown" });
+            watchController.abort();
+            throw error;
+          } finally {
+            signal.removeEventListener("abort", abortIteration);
+            if (!iterationSignal.aborted) iterationController.abort();
+            await scopeMonitorPromise.catch(() => undefined);
           }
         }
-      };
-      const budgetFailures: CollectorWatchBudgetExhaustedError[] = [];
-      const runNamespaceWithIsolation = async (namespace: string): Promise<boolean> => {
-        try {
-          await runNamespace(namespace);
-          return true;
-        } catch (error) {
-          if (!(error instanceof CollectorWatchBudgetExhaustedError)) throw error;
-          if (!signalState.failedNamespaces.includes(namespace)) signalState.failedNamespaces.push(namespace);
-          budgetFailures.push(error);
-          return false;
-        }
-      };
-      try {
-        const namespaceResults = await Promise.all(scope.namespaces.map(runNamespaceWithIsolation));
-        collectionReady = namespaceResults.every((result) => result);
-        if (namespaceResults.every((result) => !result) && budgetFailures[0]) throw budgetFailures[0];
-      } catch (error) {
-        collectionReady = false;
-        telemetry.log("error", "collector.watch.failure", telemetry.correlation("collector-watch"), { error_type: error instanceof Error ? error.name : "unknown" });
-        watchController.abort();
-        throw error;
       } finally {
         shutdownController.signal.removeEventListener("abort", abortWatch);
         watchOptions.signal?.removeEventListener("abort", abortWatch);
@@ -832,8 +972,11 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   if (options.collectOnStart) {
     try {
       const startupScope = await configuredScope();
+      const startupCollections = startupScope && hasCollectionPreconditions(startupScope, adapter)
+        ? startupScope.namespaces.flatMap((namespace) => startupScope.resourceKinds.map((resourceKind) => [namespace, resourceKind] as const))
+        : [];
       const startupCheckpoints = startupScope
-        ? await Promise.all(startupScope.namespaces.map((namespace) => checkpoint(startupScope, namespace)))
+        ? await Promise.all(startupCollections.map(([namespace, resourceKind]) => checkpoint(startupScope, namespace, resourceKind)))
         : [];
       if (!startupScope || startupCheckpoints.some((value) => !value)) await collectObservations();
     } catch (error) {

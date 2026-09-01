@@ -325,6 +325,9 @@ export class MemoryAdmissionStore implements AdmissionStore, MembershipStore, Lo
 }
 
 type PoolProvider = () => Promise<Pool>;
+const CLUSTER_SCOPE_READ_TIMEOUT_MS = 1_000;
+const POSTGRES_POOL_CONNECTION_TIMEOUT_MS = CLUSTER_SCOPE_READ_TIMEOUT_MS - 100;
+
 type ClusterRow = Readonly<{
   id: string;
   workspace_id: string;
@@ -788,17 +791,27 @@ export class MemoryObservationStore implements TimelineStore, TimelineNotificati
     }
   }
 
-  private async validateConfiguredCluster(workspaceId: string, clusterId: string, recordName: string): Promise<void> {
+  private async validateConfiguredCluster(
+    workspaceId: string,
+    clusterId: string,
+    recordName: string,
+    namespace?: string,
+    resourceKind?: string,
+  ): Promise<void> {
     if (!this.clusterScopeStore) return;
     const scope = await this.clusterScopeStore.get(workspaceId);
     if (!scope || scope.clusterId !== clusterId) {
       throw new Error(`${recordName} Cluster does not belong to its Workspace`);
     }
+    if (namespace !== undefined && resourceKind !== undefined
+      && (!scope.namespaces.includes(namespace) || !scope.resourceKinds.includes(resourceKind as SupportedResourceKind))) {
+      throw new Error(`${recordName} is outside the approved Cluster scope`);
+    }
   }
 
   private async validateObservationOwnership(observations: readonly NormalizedObservation[]): Promise<void> {
     for (const observation of observations) {
-      await this.validateConfiguredCluster(observation.workspaceId, observation.clusterId, "Observation");
+      await this.validateConfiguredCluster(observation.workspaceId, observation.clusterId, "Observation", observation.namespace, observation.kind);
     }
   }
 
@@ -895,7 +908,7 @@ export class MemoryObservationStore implements TimelineStore, TimelineNotificati
     checkpoint: IngestionCheckpointInput,
   ): Promise<readonly ObservationPersistenceResult[]> {
     await this.validateObservationOwnership(observations);
-    await this.validateConfiguredCluster(checkpoint.workspaceId, checkpoint.clusterId, "Ingestion Checkpoint");
+    await this.validateConfiguredCluster(checkpoint.workspaceId, checkpoint.clusterId, "Ingestion Checkpoint", checkpoint.namespace, checkpoint.resourceKind);
     const results = this.recordObservationsInternal(observations, checkpoint);
     for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) await this.refreshCorrelationSuggestions(workspaceId);
     return results;
@@ -907,7 +920,7 @@ export class MemoryObservationStore implements TimelineStore, TimelineNotificati
   }
 
   async advanceIngestionCheckpoint(checkpoint: IngestionCheckpointInput): Promise<IngestionCheckpoint | null> {
-    await this.validateConfiguredCluster(checkpoint.workspaceId, checkpoint.clusterId, "Ingestion Checkpoint");
+    await this.validateConfiguredCluster(checkpoint.workspaceId, checkpoint.clusterId, "Ingestion Checkpoint", checkpoint.namespace, checkpoint.resourceKind);
     const key = checkpointKey(checkpoint);
     const previous = this.checkpoints.get(key);
     if (!previous || checkpointVersionShouldReplace(checkpoint.resourceVersion, previous.resourceVersion)) {
@@ -918,7 +931,7 @@ export class MemoryObservationStore implements TimelineStore, TimelineNotificati
   }
 
   async clearIngestionCheckpoint(checkpoint: Omit<IngestionCheckpointInput, "resourceVersion">): Promise<void> {
-    await this.validateConfiguredCluster(checkpoint.workspaceId, checkpoint.clusterId, "Ingestion Checkpoint");
+    await this.validateConfiguredCluster(checkpoint.workspaceId, checkpoint.clusterId, "Ingestion Checkpoint", checkpoint.namespace, checkpoint.resourceKind);
     this.checkpoints.delete(checkpointKey(checkpoint));
   }
 
@@ -979,12 +992,16 @@ export class MemoryObservationStore implements TimelineStore, TimelineNotificati
 
   private async refreshCorrelationSuggestions(workspaceId: string): Promise<void> {
     const entries = [...this.entries.values()].filter((entry) => entry.workspaceId === workspaceId);
-    for (const candidate of suggestCorrelationCandidates(entries.map(correlationEntryFor))) {
+    const candidates = suggestCorrelationCandidates(entries.map(correlationEntryFor));
+    const currentKeys = new Set(candidates.map((candidate) => `${candidate.workspaceId}\u0000${candidate.leftEntryId}\u0000${candidate.rightEntryId}`));
+    for (const [key, existing] of this.correlationSuggestions) {
+      if (existing.workspaceId === workspaceId && existing.status === "pending" && !currentKeys.has(key)) this.correlationSuggestions.delete(key);
+    }
+    for (const candidate of candidates) {
       const key = `${candidate.workspaceId}\u0000${candidate.leftEntryId}\u0000${candidate.rightEntryId}`;
       const existing = this.correlationSuggestions.get(key);
-      this.correlationSuggestions.set(key, existing
-        ? { ...existing, signals: [...candidate.signals] }
-        : candidate);
+      if (!existing) this.correlationSuggestions.set(key, candidate);
+      else if (existing.status === "pending") this.correlationSuggestions.set(key, { ...existing, signals: [...candidate.signals] });
     }
   }
 
@@ -1170,38 +1187,126 @@ function clusterFromRow(row: ClusterRow): ClusterScope {
   };
 }
 
+function clusterScopeError(error: unknown, fallback: string): Error {
+  if (error instanceof Error && error.message === "timeout exceeded when trying to connect") {
+    return clusterScopeTimeoutError(error);
+  }
+  return error instanceof Error ? error : new Error(fallback, { cause: error });
+}
+
+function clusterScopeAbortError(signal: AbortSignal): Error {
+  return clusterScopeError(signal.reason, "Cluster scope read aborted");
+}
+
+function clusterScopeTimeoutError(cause?: unknown): Error {
+  const error = new Error("Cluster scope read timed out", cause === undefined ? undefined : { cause });
+  error.name = "TimeoutError";
+  return error;
+}
+
+function withClusterScopeDeadline<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(clusterScopeAbortError(signal));
+      return;
+    }
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (value: T | Error, rejected: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (rejected) reject(value);
+      else resolve(value as T);
+    };
+    const onAbort = (): void => finish(clusterScopeAbortError(signal as AbortSignal), true);
+    timer = setTimeout(() => finish(clusterScopeTimeoutError(), true), CLUSTER_SCOPE_READ_TIMEOUT_MS);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      void operation().then(
+        (value) => finish(value, false),
+        (error: unknown) => finish(clusterScopeError(error, "Cluster scope read failed"), true),
+      );
+    } catch (error) {
+      finish(clusterScopeError(error, "Cluster scope read failed"), true);
+    }
+  });
+}
+
 export class PostgresClusterScopeStore implements ClusterScopeStore {
   constructor(private readonly poolProvider: PoolProvider) {}
 
-  async get(workspaceId: string): Promise<ClusterScope | null> {
-    const pool = await this.poolProvider();
-    const result = await pool.query<ClusterRow>(
-      `SELECT id, workspace_id, name, endpoint, approved_namespaces, approved_resource_kinds
-         FROM tracegarden_clusters WHERE workspace_id = $1`,
-      [workspaceId],
-    );
-    const row = result.rows[0];
-    return row ? clusterFromRow(row) : null;
+  async get(workspaceId: string, signal?: AbortSignal): Promise<ClusterScope | null> {
+    if (signal?.aborted) throw clusterScopeAbortError(signal);
+    const pool = await withClusterScopeDeadline(() => this.poolProvider(), signal);
+    const connection = pool.connect();
+    let pendingClient: PoolClient;
+    try {
+      pendingClient = await withClusterScopeDeadline(() => connection, signal);
+    } catch (error) {
+      void connection.then((client) => client.release(clusterScopeError(error, "Cluster scope read connection failed"))).catch(() => undefined);
+      throw error;
+    }
+    let released = false;
+    const release = (error?: Error): void => {
+      if (released) return;
+      released = true;
+      pendingClient.release(error);
+    };
+    const query = <T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> =>
+      withClusterScopeDeadline(() => pendingClient.query<T>(text, values), signal);
+    try {
+      await query("BEGIN");
+      await query("SET LOCAL statement_timeout = '1000ms'");
+      const result = await query<ClusterRow>(
+        `SELECT id, workspace_id, name, endpoint, approved_namespaces, approved_resource_kinds
+           FROM tracegarden_clusters WHERE workspace_id = $1`,
+        [workspaceId],
+      );
+      await query("COMMIT");
+      release();
+      const row = result.rows[0];
+      return row ? clusterFromRow(row) : null;
+    } catch (error) {
+      // A timed-out/aborted query may still be in flight; destroy this client rather than returning it to the pool.
+      release(clusterScopeError(error, "Cluster scope read failed"));
+      throw error;
+    }
   }
 
   async save(scope: ClusterScope): Promise<ClusterScope> {
     const pool = await this.poolProvider();
-    const result = await pool.query<ClusterRow>(
-      `INSERT INTO tracegarden_clusters
-         (id, workspace_id, name, endpoint, approved_namespaces, approved_resource_kinds, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, now())
-       ON CONFLICT (workspace_id) DO UPDATE SET
-         name = EXCLUDED.name,
-         endpoint = EXCLUDED.endpoint,
-         approved_namespaces = EXCLUDED.approved_namespaces,
-         approved_resource_kinds = EXCLUDED.approved_resource_kinds,
-         updated_at = now()
-       RETURNING id, workspace_id, name, endpoint, approved_namespaces, approved_resource_kinds`,
-      [scope.clusterId, scope.workspaceId, scope.name, scope.endpoint, scope.namespaces, scope.resourceKinds],
-    );
-    const row = result.rows[0];
-    if (!row) throw new Error("Cluster scope persistence returned no row");
-    return clusterFromRow(row);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        "SELECT id FROM tracegarden_clusters WHERE workspace_id = $1 FOR UPDATE",
+        [scope.workspaceId],
+      );
+      const result = await client.query<ClusterRow>(
+        `INSERT INTO tracegarden_clusters
+           (id, workspace_id, name, endpoint, approved_namespaces, approved_resource_kinds, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now())
+         ON CONFLICT (workspace_id) DO UPDATE SET
+           name = EXCLUDED.name,
+           endpoint = EXCLUDED.endpoint,
+           approved_namespaces = EXCLUDED.approved_namespaces,
+           approved_resource_kinds = EXCLUDED.approved_resource_kinds,
+           updated_at = now()
+         RETURNING id, workspace_id, name, endpoint, approved_namespaces, approved_resource_kinds`,
+        [scope.clusterId, scope.workspaceId, scope.name, scope.endpoint, scope.namespaces, scope.resourceKinds],
+      );
+      await client.query("COMMIT");
+      const row = result.rows[0];
+      if (!row) throw new Error("Cluster scope persistence returned no row");
+      return clusterFromRow(row);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 }
 
@@ -1680,11 +1785,16 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
     client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
     observation: NormalizedObservation,
   ): Promise<void> {
-    const result = await client.query<{ id: string }>(
-      `SELECT id FROM tracegarden_clusters WHERE workspace_id = $1 AND id = $2`,
+    const result = await client.query<{ id: string; approved_namespaces: string[]; approved_resource_kinds: string[] }>(
+      `SELECT id, approved_namespaces, approved_resource_kinds
+         FROM tracegarden_clusters WHERE workspace_id = $1 AND id = $2 FOR SHARE`,
       [observation.workspaceId, observation.clusterId],
     );
-    if (!result.rows[0]) throw new Error("Observation Cluster does not belong to its Workspace");
+    const cluster = result.rows[0];
+    if (!cluster) throw new Error("Observation Cluster does not belong to its Workspace");
+    if (!cluster.approved_namespaces.includes(observation.namespace) || !cluster.approved_resource_kinds.includes(observation.kind)) {
+      throw new Error("Observation is outside the approved Cluster scope");
+    }
   }
 
   private async recordObservationInTransaction(
@@ -1747,13 +1857,18 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
 
   private async validateCheckpointClusterInTransaction(
     client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
-    checkpoint: Pick<IngestionCheckpointInput, "workspaceId" | "clusterId">,
+    checkpoint: Pick<IngestionCheckpointInput, "workspaceId" | "clusterId" | "namespace" | "resourceKind">,
   ): Promise<void> {
-    const result = await client.query<{ id: string }>(
-      `SELECT id FROM tracegarden_clusters WHERE workspace_id = $1 AND id = $2`,
+    const result = await client.query<{ id: string; approved_namespaces: string[]; approved_resource_kinds: string[] }>(
+      `SELECT id, approved_namespaces, approved_resource_kinds
+         FROM tracegarden_clusters WHERE workspace_id = $1 AND id = $2 FOR SHARE`,
       [checkpoint.workspaceId, checkpoint.clusterId],
     );
-    if (!result.rows[0]) throw new Error("Ingestion Checkpoint Cluster does not belong to its Workspace");
+    const cluster = result.rows[0];
+    if (!cluster) throw new Error("Ingestion Checkpoint Cluster does not belong to its Workspace");
+    if (!cluster.approved_namespaces.includes(checkpoint.namespace) || !cluster.approved_resource_kinds.includes(checkpoint.resourceKind)) {
+      throw new Error("Ingestion Checkpoint is outside the approved Cluster scope");
+    }
   }
 
   private async saveCheckpointInTransaction(
@@ -2083,12 +2198,25 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
       await client.query("BEGIN");
       await client.query(timelineWriterLock);
       const candidates = suggestCorrelationCandidates((await this.allTimelineEntriesForCorrelation(client, workspaceId)).map(correlationEntryFor));
+      const currentKeys = new Set(candidates.map((candidate) => `${candidate.leftEntryId}\u0000${candidate.rightEntryId}`));
+      const existing = await client.query<{ id: string; left_entry_id: string; right_entry_id: string; status: CorrelationSuggestionRecord["status"] }>(
+        `SELECT id, left_entry_id, right_entry_id, status
+           FROM tracegarden_correlation_suggestions
+          WHERE workspace_id = $1`,
+        [workspaceId],
+      );
+      for (const suggestion of existing.rows) {
+        if (suggestion.status === "pending" && !currentKeys.has(`${suggestion.left_entry_id}\u0000${suggestion.right_entry_id}`)) {
+          await client.query("DELETE FROM tracegarden_correlation_suggestions WHERE workspace_id = $1 AND id = $2 AND status = 'pending'", [workspaceId, suggestion.id]);
+        }
+      }
       for (const candidate of candidates) {
         await client.query(
           `INSERT INTO tracegarden_correlation_suggestions
              (id, workspace_id, left_entry_id, right_entry_id, signals, status, created_at)
            VALUES ($1, $2, $3, $4, $5, 'pending', $6)
-           ON CONFLICT (workspace_id, left_entry_id, right_entry_id) DO UPDATE SET signals = EXCLUDED.signals`,
+           ON CONFLICT (workspace_id, left_entry_id, right_entry_id) DO UPDATE SET
+             signals = CASE WHEN tracegarden_correlation_suggestions.status = 'pending' THEN EXCLUDED.signals ELSE tracegarden_correlation_suggestions.signals END`,
           [candidate.id, candidate.workspaceId, candidate.leftEntryId, candidate.rightEntryId, candidate.signals, candidate.createdAt],
         );
       }
@@ -2900,7 +3028,11 @@ export class PostgresDatabase implements DatabaseBoundary {
   private async getPool(): Promise<Pool> {
     if (this.pool) return this.pool;
     const { Pool: PgPool } = await import("pg");
-    this.pool = new PgPool({ connectionString: this.connectionString, max: 5 });
+    this.pool = new PgPool({
+      connectionString: this.connectionString,
+      max: 5,
+      connectionTimeoutMillis: POSTGRES_POOL_CONNECTION_TIMEOUT_MS,
+    });
     return this.pool;
   }
 

@@ -63,6 +63,15 @@ if (!workflowText.includes("KUBECONFORM_SCHEMA_LOCATION")) {
   errors.push("workflow suite must pass an explicit local schema location");
 }
 if (!workflowText.includes("--exit-code 1") || !workflowText.includes("--severity HIGH,CRITICAL")) errors.push("workflow suite must fail on actionable image CVEs");
+const exactReleaseSmoke = workflowText.indexOf("Smoke-test exact published digests");
+const exactReleaseScan = workflowText.indexOf("Scan exact published digests before attestation");
+const releaseAttestation = workflowText.indexOf("actions/attest-build-provenance@");
+if (exactReleaseSmoke < 0 || exactReleaseScan < 0 || !workflowText.includes("CONTAINER_SMOKE_NO_BUILD: \"1\"")) {
+  errors.push("release publication must smoke-test the exact pushed immutable digests without rebuilding");
+}
+if (exactReleaseScan < 0 || releaseAttestation < 0 || exactReleaseScan > releaseAttestation) {
+  errors.push("release publication must scan pushed digests before attestation");
+}
 if (/--platform linux\/arm64/.test(workflowText) && !workflowText.includes("runs-on: ubuntu-24.04-arm")) {
   errors.push("ARM64 builds require a native ARM runner or immutable-pinned QEMU setup");
 }

@@ -130,10 +130,10 @@ export function validateClusterScopeInput(input: unknown): ClusterScopeValidatio
   } else {
     try {
       const url = new URL(endpoint);
-      if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("unsupported protocol");
+      if (url.protocol !== "https:") throw new Error("unsupported protocol");
       if (url.username || url.password) throw new Error("credentials are not allowed");
     } catch {
-      issues.push({ field: "endpoint", message: "must be an absolute HTTP(S) URL without credentials" });
+      issues.push({ field: "endpoint", message: "must be an absolute HTTPS URL without credentials" });
     }
   }
 
@@ -194,7 +194,7 @@ export function scopeFromInput(
 }
 
 export interface ClusterScopeStore {
-  get(workspaceId: string): Promise<ClusterScope | null>;
+  get(workspaceId: string, signal?: AbortSignal): Promise<ClusterScope | null>;
   save(scope: ClusterScope): Promise<ClusterScope>;
 }
 
@@ -275,6 +275,15 @@ export class KubernetesWatchDisconnectedError extends Error {
   constructor(message = "Kubernetes watch disconnected", options?: ErrorOptions) {
     super(message, options);
     this.name = "KubernetesWatchDisconnectedError";
+  }
+}
+
+export const KUBERNETES_WATCH_BUFFER_LIMIT = 1024;
+
+export class KubernetesWatchBufferOverflowError extends KubernetesWatchDisconnectedError {
+  constructor() {
+    super(`Kubernetes watch exceeded its ${KUBERNETES_WATCH_BUFFER_LIMIT}-event buffer`);
+    this.name = "KubernetesWatchBufferOverflowError";
   }
 }
 
@@ -493,10 +502,13 @@ function condition(resource: KubernetesResource, type: string): Record<string, u
 function abnormalCondition(kind: SupportedResourceKind, resource: KubernetesResource): Record<string, unknown> | null {
   const relevantTypes = new Set(["Failed", "Degraded", "Available", "Progressing"]);
   return conditions(resource).find((candidate) => {
-    if (!relevantTypes.has(candidate.type as string)) return false;
-    return candidate.status === "False"
-      || candidate.status === "Unknown"
-      || kind === "Job" && candidate.type === "Failed" && candidate.status === "True";
+    const type = candidate.type;
+    if (!relevantTypes.has(type as string)) return false;
+    if (type === "Failed" || type === "Degraded") {
+      return candidate.status === "True" || candidate.status === "Unknown";
+    }
+    return candidate.status === "False" || candidate.status === "Unknown"
+      || kind === "Job" && type === "Failed" && candidate.status === "True";
   }) ?? null;
 }
 
@@ -1157,6 +1169,7 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
 
   async listResult(scope: ClusterScope, signal?: AbortSignal): Promise<KubernetesListResult> {
     const resources: KubernetesResource[] = [];
+    let collectionCount = 0;
     let listResourceVersion: string | null = null;
     const kubeConfig = this.kubeConfigForScope(scope);
     const coreApi = kubeConfig.makeApiClient(CoreV1Api);
@@ -1167,6 +1180,7 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
       if (!scope.resourceKinds.includes(kind)) continue;
       this.endpointForScope(scope, kind);
       for (const namespace of scope.namespaces) {
+        collectionCount += 1;
         signal?.throwIfAborted();
         try {
           this.contacted = true;
@@ -1218,8 +1232,10 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
       }
     }
     return {
-      resources: resources.filter((resource) => isResourceInScope(scope, resource)),
-      ...(listResourceVersion ? { resourceVersion: listResourceVersion } : {}),
+      resources,
+      // A resourceVersion is scoped to one kind/namespace list. Never expose a
+      // value made by comparing independent Kubernetes collections.
+      ...(collectionCount === 1 && listResourceVersion ? { resourceVersion: listResourceVersion } : {}),
     };
   }
 
@@ -1230,11 +1246,22 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
   private async watchNamespace(
     scope: ClusterScope,
     namespace: string,
+    kind: SupportedResourceKind,
     resourceVersion: string | null,
     signal?: AbortSignal,
   ): Promise<AsyncIterable<KubernetesWatchEvent>> {
-    this.endpointForScope(scope);
-    const path = `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods`;
+    this.endpointForScope(scope, kind);
+    const core = kind === "Pod";
+    const group = kind === "Event" ? "events.k8s.io" : kind === "Deployment" || kind === "StatefulSet" || kind === "DaemonSet" || kind === "ReplicaSet" ? "apps" : "batch";
+    const plural = kind === "Deployment" ? "deployments"
+      : kind === "StatefulSet" ? "statefulsets"
+        : kind === "DaemonSet" ? "daemonsets"
+          : kind === "ReplicaSet" ? "replicasets"
+            : kind === "Pod" ? "pods"
+              : kind === "Job" ? "jobs"
+                : kind === "CronJob" ? "cronjobs"
+                  : "events";
+    const path = `${core ? "/api/v1" : `/apis/${group}/v1`}/namespaces/${encodeURIComponent(namespace)}/${plural}`;
     const queryParams = {
       allowWatchBookmarks: true,
       ...(resourceVersion ? { resourceVersion } : {}),
@@ -1247,6 +1274,11 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
     let requestController: AbortController | null = null;
     const push = (event: KubernetesWatchEvent): void => {
       if (complete || signal?.aborted) return;
+      if (events.length >= KUBERNETES_WATCH_BUFFER_LIMIT) {
+        finish(new KubernetesWatchBufferOverflowError());
+        requestController?.abort();
+        return;
+      }
       events.push(event);
       wake?.();
       wake = null;
@@ -1290,6 +1322,7 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
           throw new DOMException("Kubernetes watch was aborted", "AbortError");
         }
         requestController = controller;
+        if (complete) requestController.abort();
       } catch (error) {
         signal.removeEventListener("abort", abort);
         throw error;
@@ -1334,12 +1367,13 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
   }
 
   async watch(scope: ClusterScope, resourceVersion: string | null = null, signal?: AbortSignal): Promise<AsyncIterable<KubernetesWatchEvent>> {
-    if (!scope.resourceKinds.includes("Pod")) return (async function* (): AsyncGenerator<KubernetesWatchEvent> {})();
     signal?.throwIfAborted();
     if (scope.namespaces.length !== 1) throw new Error("Configured Kubernetes watch requires one namespace per stream");
+    if (scope.resourceKinds.length !== 1) throw new Error("Configured Kubernetes watch requires one resource kind per stream");
     const namespace = scope.namespaces[0];
-    if (!namespace) return (async function* (): AsyncGenerator<KubernetesWatchEvent> {})();
-    return this.watchNamespace(scope, namespace, resourceVersion, signal);
+    const kind = scope.resourceKinds[0];
+    if (!namespace || !kind) return (async function* (): AsyncGenerator<KubernetesWatchEvent> {})();
+    return this.watchNamespace(scope, namespace, kind, resourceVersion, signal);
   }
 }
 
@@ -1355,7 +1389,9 @@ export async function collectScopedResources(
   adapter: KubernetesObservationAdapter,
 ): Promise<readonly KubernetesResource[]> {
   const resources = await adapter.list(scope);
-  return resources.filter((resource) => isResourceInScope(scope, resource));
+  const outOfScope = resources.find((resource) => !isResourceInScope(scope, resource));
+  if (outOfScope) throw new ObservationNormalizationError(`${outOfScope.kind || "Resource"} is outside the approved observation scope`);
+  return resources;
 }
 
 export function hasClusterConfigureCapability(member: Pick<MemberRecord, "capabilities">): boolean {

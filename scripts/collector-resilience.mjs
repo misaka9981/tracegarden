@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import pg from "pg";
 import {
   CollectorRecoveryError,
   createCollectorRuntime,
@@ -6,12 +8,15 @@ import {
 import {
   ConfiguredKubernetesAdapter,
   DeterministicKubernetesAdapter,
+  KUBERNETES_WATCH_BUFFER_LIMIT,
+  SUPPORTED_RESOURCE_KINDS,
+  KubernetesWatchBufferOverflowError,
   KubernetesWatchGoneError,
   compareResourceVersions,
   parseKubernetesWatchEvent,
 } from "../dist/packages/cluster/src/index.js";
-import { MemoryObservationStore } from "../dist/packages/db/src/index.js";
-import { CoreV1Api, Watch } from "@kubernetes/client-node";
+import { MemoryClusterScopeStore, MemoryObservationStore, PostgresClusterScopeStore } from "../dist/packages/db/src/index.js";
+import { AppsV1Api, BatchV1Api, CoreV1Api, Watch } from "@kubernetes/client-node";
 
 const scope = {
   workspaceId: "workspace-single",
@@ -190,6 +195,64 @@ try {
   const stream = await configuredAdapter.watch(prefixedScope, "1");
   assert.equal(capturedWatchPath, "/api/v1/namespaces/tracegarden/pods");
   assert.equal((await stream[Symbol.asyncIterator]().next()).done, true);
+} finally {
+  Watch.prototype.watch = originalWatch;
+}
+
+const originalDeploymentList = AppsV1Api.prototype.listNamespacedDeployment;
+const originalJobList = BatchV1Api.prototype.listNamespacedJob;
+let deploymentListCalls = 0;
+let jobListCalls = 0;
+AppsV1Api.prototype.listNamespacedDeployment = async () => {
+  deploymentListCalls += 1;
+  return { metadata: { resourceVersion: "10" }, items: [] };
+};
+BatchV1Api.prototype.listNamespacedJob = async () => {
+  jobListCalls += 1;
+  return { metadata: { resourceVersion: "20" }, items: [] };
+};
+try {
+  const multipleCollections = await configuredAdapter.listResult({
+    ...prefixedScope,
+    namespaces: ["tracegarden", "other"],
+    resourceKinds: ["Deployment", "Job"],
+  });
+  assert.equal(multipleCollections.resourceVersion, undefined);
+  assert.equal(deploymentListCalls, 2);
+  assert.equal(jobListCalls, 2);
+} finally {
+  AppsV1Api.prototype.listNamespacedDeployment = originalDeploymentList;
+  BatchV1Api.prototype.listNamespacedJob = originalJobList;
+}
+
+const productionWatchScope = { ...prefixedScope, resourceKinds: ["Deployment"] };
+let productionWatchPath;
+Watch.prototype.watch = async (path, _query, _callback, done) => {
+  productionWatchPath = path;
+  done(null);
+  return new AbortController();
+};
+try {
+  const stream = await configuredAdapter.watch(productionWatchScope, "1");
+  assert.equal(productionWatchPath, "/apis/apps/v1/namespaces/tracegarden/deployments");
+  assert.equal((await stream[Symbol.asyncIterator]().next()).done, true);
+} finally {
+  Watch.prototype.watch = originalWatch;
+}
+
+Watch.prototype.watch = async (_path, _query, callback) => {
+  for (let index = 0; index <= KUBERNETES_WATCH_BUFFER_LIMIT; index += 1) {
+    callback("BOOKMARK", { metadata: { resourceVersion: String(index) } }, {});
+  }
+  return new AbortController();
+};
+try {
+  const overflowStream = await configuredAdapter.watch(productionWatchScope, "1");
+  await assert.rejects((async () => {
+    for await (const _event of overflowStream) {
+      // Drain the bounded stream so the terminal overflow is observed.
+    }
+  })(), (error) => error instanceof KubernetesWatchBufferOverflowError);
 } finally {
   Watch.prototype.watch = originalWatch;
 }
@@ -444,4 +507,276 @@ try {
   await listCancellation.close();
 }
 
-console.log("collector checkpoint, per-namespace ordering, streamed-410, cancellation, huge-RV, bounded-backoff, and failure-path checks passed");
+const hangingScopeClient = {
+  queries: [],
+  releasedWith: undefined,
+  async query(text) {
+    this.queries.push(text);
+    if (text.startsWith("SELECT id, workspace_id")) return new Promise(() => {});
+    return { rows: [], rowCount: 0 };
+  },
+  release(error) {
+    this.releasedWith = error;
+  },
+};
+const hangingScopeStore = new PostgresClusterScopeStore(async () => ({ connect: async () => hangingScopeClient }));
+const hangingScopeStartedAt = Date.now();
+await assert.rejects(hangingScopeStore.get(scope.workspaceId), (error) => error instanceof Error && error.name === "TimeoutError");
+assert.ok(Date.now() - hangingScopeStartedAt < 2500);
+assert.deepEqual(hangingScopeClient.queries.slice(0, 2), ["BEGIN", "SET LOCAL statement_timeout = '1000ms'"]);
+assert.equal(hangingScopeClient.releasedWith?.name, "TimeoutError");
+
+class FakePoolClient extends EventEmitter {
+  constructor() {
+    super();
+    this._queryable = true;
+    this._ending = false;
+  }
+
+  connect(callback) {
+    process.nextTick(() => callback(null));
+  }
+
+  end(callback) {
+    this._ending = true;
+    process.nextTick(() => {
+      this.emit("end");
+      callback?.();
+    });
+  }
+
+  ref() {}
+
+  unref() {}
+
+  isConnected() {
+    return true;
+  }
+}
+
+const saturatedScopePool = new pg.Pool({ max: 1, connectionTimeoutMillis: 25, Client: FakePoolClient });
+const heldScopeClient = await saturatedScopePool.connect();
+let heldScopeReleased = false;
+const releaseHeldScopeClient = () => {
+  if (heldScopeReleased) return;
+  heldScopeReleased = true;
+  heldScopeClient.release();
+};
+const saturatedScopeStore = new PostgresClusterScopeStore(async () => saturatedScopePool);
+const saturatedScopeRead = saturatedScopeStore.get(scope.workspaceId);
+const saturatedScopeResult = saturatedScopeRead.then(() => null, (error) => error);
+try {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(saturatedScopePool.waitingCount, 0);
+  const saturatedScopeError = await saturatedScopeResult;
+  assert.equal(saturatedScopeError?.name, "TimeoutError");
+  assert.equal(saturatedScopePool.totalCount, 1);
+  assert.equal(saturatedScopePool.idleCount, 0);
+  releaseHeldScopeClient();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(saturatedScopePool.waitingCount, 0);
+  assert.equal(saturatedScopePool.totalCount, 1);
+  assert.equal(saturatedScopePool.idleCount, 1);
+} finally {
+  releaseHeldScopeClient();
+  await saturatedScopePool.end();
+}
+assert.equal(saturatedScopePool.waitingCount, 0);
+assert.equal(saturatedScopePool.totalCount, 0);
+
+let timeoutScopeReadCount = 0;
+const timeoutScopeController = new AbortController();
+const timeoutScopeStore = {
+  get: async () => {
+    timeoutScopeReadCount += 1;
+    if (timeoutScopeReadCount < 4) return scope;
+    const error = new Error("Cluster scope read timed out");
+    error.name = "TimeoutError";
+    throw error;
+  },
+  save: async (value) => value,
+};
+const timeoutScopeRuntime = await createCollectorRuntime({
+  port: 43317,
+  host: "127.0.0.1",
+  adapter: {
+    kind: "deterministic",
+    listResult: async () => ({ resources: [], resourceVersion: "1" }),
+    watch: async () => (async function* () {})(),
+  },
+  database: { kind: "memory", clusterScope: timeoutScopeStore, ping: async () => true },
+  observationStore: new MemoryObservationStore(),
+  sleep: async () => timeoutScopeController.abort(),
+  scopeMonitorIntervalMs: 1_000,
+});
+try {
+  await timeoutScopeRuntime.runWatch({ signal: timeoutScopeController.signal });
+} finally {
+  await timeoutScopeRuntime.close();
+}
+assert.equal(timeoutScopeReadCount, 4);
+
+let hangingScopeReadCount = 0;
+let hangingScopeReadSignal;
+const abortableHangingScopeStore = {
+  get: async (_workspaceId, signal) => {
+    hangingScopeReadCount += 1;
+    if (hangingScopeReadCount < 5) return scope;
+    hangingScopeReadSignal = signal;
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+    await new Promise((_, reject) => signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true }));
+    return null;
+  },
+  save: async (value) => value,
+};
+const hangingScopeWatchSignals = [];
+const abortableHangingScopeAdapter = {
+  kind: "deterministic",
+  contacted: false,
+  listResult: async (_scope, signal) => {
+    signal?.throwIfAborted();
+    return { resources: [], resourceVersion: "1" };
+  },
+  watch: async (_scope, _resourceVersion, signal) => {
+    hangingScopeWatchSignals.push(signal);
+    return (async function* () {
+      await new Promise((resolve) => {
+        if (signal.aborted) {
+          resolve();
+          return;
+        }
+        signal.addEventListener("abort", resolve, { once: true });
+      });
+    })();
+  },
+};
+const hangingScopeRuntime = await createCollectorRuntime({
+  port: 43316,
+  host: "127.0.0.1",
+  adapter: abortableHangingScopeAdapter,
+  database: { kind: "memory", clusterScope: abortableHangingScopeStore, ping: async () => true },
+  observationStore: new MemoryObservationStore(),
+  scopeMonitorIntervalMs: 5,
+});
+const hangingScopeRun = hangingScopeRuntime.runWatch();
+try {
+  while (hangingScopeReadCount < 5) await new Promise((resolve) => setTimeout(resolve, 0));
+  await Promise.race([
+    hangingScopeRuntime.close(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("hanging scope shutdown timed out")), 1000)),
+  ]);
+  await hangingScopeRun;
+  assert.equal(hangingScopeReadSignal.aborted, true);
+  assert.ok(hangingScopeWatchSignals.every((signal) => signal.aborted));
+} finally {
+  await hangingScopeRuntime.close();
+}
+
+const idleScope = { ...scope, clusterId: "idle-scope-cluster", namespaces: ["alpha"] };
+const updatedIdleScope = { ...idleScope, namespaces: ["beta"] };
+const removedIdleScope = { ...idleScope, namespaces: [], resourceKinds: [] };
+const idleScopeStore = new MemoryClusterScopeStore();
+await idleScopeStore.save(idleScope);
+const idleWatchSignals = [];
+const idleWatchClosed = [];
+const idleAdapter = {
+  kind: "deterministic",
+  contacted: false,
+  listResult: async (requestScope, signal) => {
+    signal?.throwIfAborted();
+    return { resources: [], resourceVersion: "1" };
+  },
+  watch: async (requestScope, _resourceVersion, signal) => {
+    const namespace = requestScope.namespaces[0];
+    idleWatchSignals.push({ namespace, signal });
+    if (namespace === "alpha") await idleScopeStore.save(updatedIdleScope);
+    if (namespace === "beta") await idleScopeStore.save(removedIdleScope);
+    return (async function* () {
+      try {
+        await new Promise((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          signal.addEventListener("abort", resolve, { once: true });
+        });
+        yield { type: "MODIFIED", resource: pod("stale", "Pending", namespace, `stale-${namespace}`), resourceVersion: "99" };
+      } finally {
+        idleWatchClosed.push(namespace);
+      }
+    })();
+  },
+};
+const idleObservationStore = new MemoryObservationStore(idleScopeStore);
+const idleScopeRuntime = await createCollectorRuntime({
+  port: 43315,
+  host: "127.0.0.1",
+  adapter: idleAdapter,
+  database: { kind: "memory", clusterScope: idleScopeStore, ping: async () => true },
+  observationStore: idleObservationStore,
+  scopeMonitorIntervalMs: 5,
+});
+try {
+  await idleScopeRuntime.runWatch();
+  assert.deepEqual(idleWatchSignals.map(({ namespace }) => namespace), ["alpha", "beta"]);
+  assert.ok(idleWatchSignals.every(({ signal }) => signal.aborted));
+  assert.deepEqual(idleWatchClosed, ["alpha", "beta"]);
+  assert.equal(await idleObservationStore.countObservations(idleScope.workspaceId), 0);
+} finally {
+  await idleScopeRuntime.close();
+}
+
+const allKindsStore = new MemoryObservationStore();
+const allKindsScope = { ...scope, clusterId: "all-kinds-checkpoint-cluster", resourceKinds: SUPPORTED_RESOURCE_KINDS };
+await Promise.all(SUPPORTED_RESOURCE_KINDS.map((resourceKind, index) => allKindsStore.recordObservationsAndCheckpoint([], {
+  workspaceId: allKindsScope.workspaceId,
+  clusterId: allKindsScope.clusterId,
+  namespace: "tracegarden",
+  resourceKind,
+  resourceVersion: `checkpoint-${index + 1}`,
+})));
+const allKindsCheckpoints = await Promise.all(SUPPORTED_RESOURCE_KINDS.map((resourceKind) =>
+  allKindsStore.getIngestionCheckpoint(allKindsScope.workspaceId, allKindsScope.clusterId, resourceKind, "tracegarden")));
+assert.deepEqual(allKindsCheckpoints.map((checkpoint) => checkpoint?.resourceKind), [...SUPPORTED_RESOURCE_KINDS]);
+assert.deepEqual(allKindsCheckpoints.map((checkpoint) => checkpoint?.resourceVersion), SUPPORTED_RESOURCE_KINDS.map((_, index) => `checkpoint-${index + 1}`));
+
+const dynamicScope = { ...scope, clusterId: "dynamic-scope-cluster", namespaces: ["alpha"] };
+const updatedDynamicScope = { ...dynamicScope, namespaces: ["beta"] };
+const removedDynamicScope = { ...dynamicScope, namespaces: [], resourceKinds: [] };
+const dynamicScopeStore = new MemoryClusterScopeStore();
+await dynamicScopeStore.save(dynamicScope);
+const dynamicObservationStore = new MemoryObservationStore(dynamicScopeStore);
+const dynamicAdapter = new DeterministicKubernetesAdapter([], {
+  listResults: [
+    { resources: [pod("1", "Running", "alpha")], resourceVersion: "1" },
+    { resources: [pod("3", "Running", "beta")], resourceVersion: "3" },
+  ],
+  watchPlans: [
+    { events: [{ type: "MODIFIED", resource: pod("2", "Pending", "alpha"), resourceVersion: "2" }], error: new Error("scope update") },
+    { events: [{ type: "MODIFIED", resource: pod("4", "Running", "beta"), resourceVersion: "4" }], error: new Error("scope removal") },
+  ],
+});
+let dynamicSleepCalls = 0;
+const dynamic = await createCollectorRuntime({
+  port: 43314,
+  host: "127.0.0.1",
+  adapter: dynamicAdapter,
+  database: { kind: "memory", clusterScope: dynamicScopeStore, ping: async () => true },
+  observationStore: dynamicObservationStore,
+  sleep: async () => {
+    dynamicSleepCalls += 1;
+    if (dynamicSleepCalls === 1) await dynamicScopeStore.save(updatedDynamicScope);
+    else await dynamicScopeStore.save(removedDynamicScope);
+  },
+});
+try {
+  await dynamic.runWatch();
+  assert.deepEqual(dynamicAdapter.watchRequests.map(({ scope: requestScope }) => requestScope.namespaces[0]), ["alpha", "beta"]);
+  assert.equal((await dynamicObservationStore.getIngestionCheckpoint(dynamicScope.workspaceId, dynamicScope.clusterId, "Pod", "alpha"))?.resourceVersion, "2");
+  assert.equal((await dynamicObservationStore.getIngestionCheckpoint(dynamicScope.workspaceId, dynamicScope.clusterId, "Pod", "beta"))?.resourceVersion, "4");
+  assert.equal(dynamicSleepCalls, 2);
+} finally {
+  await dynamic.close();
+}
+
+console.log("collector checkpoint, per-namespace ordering, streamed-410, cancellation, huge-RV, bounded-backoff, scope reconciliation, and failure-path checks passed");

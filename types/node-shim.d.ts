@@ -87,7 +87,7 @@ declare module "pg" {
     on(event: "error", listener: (error: unknown) => void): this;
     removeListener(event: "notification", listener: (message: { channel: string; payload?: string }) => void): this;
     removeListener(event: "error", listener: (error: unknown) => void): this;
-    release(): void;
+    release(error?: Error): void;
   }
   export class Pool {
     constructor(options?: Record<string, unknown>);
