@@ -6,6 +6,7 @@ export type StatusResponse = Readonly<{
   checks: Readonly<{
     database: ProcessState;
     migrations: ProcessState;
+    timeline?: ProcessState;
     collector?: ProcessState;
     clusterContacted?: boolean;
   }>;

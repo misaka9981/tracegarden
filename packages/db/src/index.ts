@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath, URL } from "node:url";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import {
   DEFAULT_LOCAL_BOOTSTRAP,
   WORKSPACE_ID,
@@ -87,6 +87,7 @@ export const OBSERVATION_CHECKPOINTS_MIGRATION_ID = "0009_observation_checkpoint
 export const TIMELINE_ATTENTION_MIGRATION_ID = "0010_timeline_attention";
 export const STRUCTURED_EXPERIMENTS_MIGRATION_ID = "0011_structured_experiments";
 export const CORRELATION_LINKS_MIGRATION_ID = "0012_correlation_links";
+export const LIVE_TIMELINE_MIGRATION_ID = "0013_live_timeline";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -103,6 +104,7 @@ const migrations: readonly Migration[] = [
   { id: TIMELINE_ATTENTION_MIGRATION_ID, path: "../migrations/0010_timeline_attention.sql" },
   { id: STRUCTURED_EXPERIMENTS_MIGRATION_ID, path: "../migrations/0011_structured_experiments.sql" },
   { id: CORRELATION_LINKS_MIGRATION_ID, path: "../migrations/0012_correlation_links.sql" },
+  { id: LIVE_TIMELINE_MIGRATION_ID, path: "../migrations/0013_live_timeline.sql" },
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -347,6 +349,7 @@ export type IngestionCheckpoint = Readonly<{
 export type TimelinePage = Readonly<{
   entries: readonly TimelineEntry[];
   nextCursor: string | null;
+  resumeCursor?: string;
   unreadAttentionCount?: number;
 }>;
 
@@ -364,6 +367,30 @@ export interface CorrelationStore {
   listConfirmedLinks(workspaceId: string, entryId?: string): Promise<readonly ConfirmedLinkRecord[]>;
 }
 
+export type TimelineNotification = Readonly<{
+  entryId: string;
+}>;
+
+export type TimelineNotificationListener = (notification: TimelineNotification) => void;
+export type TimelineNotificationErrorListener = (error: unknown) => void;
+
+export interface TimelineNotificationSource {
+  subscribeTimeline(listener: TimelineNotificationListener): Promise<() => void>;
+  onTimelineError?(listener: TimelineNotificationErrorListener): () => void;
+  timelineNotificationsHealthy?(): boolean;
+}
+
+export function parseTimelineNotification(payload: string): TimelineNotification | null {
+  try {
+    const value: unknown = JSON.parse(payload);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (Object.keys(record).length !== 1 || typeof record.entryId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(record.entryId)) return null;
+    return { entryId: record.entryId };
+  } catch {
+    return null;
+  }
+}
 export type AttentionReviewResult = Readonly<{
   entryId: string;
   reviewed: boolean;
@@ -382,9 +409,8 @@ const timelineStates = ["Pending", "Running", "Succeeded", "Failed", "Unknown"] 
 type TimelineFilterField = (typeof timelineFilterFields)[number];
 
 type TimelineCursor = Readonly<{
-  version: 1;
-  occurredAt: string;
-  id: string;
+  version: 2;
+  sequence: string;
   memberId: string | null;
   filters: string;
 }>;
@@ -417,11 +443,15 @@ function base64UrlEncode(value: string | Uint8Array): string {
 function base64UrlDecode(value: string): Uint8Array {
   const normalized = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4);
   const binary = atob(normalized);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  const decoded = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  if (base64UrlEncode(decoded) !== value) throw new Error("base64url encoding is not canonical");
+  return decoded;
 }
 
-function encodeTimelineCursor(entry: Pick<TimelineEntry, "occurredAt" | "id">, query: TimelineQuery, secret: string, memberId?: string): string {
-  const payload: TimelineCursor = { version: 1, occurredAt: entry.occurredAt, id: entry.id, memberId: memberId ?? null, filters: timelineFilterKey(query, memberId) };
+type StoredTimelineEntry = TimelineEntry & Readonly<{ timelineSequence: string }>;
+
+function encodeTimelineCursor(entry: StoredTimelineEntry, query: TimelineQuery, secret: string, memberId?: string): string {
+  const payload: TimelineCursor = { version: 2, sequence: entry.timelineSequence, memberId: memberId ?? null, filters: timelineFilterKey(query, memberId) };
   const encodedPayload = base64UrlEncode(JSON.stringify(payload));
   const signature = base64UrlEncode(createHmac("sha256", secret).update(encodedPayload).digest());
   return `${encodedPayload}.${signature}`;
@@ -431,7 +461,7 @@ function validTimelineCursorShape(value: string): boolean {
   return value.length <= 2048 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
 }
 
-function decodeTimelineCursor(value: string, query: TimelineQuery, secret: string, memberId?: string): Readonly<{ occurredAt: string; id: string }> {
+function decodeTimelineCursor(value: string, query: TimelineQuery, secret: string, memberId?: string): Readonly<{ sequence: string }> {
   try {
     if (!validTimelineCursorShape(value)) throw new Error("cursor encoding is invalid");
     const separator = value.indexOf(".");
@@ -445,11 +475,11 @@ function decodeTimelineCursor(value: string, query: TimelineQuery, secret: strin
     const decoded: unknown = JSON.parse(new TextDecoder().decode(base64UrlDecode(encodedPayload)));
     if (typeof decoded !== "object" || decoded === null) throw new Error("cursor object required");
     const record = decoded as Record<string, unknown>;
-    if (record.version !== 1 || typeof record.occurredAt !== "string" || !Number.isFinite(Date.parse(record.occurredAt)) || typeof record.id !== "string" || !record.id.trim() || typeof record.filters !== "string" || (typeof record.memberId !== "string" && record.memberId !== null) || (typeof record.memberId === "string" && !record.memberId.trim())) {
+    if (record.version !== 2 || typeof record.sequence !== "string" || !/^[1-9]\d*$/.test(record.sequence) || typeof record.filters !== "string" || (typeof record.memberId !== "string" && record.memberId !== null) || (typeof record.memberId === "string" && !record.memberId.trim())) {
       throw new Error("cursor fields are invalid");
     }
     if (record.memberId !== (memberId ?? null) || record.filters !== timelineFilterKey(query, memberId)) throw new Error("cursor does not match query filters");
-    return { occurredAt: new Date(record.occurredAt).toISOString(), id: record.id };
+    return { sequence: record.sequence };
   } catch {
     throw new TimelineQueryValidationError(["cursor must be an opaque valid Timeline cursor for these filters"]);
   }
@@ -536,6 +566,7 @@ export interface TimelineStore {
   advanceIngestionCheckpoint?(checkpoint: IngestionCheckpointInput): Promise<IngestionCheckpoint | null>;
   clearIngestionCheckpoint?(checkpoint: Omit<IngestionCheckpointInput, "resourceVersion">): Promise<void>;
   listTimelineEntries(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<TimelinePage>;
+  countTimelineEntriesAfterCursor?(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<number>;
   getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null>;
   countObservations(workspaceId: string): Promise<number>;
   countTimelineEntries(workspaceId: string): Promise<number>;
@@ -624,9 +655,10 @@ function correlationEntryFor(entry: TimelineEntry): CorrelationEntry {
     };
 }
 
-function timelineEntryFor(observation: NormalizedObservation): TimelineEntry {
+function timelineEntryFor(observation: NormalizedObservation, timelineSequence: bigint): StoredTimelineEntry {
   return {
     id: randomUUID(),
+    timelineSequence: timelineSequence.toString(),
     workspaceId: observation.workspaceId,
     clusterId: observation.clusterId,
     entryType: "observation",
@@ -655,29 +687,36 @@ function entryMatchesQuery(entry: TimelineEntry, query: TimelineQuery): boolean 
     && (query.unread === undefined || (query.unread ? entry.attentionItem && entry.attentionUnread : !entry.attentionUnread));
 }
 
-function pageFromEntries(entries: readonly TimelineEntry[], query: TimelineQuery, cursorSecret: string, memberId?: string): TimelinePage {
-  const sorted = entries.filter((entry) => entryMatchesQuery(entry, query)).sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id));
+function compareTimelineSequences(left: string, right: string): number {
+  const leftSequence = BigInt(left);
+  const rightSequence = BigInt(right);
+  return leftSequence < rightSequence ? -1 : leftSequence > rightSequence ? 1 : 0;
+}
+
+function pageFromEntries(entries: readonly StoredTimelineEntry[], query: TimelineQuery, cursorSecret: string, memberId?: string): TimelinePage {
+  const sorted = entries.filter((entry) => entryMatchesQuery(entry, query)).sort((left, right) => compareTimelineSequences(left.timelineSequence, right.timelineSequence));
   const cursor = query.cursor ? decodeTimelineCursor(query.cursor, query, cursorSecret, memberId) : null;
-  const afterCursor = cursor
-    ? sorted.filter((entry) => entry.occurredAt > cursor.occurredAt || (entry.occurredAt === cursor.occurredAt && entry.id > cursor.id))
-    : sorted;
+  const afterCursor = cursor ? sorted.filter((entry) => compareTimelineSequences(entry.timelineSequence, cursor.sequence) > 0) : sorted;
   const page = afterCursor.slice(0, query.limit);
   return {
     entries: page.map(cloneEntry),
-    nextCursor: afterCursor.length > query.limit && page.length > 0 ? encodeTimelineCursor(page[page.length - 1] as TimelineEntry, query, cursorSecret, memberId) : null,
+    nextCursor: afterCursor.length > query.limit && page.length > 0 ? encodeTimelineCursor(page[page.length - 1] as StoredTimelineEntry, query, cursorSecret, memberId) : null,
+    ...(memberId !== undefined && page.length > 0 ? { resumeCursor: encodeTimelineCursor(page[page.length - 1] as StoredTimelineEntry, query, cursorSecret, memberId) } : {}),
   };
 }
 
-export class MemoryObservationStore implements TimelineStore {
+export class MemoryObservationStore implements TimelineStore, TimelineNotificationSource {
   private readonly observations = new Map<string, NormalizedObservation>();
   private readonly experiments = new Map<string, ExperimentRecord>();
-  private readonly entries = new Map<string, TimelineEntry>();
+  private readonly entries = new Map<string, StoredTimelineEntry>();
+  private nextTimelineSequence = 0n;
   private readonly ingestionOrders = new Map<string, bigint>();
   private nextIngestionOrder = 0n;
   private readonly checkpoints = new Map<string, IngestionCheckpoint>();
   private readonly attentionReviews = new Set<string>();
   private readonly correlationSuggestions = new Map<string, CorrelationSuggestionRecord>();
   private readonly confirmedLinks = new Map<string, ConfirmedLinkRecord>();
+  private readonly timelineListeners = new Set<TimelineNotificationListener>();
 
   private readonly cursorSecret: string;
   private readonly clusterScopeStore: ClusterScopeStore | undefined;
@@ -704,6 +743,20 @@ export class MemoryObservationStore implements TimelineStore {
     }
   }
 
+  private async validateConfiguredCluster(workspaceId: string, clusterId: string, recordName: string): Promise<void> {
+    if (!this.clusterScopeStore) return;
+    const scope = await this.clusterScopeStore.get(workspaceId);
+    if (!scope || scope.clusterId !== clusterId) {
+      throw new Error(`${recordName} Cluster does not belong to its Workspace`);
+    }
+  }
+
+  private async validateObservationOwnership(observations: readonly NormalizedObservation[]): Promise<void> {
+    for (const observation of observations) {
+      await this.validateConfiguredCluster(observation.workspaceId, observation.clusterId, "Observation");
+    }
+  }
+
   async recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult> {
     const results = await this.recordObservations([observation]);
     const result = results[0];
@@ -720,6 +773,7 @@ export class MemoryObservationStore implements TimelineStore {
     const pendingOrders = new Map(this.ingestionOrders);
     const pendingCheckpoints = new Map(this.checkpoints);
     const results: ObservationPersistenceResult[] = [];
+    const createdEntryIds: string[] = [];
     for (const observation of observations) {
       const key = observationKey(observation);
       const existing = pendingObservations.get(key);
@@ -740,10 +794,11 @@ export class MemoryObservationStore implements TimelineStore {
           return leftOrder < rightOrder ? 1 : leftOrder > rightOrder ? -1 : 0;
         })[0]?.[1] ?? null;
       const storedObservation = cloneObservation(markRecovery(observation, previous));
-      const entry = timelineEntryFor(storedObservation);
+      const entry = timelineEntryFor(storedObservation, ++this.nextTimelineSequence);
       pendingObservations.set(key, storedObservation);
       pendingEntries.set(entry.id, entry);
       pendingOrders.set(key, ++this.nextIngestionOrder);
+      createdEntryIds.push(entry.id);
       results.push({ observation: cloneObservation(storedObservation), entry: cloneEntry(entry), duplicate: false });
     }
     if (checkpoint) {
@@ -761,10 +816,30 @@ export class MemoryObservationStore implements TimelineStore {
     for (const [key, order] of pendingOrders) this.ingestionOrders.set(key, order);
     this.checkpoints.clear();
     for (const [key, value] of pendingCheckpoints) this.checkpoints.set(key, value);
+    for (const entryId of createdEntryIds) {
+      for (const listener of this.timelineListeners) {
+        try { listener({ entryId }); } catch { /* notification listeners cannot affect persistence */ }
+      }
+    }
     return results;
   }
 
+  async subscribeTimeline(listener: TimelineNotificationListener): Promise<() => void> {
+    this.timelineListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.timelineListeners.delete(listener);
+    };
+  }
+
+  timelineNotificationsHealthy(): boolean {
+    return true;
+  }
+
   async recordObservations(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]> {
+    await this.validateObservationOwnership(observations);
     const results = this.recordObservationsInternal(observations);
     for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) await this.refreshCorrelationSuggestions(workspaceId);
     return results;
@@ -774,6 +849,8 @@ export class MemoryObservationStore implements TimelineStore {
     observations: readonly NormalizedObservation[],
     checkpoint: IngestionCheckpointInput,
   ): Promise<readonly ObservationPersistenceResult[]> {
+    await this.validateObservationOwnership(observations);
+    await this.validateConfiguredCluster(checkpoint.workspaceId, checkpoint.clusterId, "Ingestion Checkpoint");
     const results = this.recordObservationsInternal(observations, checkpoint);
     for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) await this.refreshCorrelationSuggestions(workspaceId);
     return results;
@@ -785,6 +862,7 @@ export class MemoryObservationStore implements TimelineStore {
   }
 
   async advanceIngestionCheckpoint(checkpoint: IngestionCheckpointInput): Promise<IngestionCheckpoint | null> {
+    await this.validateConfiguredCluster(checkpoint.workspaceId, checkpoint.clusterId, "Ingestion Checkpoint");
     const key = checkpointKey(checkpoint);
     const previous = this.checkpoints.get(key);
     if (!previous || checkpointVersionShouldReplace(checkpoint.resourceVersion, previous.resourceVersion)) {
@@ -795,6 +873,7 @@ export class MemoryObservationStore implements TimelineStore {
   }
 
   async clearIngestionCheckpoint(checkpoint: Omit<IngestionCheckpointInput, "resourceVersion">): Promise<void> {
+    await this.validateConfiguredCluster(checkpoint.workspaceId, checkpoint.clusterId, "Ingestion Checkpoint");
     this.checkpoints.delete(checkpointKey(checkpoint));
   }
 
@@ -802,8 +881,9 @@ export class MemoryObservationStore implements TimelineStore {
     const timelineEntryId = randomUUID();
     const experiment = createExperimentRecord(workspaceId, createdByMemberId, timelineEntryId, input);
     await this.validateExperimentClusters(workspaceId, experiment.workloads);
-    const entry: ExperimentTimelineEntry = {
+    const entry: StoredTimelineEntry = {
       id: timelineEntryId,
+      timelineSequence: (++this.nextTimelineSequence).toString(),
       workspaceId,
       clusterId: experiment.workloads[0]?.clusterId ?? null,
       entryType: "experiment",
@@ -813,6 +893,9 @@ export class MemoryObservationStore implements TimelineStore {
     this.experiments.set(experiment.id, experiment);
     this.entries.set(entry.id, entry);
     await this.refreshCorrelationSuggestions(workspaceId);
+    for (const listener of this.timelineListeners) {
+      try { listener({ entryId: entry.id }); } catch { /* notification listeners cannot affect persistence */ }
+    }
     return cloneExperiment(experiment);
   }
 
@@ -823,7 +906,7 @@ export class MemoryObservationStore implements TimelineStore {
     await this.validateExperimentClusters(workspaceId, updated.workloads);
     const entry = this.entries.get(current.timelineEntryId);
     if (!entry || entry.entryType !== "experiment") throw new Error("Timeline entry is missing for an Experiment");
-    const replacement: ExperimentTimelineEntry = { ...entry, clusterId: updated.workloads[0]?.clusterId ?? null, experiment: updated };
+    const replacement: StoredTimelineEntry = { ...entry, clusterId: updated.workloads[0]?.clusterId ?? null, experiment: updated };
     this.experiments.set(id, updated);
     this.entries.set(updated.timelineEntryId, replacement);
     await this.refreshCorrelationSuggestions(workspaceId);
@@ -904,7 +987,7 @@ export class MemoryObservationStore implements TimelineStore {
       .map((link) => ({ ...link })));
   }
 
-  private entryWithLinks(entry: TimelineEntry): TimelineEntry {
+  private entryWithLinks(entry: StoredTimelineEntry): StoredTimelineEntry {
     const links = [...this.confirmedLinks.values()].filter((link) => link.leftEntryId === entry.id || link.rightEntryId === entry.id);
     return links.length > 0 ? { ...entry, confirmedLinks: links } : entry;
   }
@@ -915,11 +998,23 @@ export class MemoryObservationStore implements TimelineStore {
     }
     const entries = [...this.entries.values()]
       .filter((entry) => entry.workspaceId === workspaceId)
-      .map((entry): TimelineEntry => this.entryWithLinks(entry.entryType === "observation"
+      .map((entry): StoredTimelineEntry => this.entryWithLinks(entry.entryType === "observation"
         ? { ...entry, attentionUnread: memberId !== undefined && entry.attentionItem && !this.attentionReviews.has(`${entry.id}\u0000${memberId}`) }
         : entry));
     const page = pageFromEntries(entries, query, this.cursorSecret, memberId);
     return memberId ? { ...page, unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) } : page;
+  }
+
+  async countTimelineEntriesAfterCursor(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<number> {
+    const page = await this.listTimelineEntries(workspaceId, { ...query, limit: 100 }, memberId);
+    let count = page.entries.length;
+    let nextCursor = page.nextCursor;
+    while (nextCursor) {
+      const nextPage = await this.listTimelineEntries(workspaceId, { ...query, limit: 100, cursor: nextCursor }, memberId);
+      count += nextPage.entries.length;
+      nextCursor = nextPage.nextCursor;
+    }
+    return count;
   }
 
   async getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null> {
@@ -1027,6 +1122,7 @@ type TimelineJoinRow = Readonly<{
   entry_cluster_id: string | null;
   entry_type: "observation" | "experiment";
   occurred_at: string | Date;
+  timeline_sequence: string | number;
   observation_id: string | null;
   workspace_id: string | null;
   cluster_id: string | null;
@@ -1240,10 +1336,11 @@ function experimentFromTimelineRow(row: TimelineJoinRow): ExperimentRecord {
   };
 }
 
-function timelineEntryFromRow(row: TimelineJoinRow): TimelineEntry {
+function timelineEntryFromRow(row: TimelineJoinRow): StoredTimelineEntry {
   if (row.entry_type === "experiment") {
     return {
       id: row.entry_id,
+      timelineSequence: String(row.timeline_sequence),
       workspaceId: row.entry_workspace_id,
       clusterId: row.entry_cluster_id,
       entryType: "experiment",
@@ -1271,6 +1368,7 @@ function timelineEntryFromRow(row: TimelineJoinRow): TimelineEntry {
   });
   return {
     id: row.entry_id,
+    timelineSequence: String(row.timeline_sequence),
     workspaceId: row.entry_workspace_id,
     clusterId: row.entry_cluster_id ?? row.cluster_id,
     entryType: "observation",
@@ -1286,7 +1384,7 @@ function timelineEntryFromRow(row: TimelineJoinRow): TimelineEntry {
 
 const timelineSelect = `
   SELECT t.id AS entry_id, t.workspace_id AS entry_workspace_id, t.cluster_id AS entry_cluster_id,
-         t.entry_type, t.occurred_at, o.id AS observation_id, o.workspace_id, o.cluster_id,
+         t.entry_type, t.occurred_at, t.timeline_sequence, o.id AS observation_id, o.workspace_id, o.cluster_id,
          o.kind, o.source_identity, o.source_key, o.uid, o.name, o.namespace,
          o.resource_version, o.facts, o.observed_at, o.ingestion_order,
          (ai.entry_id IS NOT NULL) AS attention_item,
@@ -1340,15 +1438,141 @@ async function validateExperimentClustersInDatabase(
   }
 }
 
-export class PostgresObservationStore implements TimelineStore {
+const timelineWriterLock = "SELECT pg_advisory_xact_lock(hashtext('tracegarden:timeline:writer'))";
+
+export class PostgresObservationStore implements TimelineStore, TimelineNotificationSource {
+  private readonly timelineListeners = new Set<TimelineNotificationListener>();
+  private timelineListenerClient: PoolClient | null = null;
+  private timelineListenerHandler: ((message: { channel: string; payload?: string }) => void) | null = null;
+  private timelineListenerErrorHandler: ((error: unknown) => void) | null = null;
+  private timelineListenerSetup: Promise<void> | null = null;
+  private timelineListenerHealthy = true;
+  private readonly timelineErrorListeners = new Set<TimelineNotificationErrorListener>();
+
   constructor(private readonly poolProvider: PoolProvider, private readonly cursorSecret: string = DEFAULT_TIMELINE_CURSOR_SECRET) {
     if (!cursorSecret.trim()) throw new Error("Timeline cursor secret is required");
+  }
+
+  private async ensureTimelineListener(): Promise<void> {
+    while (!this.timelineListenerClient) {
+      if (!this.timelineListenerSetup) {
+        this.timelineListenerHealthy = false;
+        this.timelineListenerSetup = (async () => {
+          const client = await (await this.poolProvider()).connect();
+          let released = false;
+          const release = (): void => {
+            if (released) return;
+            released = true;
+            client.release();
+          };
+          const onNotification = (message: { channel: string; payload?: string }): void => {
+            if (message.channel !== "tracegarden_timeline" || !message.payload) return;
+            const notification = parseTimelineNotification(message.payload);
+            if (!notification) return;
+            for (const listener of this.timelineListeners) {
+              try { listener(notification); } catch { /* notification listeners cannot affect persistence */ }
+            }
+          };
+          const onError = (error: unknown): void => {
+            if (this.timelineListenerClient !== client) return;
+            this.timelineListenerClient = null;
+            this.timelineListenerHandler = null;
+            this.timelineListenerErrorHandler = null;
+            this.timelineListenerHealthy = false;
+            for (const listener of this.timelineErrorListeners) {
+              try { listener(error); } catch { /* failure listeners cannot affect listener recovery */ }
+            }
+            release();
+          };
+          client.on("notification", onNotification);
+          client.on("error", onError);
+          this.timelineListenerClient = client;
+          this.timelineListenerHandler = onNotification;
+          this.timelineListenerErrorHandler = onError;
+          try {
+            await client.query("LISTEN tracegarden_timeline");
+            this.timelineListenerHealthy = true;
+          } catch (error) {
+            client.removeListener("notification", onNotification);
+            client.removeListener("error", onError);
+            if (this.timelineListenerClient === client) this.timelineListenerClient = null;
+            this.timelineListenerHandler = null;
+            this.timelineListenerErrorHandler = null;
+            release();
+            throw error;
+          }
+        })().finally(() => {
+          this.timelineListenerSetup = null;
+        });
+      }
+      await this.timelineListenerSetup;
+    }
+  }
+
+  private async releaseTimelineListener(): Promise<void> {
+    await this.timelineListenerSetup?.catch(() => undefined);
+    if (this.timelineListeners.size > 0) return;
+    const client = this.timelineListenerClient;
+    const handler = this.timelineListenerHandler;
+    const errorHandler = this.timelineListenerErrorHandler;
+    this.timelineListenerClient = null;
+    this.timelineListenerHandler = null;
+    this.timelineListenerErrorHandler = null;
+    this.timelineListenerHealthy = true;
+    if (!client) return;
+    if (handler) client.removeListener("notification", handler);
+    if (errorHandler) client.removeListener("error", errorHandler);
+    await client.query("UNLISTEN tracegarden_timeline").catch(() => undefined);
+    client.release();
+  }
+
+  async subscribeTimeline(listener: TimelineNotificationListener): Promise<() => void> {
+    this.timelineListeners.add(listener);
+    try {
+      await this.ensureTimelineListener();
+    } catch (error) {
+      this.timelineListeners.delete(listener);
+      throw error;
+    }
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.timelineListeners.delete(listener);
+      if (this.timelineListeners.size === 0) void this.releaseTimelineListener();
+    };
+  }
+
+  onTimelineError(listener: TimelineNotificationErrorListener): () => void {
+    this.timelineErrorListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.timelineErrorListeners.delete(listener);
+    };
+  }
+
+  timelineNotificationsHealthy(): boolean {
+    return this.timelineListenerHealthy;
+  }
+
+  private async validateObservationClusterInTransaction(
+    client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
+    observation: NormalizedObservation,
+  ): Promise<void> {
+    const result = await client.query<{ id: string }>(
+      `SELECT id FROM tracegarden_clusters WHERE workspace_id = $1 AND id = $2`,
+      [observation.workspaceId, observation.clusterId],
+    );
+    if (!result.rows[0]) throw new Error("Observation Cluster does not belong to its Workspace");
   }
 
   private async recordObservationInTransaction(
     client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
     observation: NormalizedObservation,
   ): Promise<ObservationPersistenceResult> {
+    await this.validateObservationClusterInTransaction(client, observation);
     const previousResult = await client.query<ObservationRow>(
       `${observationSelect}
         WHERE workspace_id = $1 AND cluster_id = $2 AND source_identity = $3
@@ -1402,10 +1626,22 @@ export class PostgresObservationStore implements TimelineStore {
     return { observation: entry.observation, entry, duplicate };
   }
 
+  private async validateCheckpointClusterInTransaction(
+    client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
+    checkpoint: Pick<IngestionCheckpointInput, "workspaceId" | "clusterId">,
+  ): Promise<void> {
+    const result = await client.query<{ id: string }>(
+      `SELECT id FROM tracegarden_clusters WHERE workspace_id = $1 AND id = $2`,
+      [checkpoint.workspaceId, checkpoint.clusterId],
+    );
+    if (!result.rows[0]) throw new Error("Ingestion Checkpoint Cluster does not belong to its Workspace");
+  }
+
   private async saveCheckpointInTransaction(
     client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
     checkpoint: IngestionCheckpointInput,
   ): Promise<void> {
+    await this.validateCheckpointClusterInTransaction(client, checkpoint);
     await client.query(
       `INSERT INTO tracegarden_ingestion_checkpoints
          (workspace_id, cluster_id, namespace, resource_kind, resource_version)
@@ -1436,6 +1672,7 @@ export class PostgresObservationStore implements TimelineStore {
     client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
     checkpoint: IngestionCheckpointInput,
   ): Promise<void> {
+    await this.validateCheckpointClusterInTransaction(client, checkpoint);
     await client.query(
       `INSERT INTO tracegarden_ingestion_checkpoints
          (workspace_id, cluster_id, namespace, resource_kind, resource_version)
@@ -1475,6 +1712,7 @@ export class PostgresObservationStore implements TimelineStore {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query(timelineWriterLock);
       const lockTargets = [...new Map(observations.map((observation) => [
         `${observation.workspaceId}\u0000${observation.clusterId}\u0000${observation.sourceIdentity}`,
         observation,
@@ -1506,6 +1744,7 @@ export class PostgresObservationStore implements TimelineStore {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query(timelineWriterLock);
       const results: ObservationPersistenceResult[] = [];
       for (const observation of observations) results.push(await this.recordObservationInTransaction(client, observation));
       await this.saveCheckpointInTransaction(client, checkpoint);
@@ -1558,6 +1797,7 @@ export class PostgresObservationStore implements TimelineStore {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await this.validateCheckpointClusterInTransaction(client, checkpoint);
       await client.query(
         `DELETE FROM tracegarden_ingestion_checkpoints
           WHERE workspace_id = $1 AND cluster_id = $2 AND namespace = $3 AND resource_kind = $4`,
@@ -1579,6 +1819,7 @@ export class PostgresObservationStore implements TimelineStore {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query(timelineWriterLock);
       await validateExperimentClustersInDatabase(client, workspaceId, experiment.workloads);
       await client.query(
         `INSERT INTO tracegarden_experiments
@@ -1623,6 +1864,7 @@ export class PostgresObservationStore implements TimelineStore {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query(timelineWriterLock);
       const locked = await client.query<{ id: string }>(
         "SELECT id FROM tracegarden_experiments WHERE id = $1 AND workspace_id = $2 FOR UPDATE",
         [id, workspaceId],
@@ -1688,7 +1930,7 @@ export class PostgresObservationStore implements TimelineStore {
 
   async listExperiments(workspaceId: string): Promise<readonly ExperimentRecord[]> {
     const pool = await this.poolProvider();
-    const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.workspace_id = $1 AND t.entry_type = 'experiment' ORDER BY t.occurred_at, t.id`, [workspaceId]);
+    const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.workspace_id = $1 AND t.entry_type = 'experiment' ORDER BY t.timeline_sequence`, [workspaceId]);
     const links = await this.listConfirmedLinks(workspaceId);
     return Object.freeze(result.rows.map((row) => {
       const entry = timelineEntryFromRow(row);
@@ -1859,8 +2101,8 @@ export class PostgresObservationStore implements TimelineStore {
       joins = ` LEFT JOIN tracegarden_attention_reviews ar ON ar.entry_id = ai.entry_id AND ar.member_id = $${values.length}`;
     }
     if (cursor) {
-      values.push(cursor.occurredAt, cursor.id);
-      condition += ` AND (t.occurred_at, t.id) > ($${values.length - 1}::timestamptz, $${values.length})`;
+      values.push(cursor.sequence);
+      condition += ` AND t.timeline_sequence > $${values.length}::bigint`;
     }
     if (query.kind) {
       values.push(query.kind);
@@ -1885,14 +2127,27 @@ export class PostgresObservationStore implements TimelineStore {
       ? "false AS attention_unread"
       : "(ai.entry_id IS NOT NULL AND ar.entry_id IS NULL) AS attention_unread";
     const listSelect = timelineSelect.replace("         false AS attention_unread", `         ${attentionUnreadSelect}`) + joins;
-    const result = await pool.query<TimelineJoinRow>(`${listSelect} WHERE ${condition} ORDER BY t.occurred_at, t.id LIMIT $${values.length}`, values);
+    const result = await pool.query<TimelineJoinRow>(`${listSelect} WHERE ${condition} ORDER BY t.timeline_sequence LIMIT $${values.length}`, values);
     const rawEntries = result.rows.slice(0, query.limit).map(timelineEntryFromRow);
     const entries = await this.attachConfirmedLinks(workspaceId, rawEntries);
     return {
       entries,
-      nextCursor: result.rows.length > query.limit && entries.length > 0 ? encodeTimelineCursor(entries[entries.length - 1] as TimelineEntry, query, this.cursorSecret, memberId) : null,
+      nextCursor: result.rows.length > query.limit && entries.length > 0 ? encodeTimelineCursor(entries[entries.length - 1] as StoredTimelineEntry, query, this.cursorSecret, memberId) : null,
+      ...(memberId !== undefined && entries.length > 0 ? { resumeCursor: encodeTimelineCursor(entries[entries.length - 1] as StoredTimelineEntry, query, this.cursorSecret, memberId) } : {}),
       ...(memberId === undefined ? {} : { unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) }),
     };
+  }
+
+  async countTimelineEntriesAfterCursor(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<number> {
+    const page = await this.listTimelineEntries(workspaceId, { ...query, limit: 100 }, memberId);
+    let count = page.entries.length;
+    let nextCursor = page.nextCursor;
+    while (nextCursor) {
+      const nextPage = await this.listTimelineEntries(workspaceId, { ...query, limit: 100, cursor: nextCursor }, memberId);
+      count += nextPage.entries.length;
+      nextCursor = nextPage.nextCursor;
+    }
+    return count;
   }
 
   async getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null> {

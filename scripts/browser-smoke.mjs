@@ -211,6 +211,54 @@ try {
   await page.getByRole("button", { name: "登录" }).click();
   await page.waitForLoadState("domcontentloaded");
   assert.match(await page.locator("body").innerText(), /Timeline/);
+  const liveObservation = normalizePodObservation(timelineScope, {
+    kind: "Pod",
+    metadata: { name: "browser-live-entry", namespace: "tracegarden", uid: "browser-live-entry", resourceVersion: "4" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, "2099-01-01T00:00:03.000Z");
+  const liveResult = await timelineDatabase.timeline.recordObservation(liveObservation);
+  const liveEntry = page.locator(`[data-entry-id="${liveResult.entry.id}"]`);
+  await liveEntry.waitFor({ state: "attached" });
+  assert.match(await liveEntry.innerText(), /browser-live-entry/);
+  const hintCountBeforeDuplicate = await page.evaluate(() => window.__tracegardenTimelineHintCount);
+  docker("exec", databaseName, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", `SELECT pg_notify('tracegarden_timeline', json_build_object('entryId', '${liveResult.entry.id}')::text);`);
+  await page.waitForFunction((count) => window.__tracegardenTimelineHintCount > count, hintCountBeforeDuplicate);
+  assert.equal(await page.locator(`[data-entry-id="${liveResult.entry.id}"]`).count(), 1);
+  let recoveryFailureInjected = false;
+  await page.route("**/api/timeline**", async (route) => {
+    const requestUrl = new URL(route.request().url());
+    if (!recoveryFailureInjected && requestUrl.pathname === "/api/timeline" && requestUrl.searchParams.has("sseClientId")) {
+      recoveryFailureInjected = true;
+      await route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
+      return;
+    }
+    await route.continue();
+  });
+  const readyCountBeforeRecoveryFailure = await page.evaluate(() => window.__tracegardenTimelineReadyCount);
+  const failedRecoveryObservation = normalizePodObservation(timelineScope, {
+    kind: "Pod",
+    metadata: { name: "browser-recovery-retry", namespace: "tracegarden", uid: "browser-recovery-retry", resourceVersion: "5" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, "2099-01-01T00:00:03.500Z");
+  const failedRecoveryResult = await timelineDatabase.timeline.recordObservation(failedRecoveryObservation);
+  await page.locator(`[data-entry-id="${failedRecoveryResult.entry.id}"]`).waitFor({ state: "attached" });
+  assert.equal(recoveryFailureInjected, true);
+  await page.waitForFunction((count) => window.__tracegardenTimelineReadyCount > count, readyCountBeforeRecoveryFailure);
+  await page.unroute("**/api/timeline**");
+  const readyCountBeforeReconnect = await page.evaluate(() => window.__tracegardenTimelineReadyCount);
+  await page.evaluate(() => window.__tracegardenTimelineEventSource.close());
+  const missedObservation = normalizePodObservation(timelineScope, {
+    kind: "Pod",
+    metadata: { name: "browser-missed-entry", namespace: "tracegarden", uid: "browser-missed-entry", resourceVersion: "5" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, "2099-01-01T00:00:04.000Z");
+  const missedResult = await timelineDatabase.timeline.recordObservation(missedObservation);
+  await page.evaluate(() => window.__tracegardenTimelineReconnect());
+  await page.waitForFunction((count) => window.__tracegardenTimelineReadyCount > count, readyCountBeforeReconnect);
+  await page.locator(`[data-entry-id="${missedResult.entry.id}"]`).waitFor({ state: "attached" });
+  assert.equal(await page.locator(`[data-entry-id="${missedResult.entry.id}"]`).count(), 1);
+  await timelineDatabase.timeline.recordObservation(liveObservation);
+  assert.equal(await page.locator(`[data-entry-id="${liveResult.entry.id}"]`).count(), 1);
   await page.locator("#timeline-namespace").fill("tracegarden");
   await page.locator("#timeline-attention").selectOption("unread");
   await page.getByRole("button", { name: "筛选 Timeline" }).click();

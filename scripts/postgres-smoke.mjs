@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import pg from "pg";
 import { execFileSync, spawn } from "node:child_process";
 import { createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { DeterministicKubernetesAdapter, normalizeObservation, normalizePodObservation } from "../dist/packages/cluster/src/index.js";
@@ -11,6 +13,7 @@ const webPort = 43200;
 const productionWebPort = 43201;
 let web;
 let productionWeb;
+let legacyMigrationDatabase;
 let logDatabase;
 const databaseUrl = `postgresql://tracegarden:local-only@127.0.0.1:${databasePort}/tracegarden`;
 let collector;
@@ -37,6 +40,81 @@ try {
     }
   }
 
+  // Apply the legacy schema first so migration 0013 is tested against pre-existing data.
+  const legacyClient = new pg.Client(databaseUrl);
+  await legacyClient.connect();
+  try {
+    await legacyClient.query("BEGIN");
+    await legacyClient.query(`
+      CREATE TABLE IF NOT EXISTS tracegarden_schema_migrations (
+        id text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    const legacyMigrationIds = [
+      "0001_foundation",
+      "0002_workspace_admission",
+      "0003_better_auth",
+      "0004_membership_management",
+      "0005_cluster_scope",
+      "0006_observation_timeline",
+      "0007_recent_logs",
+      "0008_normalized_observations",
+      "0009_observation_checkpoints",
+      "0010_timeline_attention",
+      "0011_structured_experiments",
+    ];
+    for (const migrationId of legacyMigrationIds) {
+      const migrationSql = await readFile(new URL(`../dist/packages/db/migrations/${migrationId}.sql`, import.meta.url), "utf8");
+      await legacyClient.query(migrationSql);
+      await legacyClient.query("INSERT INTO tracegarden_schema_migrations (id) VALUES ($1)", [migrationId]);
+    }
+    await legacyClient.query("INSERT INTO tracegarden_workspaces (id, name) VALUES ('workspace-legacy', 'Legacy Workspace')");
+    await legacyClient.query("INSERT INTO tracegarden_clusters (id, workspace_id, name, endpoint) VALUES ('legacy-cluster', 'workspace-legacy', 'Legacy Cluster', 'https://legacy-cluster.example.test')");
+    await legacyClient.query(
+      `INSERT INTO tracegarden_observations
+         (id, workspace_id, cluster_id, kind, source_identity, source_key, uid, name, namespace, resource_version, facts, observed_at)
+       VALUES ('legacy-mismatched-observation', 'workspace-single', 'legacy-cluster', 'Pod', 'legacy-source', 'legacy-source', 'legacy-uid', 'legacy-pod', 'tracegarden', '1', '{"payload":"must survive migration failure"}'::jsonb, '2026-01-01T00:00:00.000Z')`,
+    );
+    await legacyClient.query("COMMIT");
+  } catch (error) {
+    await legacyClient.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    await legacyClient.end();
+  }
+  legacyMigrationDatabase = new PostgresDatabase(databaseUrl);
+  await assert.rejects(
+    legacyMigrationDatabase.migrate(),
+    (error) => error instanceof Error
+      && /database migration failed/.test(error.message)
+      && error.cause instanceof Error
+      && /Migration 0013 blocked: 1 legacy Workspace\/Cluster ownership mismatch/.test(error.cause.message),
+  );
+  const preservedLegacyClient = new pg.Client(databaseUrl);
+  await preservedLegacyClient.connect();
+  try {
+    const preserved = await preservedLegacyClient.query(
+      "SELECT workspace_id, cluster_id, facts->>'payload' AS payload FROM tracegarden_observations WHERE id = 'legacy-mismatched-observation'",
+    );
+    assert.deepEqual(preserved.rows, [{ workspace_id: "workspace-single", cluster_id: "legacy-cluster", payload: "must survive migration failure" }]);
+    await preservedLegacyClient.query("UPDATE tracegarden_observations SET workspace_id = 'workspace-legacy' WHERE id = 'legacy-mismatched-observation'");
+  } finally {
+    await preservedLegacyClient.end();
+  }
+  await legacyMigrationDatabase.migrate();
+  const cleanupLegacyClient = new pg.Client(databaseUrl);
+  await cleanupLegacyClient.connect();
+  try {
+    await cleanupLegacyClient.query("DELETE FROM tracegarden_observations WHERE id = 'legacy-mismatched-observation'");
+    await cleanupLegacyClient.query("DELETE FROM tracegarden_clusters WHERE id = 'legacy-cluster'");
+    await cleanupLegacyClient.query("DELETE FROM tracegarden_workspaces WHERE id = 'workspace-legacy'");
+  } finally {
+    await cleanupLegacyClient.end();
+  }
+  await legacyMigrationDatabase.close();
+  legacyMigrationDatabase = undefined;
+
   web = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
     env: { ...process.env, DATABASE_URL: databaseUrl, PORT: String(webPort), HOST: "127.0.0.1" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -59,8 +137,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention', '0011_structured_experiments', '0012_correlation_links');");
-  assert.equal(migrationCount, "12");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention', '0011_structured_experiments', '0012_correlation_links', '0013_live_timeline');");
+  assert.equal(migrationCount, "13");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -156,6 +234,69 @@ try {
   assert.equal(invalidAssociation.status, 400);
   docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "INSERT INTO tracegarden_workspaces (id, name) VALUES ('workspace-other', 'Other Workspace') ON CONFLICT (id) DO NOTHING; INSERT INTO tracegarden_clusters (id, workspace_id, name, endpoint) VALUES ('other-workspace-cluster', 'workspace-other', 'Other Cluster', 'https://other-cluster.example.test') ON CONFLICT (id) DO NOTHING;");
   try {
+    let crossWorkspaceObservationRejected = false;
+    try {
+      docker("exec", name, "psql", "-v", "ON_ERROR_STOP=1", "-U", "tracegarden", "-d", "tracegarden", "-c", "BEGIN; INSERT INTO tracegarden_observations (id, workspace_id, cluster_id, kind, source_identity, source_key, uid, name, namespace, resource_version, facts, observed_at) VALUES ('cross-workspace-observation', 'workspace-single', 'other-workspace-cluster', 'Pod', 'cross-workspace', 'cross-workspace', 'cross-workspace', 'cross-workspace', 'tracegarden', '1', '{}'::jsonb, now()); ROLLBACK;");
+    } catch {
+      crossWorkspaceObservationRejected = true;
+    }
+    assert.equal(crossWorkspaceObservationRejected, true);
+    let crossWorkspaceCheckpointRejected = false;
+    try {
+      docker("exec", name, "psql", "-v", "ON_ERROR_STOP=1", "-U", "tracegarden", "-d", "tracegarden", "-c", "BEGIN; INSERT INTO tracegarden_ingestion_checkpoints (workspace_id, cluster_id, namespace, resource_kind, resource_version) VALUES ('workspace-single', 'other-workspace-cluster', 'tracegarden', 'Pod', '1'); ROLLBACK;");
+    } catch {
+      crossWorkspaceCheckpointRejected = true;
+    }
+    assert.equal(crossWorkspaceCheckpointRejected, true);
+    const ownershipDatabase = new PostgresDatabase(databaseUrl);
+    try {
+      const mismatchedScope = {
+        workspaceId: "workspace-single",
+        clusterId: "other-workspace-cluster",
+        name: "Mismatched Cluster",
+        endpoint: "https://other-cluster.example.test",
+        namespaces: ["tracegarden"],
+        resourceKinds: ["Pod"],
+      };
+      await assert.rejects(
+        ownershipDatabase.timeline.recordObservation(normalizePodObservation(mismatchedScope, {
+          kind: "Pod",
+          metadata: { name: "mismatched-observation", namespace: "tracegarden", uid: "mismatched-observation", resourceVersion: "1" },
+          status: { phase: "Running" },
+        })),
+        (error) => error instanceof Error && error.cause instanceof Error && /does not belong/.test(error.cause.message),
+      );
+      const mismatchedCheckpoint = {
+        workspaceId: "workspace-single",
+        clusterId: "other-workspace-cluster",
+        namespace: "tracegarden",
+        resourceKind: "Pod",
+        resourceVersion: "1",
+      };
+      await assert.rejects(
+        ownershipDatabase.timeline.recordObservationsAndCheckpoint([], mismatchedCheckpoint),
+        (error) => error instanceof Error && error.cause instanceof Error && /does not belong/.test(error.cause.message),
+      );
+      await assert.rejects(
+        ownershipDatabase.timeline.advanceIngestionCheckpoint(mismatchedCheckpoint),
+        (error) => error instanceof Error && error.cause instanceof Error && /does not belong/.test(error.cause.message),
+      );
+      await assert.rejects(
+        ownershipDatabase.timeline.clearIngestionCheckpoint(mismatchedCheckpoint),
+        (error) => error instanceof Error && error.cause instanceof Error && /does not belong/.test(error.cause.message),
+      );
+      const validCheckpoint = { ...mismatchedCheckpoint, clusterId: "local-postgres-smoke" };
+      await ownershipDatabase.timeline.advanceIngestionCheckpoint(validCheckpoint);
+      await assert.rejects(
+        ownershipDatabase.timeline.clearIngestionCheckpoint(mismatchedCheckpoint),
+        (error) => error instanceof Error && error.cause instanceof Error && /does not belong/.test(error.cause.message),
+      );
+      assert.equal((await ownershipDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"))?.resourceVersion, "1");
+      await ownershipDatabase.timeline.clearIngestionCheckpoint(validCheckpoint);
+      assert.equal(await ownershipDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"), null);
+    } finally {
+      await ownershipDatabase.close();
+    }
     const crossWorkspaceAssociation = await fetch(`http://127.0.0.1:${webPort}/api/experiments`, {
       method: "POST",
       headers: { cookie: ownerCookie, "content-type": "application/json" },
@@ -407,7 +548,110 @@ try {
   assert.match(await timelinePage.text(), /Pod Observation/);
   const timelinePageChinese = await fetch(`http://127.0.0.1:${webPort}/app?lang=zh-CN`, { headers: { cookie: ownerCookie } });
   assert.match(await timelinePageChinese.text(), /已提交的 Kubernetes Observation 会出现在这里/);
+  const unauthorizedStream = await fetch(`http://127.0.0.1:${webPort}/api/timeline/stream`);
+  assert.equal(unauthorizedStream.status, 401);
+  const streamController = new AbortController();
+  const authorizedStream = await fetch(`http://127.0.0.1:${webPort}/api/timeline/stream`, { headers: { cookie: ownerCookie }, signal: streamController.signal });
+  assert.equal(authorizedStream.status, 200);
+  assert.equal(authorizedStream.headers.get("content-type"), "text/event-stream; charset=utf-8");
+  const streamReader = authorizedStream.body.getReader();
+  const readyChunk = await streamReader.read();
+  const readyText = new TextDecoder().decode(readyChunk.value);
+  assert.match(readyText, /event: ready/);
+  assert.doesNotMatch(readyText, /api-deployment|facts|observation/);
+  await streamReader.cancel();
+  streamController.abort();
   const timelineStore = collectorDatabase.timeline;
+  const timelineHints = [];
+  const unsubscribeTimeline = await timelineStore.subscribeTimeline((hint) => timelineHints.push(hint));
+  const liveObservation = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "live-entry", namespace: "tracegarden", uid: "pod-uid-live", resourceVersion: "9" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, "2099-10-01T00:00:00.000Z");
+  const liveResult = await timelineStore.recordObservation(liveObservation);
+  assert.deepEqual(timelineHints, [{ entryId: liveResult.entry.id }]);
+  assert.doesNotMatch(JSON.stringify(timelineHints), /Running|live-entry/);
+  const hintsBeforeRollback = timelineHints.length;
+  docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "CREATE OR REPLACE FUNCTION tracegarden_test_fail_live_timeline() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'live timeline write failed'; END; $$; CREATE TRIGGER tracegarden_test_fail_live_timeline BEFORE INSERT ON tracegarden_timeline_entries FOR EACH ROW EXECUTE FUNCTION tracegarden_test_fail_live_timeline();");
+  try {
+    await assert.rejects(timelineStore.recordObservation(normalizePodObservation(observationScope, {
+      kind: "Pod",
+      metadata: { name: "rolled-back-live-entry", namespace: "tracegarden", uid: "pod-uid-rolled-back", resourceVersion: "10" },
+      status: { phase: "Running" },
+    }, "2099-10-01T00:00:01.000Z")), /persistence failed/);
+    assert.equal(timelineHints.length, hintsBeforeRollback);
+  } finally {
+    docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "DROP TRIGGER tracegarden_test_fail_live_timeline ON tracegarden_timeline_entries; DROP FUNCTION tracegarden_test_fail_live_timeline();");
+  }
+  const recoveryBase = await timelineStore.listTimelineEntries("workspace-single", { limit: 100 }, sessionBody.member.id);
+  assert.ok(recoveryBase.resumeCursor);
+  const disconnectedHints = [];
+  const unsubscribeDisconnected = await timelineStore.subscribeTimeline((hint) => disconnectedHints.push(hint));
+  unsubscribeDisconnected();
+  const missedObservation = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "missed-live-entry", namespace: "tracegarden", uid: "pod-uid-missed-live", resourceVersion: "11" },
+    status: { phase: "Running" },
+  }, "2099-10-01T00:00:01.000Z");
+  const missedResult = await timelineStore.recordObservation(missedObservation);
+  assert.deepEqual(disconnectedHints, []);
+  const recoveredPage = await timelineStore.listTimelineEntries("workspace-single", { limit: 100, cursor: recoveryBase.resumeCursor }, sessionBody.member.id);
+  assert.deepEqual(recoveredPage.entries.map((entry) => entry.id), [missedResult.entry.id]);
+  const reconnectHints = [];
+  const unsubscribeReconnected = await timelineStore.subscribeTimeline((hint) => reconnectHints.push(hint));
+  const duplicateMissed = await timelineStore.recordObservation(missedObservation);
+  assert.equal(duplicateMissed.duplicate, true);
+  assert.deepEqual(reconnectHints, []);
+  const reconnectedObservation = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "reconnected-live-entry", namespace: "tracegarden", uid: "pod-uid-reconnected-live", resourceVersion: "12" },
+    status: { phase: "Running" },
+  }, "2099-10-01T00:00:02.000Z");
+  const reconnectedResult = await timelineStore.recordObservation(reconnectedObservation);
+  assert.deepEqual(reconnectHints, [{ entryId: reconnectedResult.entry.id }]);
+  unsubscribeReconnected();
+  const concurrencyClient = new pg.Client(databaseUrl);
+  await concurrencyClient.connect();
+  const concurrencyObservationId = `concurrency-observation-${process.pid}`;
+  const concurrencyEntryId = `concurrency-entry-${process.pid}`;
+  try {
+    await concurrencyClient.query("BEGIN");
+    await concurrencyClient.query("SELECT pg_advisory_xact_lock(hashtext('tracegarden:timeline:writer'))");
+    await concurrencyClient.query(
+      `INSERT INTO tracegarden_observations
+         (id, workspace_id, cluster_id, kind, source_identity, source_key, uid, name, namespace, resource_version, facts, observed_at)
+       VALUES ($1, 'workspace-single', $2, 'Pod', $3, $3, $3, 'concurrency-before', 'tracegarden', '1', '{}'::jsonb, '2099-11-01T00:00:00.000Z')`,
+      [concurrencyObservationId, observationScope.clusterId, concurrencyObservationId],
+    );
+    const sequenceA = (await concurrencyClient.query(
+      `INSERT INTO tracegarden_timeline_entries (id, workspace_id, cluster_id, entry_type, observation_id, occurred_at)
+       VALUES ($1, 'workspace-single', $2, 'observation', $3, '2099-11-01T00:00:00.000Z')
+       RETURNING timeline_sequence`,
+      [concurrencyEntryId, observationScope.clusterId, concurrencyObservationId],
+    )).rows[0]?.timeline_sequence;
+    assert.ok(sequenceA);
+    const blockedObservation = normalizePodObservation(observationScope, {
+      kind: "Pod",
+      metadata: { name: "concurrency-after", namespace: "tracegarden", uid: "concurrency-after", resourceVersion: "1" },
+      status: { phase: "Running" },
+    }, "2099-11-01T00:00:01.000Z");
+    const blockedWrite = timelineStore.recordObservationsAndCheckpoint([blockedObservation], {
+      workspaceId: "workspace-single",
+      clusterId: observationScope.clusterId,
+      namespace: "tracegarden",
+      resourceKind: "Pod",
+      resourceVersion: "concurrency-1",
+    });
+    await concurrencyClient.query("COMMIT");
+    const blockedResult = (await blockedWrite)[0];
+    assert.ok(blockedResult);
+    assert.ok(BigInt(blockedResult.entry.timelineSequence) > BigInt(sequenceA));
+  } finally {
+    await concurrencyClient.query("ROLLBACK").catch(() => undefined);
+    await concurrencyClient.end();
+  }
+  unsubscribeTimeline();
   const pendingObservation = normalizePodObservation(observationScope, {
     kind: "Pod",
     metadata: { name: "pending", namespace: "tracegarden", uid: "pod-uid-pending", resourceVersion: "10" },
@@ -527,7 +771,7 @@ try {
   }, tieTimestamp);
   const equalResultA = await timelineStore.recordObservation(equalTimestampA);
   const equalResultB = await timelineStore.recordObservation(equalTimestampB);
-  const expectedEqualOrder = equalResultA.entry.id.localeCompare(equalResultB.entry.id) < 0 ? ["equal-a", "equal-b"] : ["equal-b", "equal-a"];
+  const expectedEqualOrder = ["equal-a", "equal-b"];
   const traversedIds = [];
   const traversedNames = [];
   const traversedTimes = [];
@@ -542,7 +786,7 @@ try {
     traversal = await timelineStore.listTimelineEntries("workspace-single", { limit: 1, namespace: "tracegarden", cursor: traversal.nextCursor }, sessionBody.member.id);
   }
   assert.equal(new Set(traversedIds).size, traversedIds.length);
-  assert.deepEqual(new Set(traversedNames), new Set(["api", "api-deployment", "pending", "running-later", "inserted-newer", "equal-a", "equal-b"]));
+  assert.deepEqual(new Set(traversedNames), new Set(["api", "api-deployment", "live-entry", "missed-live-entry", "pending", "running-later", "inserted-newer", "reconnected-live-entry", "concurrency-before", "concurrency-after", "equal-a", "equal-b"]));
   const equalIndexes = [traversedNames.indexOf("equal-a"), traversedNames.indexOf("equal-b")].sort((left, right) => left - right);
   assert.equal(equalIndexes[1] - equalIndexes[0], 1);
   assert.deepEqual(traversedNames.slice(equalIndexes[0], equalIndexes[1] + 1), expectedEqualOrder);
@@ -637,6 +881,30 @@ try {
     auditTruncateRejected = true;
   }
   assert.equal(auditTruncateRejected, true);
+  const rollbackNotificationClient = new pg.Client(databaseUrl);
+  const rollbackTransactionClient = new pg.Client(databaseUrl);
+  await rollbackNotificationClient.connect();
+  await rollbackTransactionClient.connect();
+  try {
+    await rollbackNotificationClient.query("LISTEN tracegarden_timeline");
+    const receivedNotifications = [];
+    const committedPayload = JSON.stringify({ entryId: "committed-after-rollback" });
+    const committedNotification = new Promise((resolve) => rollbackNotificationClient.on("notification", (message) => {
+      receivedNotifications.push(message.payload);
+      if (message.payload === committedPayload) resolve();
+    }));
+    await rollbackTransactionClient.query("BEGIN");
+    await rollbackTransactionClient.query("SELECT pg_notify('tracegarden_timeline', $1)", [JSON.stringify({ entryId: "rolled-back-after-notify" })]);
+    await rollbackTransactionClient.query("ROLLBACK");
+    await rollbackTransactionClient.query("BEGIN");
+    await rollbackTransactionClient.query("SELECT pg_notify('tracegarden_timeline', $1)", [committedPayload]);
+    await rollbackTransactionClient.query("COMMIT");
+    await committedNotification;
+    assert.deepEqual(receivedNotifications, [committedPayload]);
+  } finally {
+    await rollbackTransactionClient.end();
+    await rollbackNotificationClient.end();
+  }
 
   productionWeb = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
     env: {
@@ -680,11 +948,12 @@ try {
   assert.match(googleLocation, /client_id=local-test-client/);
   assert.match(googleLocation, /redirect_uri=https%3A%2F%2Ftracegarden.test%2Fapi%2Fauth%2Fcallback%2Fgoogle/);
   assert.doesNotMatch(googleLocation, /local-test-secret/);
-  console.log("PostgreSQL migration, admission, Experiment, normalized Observation, Timeline, rollback, and Better Auth integration smoke passed");
+  console.log("PostgreSQL migration, admission, Experiment, normalized Observation, live Timeline, rollback, and Better Auth integration smoke passed");
 } finally {
   await collector?.close();
   collectorProcess?.kill("SIGTERM");
   await collectorDatabase?.close();
+  await legacyMigrationDatabase?.close();
   web?.kill("SIGTERM");
   productionWeb?.kill("SIGTERM");
   await logDatabase?.close();

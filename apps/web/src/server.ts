@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { URL } from "node:url";
 import { state, type StatusResponse } from "../../../packages/contracts/src/index.js";
 import {
@@ -7,6 +8,8 @@ import {
   parseTimelineQuery,
   TimelineQueryValidationError,
   type DatabaseBoundary,
+  type TimelineNotification,
+  type TimelineNotificationSource,
   type ExperimentStore,
   type ObservationTimelineEntry,
   type TimelineEntry,
@@ -469,7 +472,18 @@ function renderTimelineSection(language: Language, messages: Messages, page: Tim
   const unreadAttentionOnlyLabel = page.entries.some((entry) => entry.entryType === "observation" && entry.attentionItem)
     ? messages.timelineUnreadOnly
     : messages.timelineUnreadOnly.replace(/ Items? only$/, " only");
-  return `<section aria-labelledby="timeline-title">
+  const liveAttributes = [
+    `data-live-timeline="true"`,
+    `data-timeline-limit="${query.limit}"`,
+    ...(query.kind ? [`data-timeline-kind="${escapeHtml(query.kind)}"`] : []),
+    ...(query.namespace ? [`data-timeline-namespace="${escapeHtml(query.namespace)}"`] : []),
+    ...(query.name ? [`data-timeline-name="${escapeHtml(query.name)}"`] : []),
+    ...(query.state ? [`data-timeline-state="${escapeHtml(query.state)}"`] : []),
+    ...(query.attention !== undefined ? [`data-timeline-attention="${query.attention}"`] : []),
+    ...(query.unread !== undefined ? [`data-timeline-unread="${query.unread}"`] : []),
+    ...(page.resumeCursor ? [`data-timeline-cursor="${escapeHtml(page.resumeCursor)}"`] : []),
+  ].join(" ");
+  return `<section aria-labelledby="timeline-title" ${liveAttributes}>
       <h2 id="timeline-title">${escapeHtml(messages.timelineTitle)}</h2>
       <p>${escapeHtml(messages.timelineDescription)}</p>
       ${reviewed ? `<p class="notice" role="status">${escapeHtml(messages.attentionReviewed)}</p>` : ""}
@@ -488,6 +502,95 @@ function renderTimelineSection(language: Language, messages: Messages, page: Tim
       </form>
       ${rows || `<p>${escapeHtml(messages.noTimelineEntries)}</p>`}
       ${next}
+      <script>
+        (() => {
+          const section = document.querySelector('[data-live-timeline="true"]');
+          if (!section) return;
+          const ids = new Set(Array.from(section.querySelectorAll('[data-entry-id]')).map((entry) => entry.getAttribute('data-entry-id')));
+          let cursor = section.dataset.timelineCursor || null;
+          let clientId = null;
+          let recovering = false;
+          let recoverAgain = false;
+          const append = (entry) => {
+            if (!entry || typeof entry.id !== 'string' || ids.has(entry.id)) return;
+            ids.add(entry.id);
+            const article = document.createElement('article');
+            article.dataset.entryId = entry.id;
+            if (entry.entryType === 'experiment') article.textContent = 'Experiment · ' + (entry.experiment?.state || '');
+            else article.textContent = (entry.observation?.kind || 'Observation') + ' · ' + (entry.observation?.name || '');
+            section.append(article);
+          };
+          const recover = async () => {
+            if (recovering) { recoverAgain = true; return; }
+            recovering = true;
+            try {
+              do {
+                recoverAgain = false;
+                const params = new URLSearchParams({ limit: section.dataset.timelineLimit || '100' });
+                for (const name of ['kind', 'namespace', 'name', 'state', 'attention', 'unread']) {
+                  const value = section.dataset['timeline' + name[0].toUpperCase() + name.slice(1)];
+                  if (value) params.set(name, value);
+                }
+                if (cursor) params.set('cursor', cursor);
+                if (clientId) params.set('sseClientId', clientId);
+                let response;
+                try {
+                  response = await fetch('/api/timeline?' + params.toString(), { headers: { accept: 'application/json' } });
+                } catch {
+                  reconnect();
+                  return;
+                }
+                if (!response.ok) {
+                  reconnect();
+                  return;
+                }
+                let page;
+                try {
+                  page = await response.json();
+                } catch {
+                  reconnect();
+                  return;
+                }
+                for (const entry of page.entries || []) append(entry);
+                if (typeof page.resumeCursor === 'string') cursor = page.resumeCursor;
+                if (typeof page.nextCursor === 'string') {
+                  cursor = page.nextCursor;
+                  recoverAgain = true;
+                }
+              } while (recoverAgain);
+            } finally {
+              recovering = false;
+              if (recoverAgain) void recover();
+            }
+          };
+          let source = null;
+          window.__tracegardenTimelineReadyCount = 0;
+          window.__tracegardenTimelineHintCount = 0;
+          const connect = () => {
+            const nextSource = new EventSource('/api/timeline/stream');
+            source = nextSource;
+            nextSource.addEventListener('ready', (event) => {
+              window.__tracegardenTimelineReadyCount += 1;
+              try { clientId = JSON.parse(event.data).clientId || null; } catch { clientId = null; }
+              // The server emits ready only after subscribing, so this closes the query-to-LISTEN gap.
+              void recover();
+            });
+            nextSource.addEventListener('error', () => { if (source === nextSource) clientId = null; });
+            nextSource.addEventListener('timeline', () => {
+              window.__tracegardenTimelineHintCount += 1;
+              void recover();
+            });
+            window.__tracegardenTimelineEventSource = nextSource;
+          };
+          const reconnect = () => {
+            source?.close();
+            clientId = null;
+            connect();
+          };
+          window.__tracegardenTimelineReconnect = reconnect;
+          connect();
+        })();
+      </script>
     </section>`;
 }
 
@@ -897,15 +1000,62 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     }
   }
 
+  type LiveSseClient = {
+    workspaceId: string;
+    memberId: string;
+    pendingNotification: TimelineNotification | null;
+    readySent: boolean;
+    hintCheckInFlight: boolean;
+    hintQueued: boolean;
+    query?: TimelineQuery;
+    cursorLagEntries: number;
+    cursorLagSince: number | null;
+    sendPendingHint?: () => void;
+    close: () => void;
+  };
+  const liveSseClients = new Map<string, LiveSseClient>();
+  let timelineReady = true;
+  const refreshLiveClientLag = async (client: LiveSseClient): Promise<void> => {
+    if (!client.query || !timelineStore?.countTimelineEntriesAfterCursor) return;
+    try {
+      const lag = await timelineStore.countTimelineEntriesAfterCursor(client.workspaceId, client.query, client.memberId);
+      if (client.cursorLagEntries === 0 && lag > 0) client.cursorLagSince = Date.now();
+      if (lag === 0) client.cursorLagSince = null;
+      client.cursorLagEntries = lag;
+    } catch {
+      // Cursor lag is telemetry; a failed measurement must not affect the stream.
+    }
+  };
+  const refreshLiveSignals = async (): Promise<void> => {
+    await Promise.all([...liveSseClients.values()].map((client) => refreshLiveClientLag(client)));
+  };
+  const liveSignalSnapshot = (): Readonly<{ sseClients: number; cursorLagEntries: number; cursorLagSeconds: number }> => {
+    let cursorLagEntries = 0;
+    let cursorLagSince: number | null = null;
+    for (const client of liveSseClients.values()) {
+      cursorLagEntries += client.cursorLagEntries;
+      if (client.cursorLagSince !== null && (cursorLagSince === null || client.cursorLagSince < cursorLagSince)) cursorLagSince = client.cursorLagSince;
+    }
+    return {
+      sseClients: liveSseClients.size,
+      cursorLagEntries,
+      cursorLagSeconds: cursorLagSince === null ? 0 : Math.max(0, (Date.now() - cursorLagSince) / 1_000),
+    };
+  };
+
   const status = async (): Promise<StatusResponse> => {
     const databaseReady = await database.ping();
+    await refreshLiveSignals();
+    const timelineState = state(timelineReady);
     return {
       service: "tracegarden-web",
-      status: state(databaseReady),
+      status: state(databaseReady && timelineReady),
       checks: {
         database: state(databaseReady),
         migrations: "ready",
+        timeline: timelineState,
       },
+      signals: liveSignalSnapshot(),
     };
   };
 
@@ -962,6 +1112,14 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     ? database.experiments ?? null
     : options.experimentStore ?? database.experiments ?? (hasExperimentStore(timelineStore) ? timelineStore : null);
   const logAuditStore = hasLogAuditStore(admissionStore) ? admissionStore : undefined;
+  const timelineNotifications = timelineStore && "subscribeTimeline" in timelineStore && typeof timelineStore.subscribeTimeline === "function"
+    ? timelineStore as TimelineNotificationSource
+    : null;
+  if (timelineNotifications?.timelineNotificationsHealthy) timelineReady = timelineNotifications.timelineNotificationsHealthy();
+  const removeTimelineErrorListener = timelineNotifications?.onTimelineError?.(() => {
+    timelineReady = false;
+    for (const client of [...liveSseClients.values()]) client.close();
+  });
 
   const scopeForSession = (session: AuthenticatedSession): Promise<ClusterScope | null> => clusterScopeStore.get(session.member.workspaceId);
   const correlationSuggestionsForSession = async (session: AuthenticatedSession): Promise<readonly CorrelationSuggestionRecord[]> =>
@@ -1128,6 +1286,113 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         response.end();
         return;
       }
+      if (requestUrl.pathname === "/api/timeline/stream") {
+        const lookup = await sessionForRequest(request);
+        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (!hasTimelineAccess(lookup.session)) {
+          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
+          return;
+        }
+        if (method !== "GET") {
+          sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        if (!timelineNotifications) {
+          sendJson(response, 503, { error: "timeline_notifications_unavailable" });
+          return;
+        }
+        const clientId = randomUUID();
+        let closed = false;
+        let unsubscribe: (() => void) | undefined;
+        const client: LiveSseClient = {
+          workspaceId: lookup.session.member.workspaceId,
+          memberId: lookup.session.member.id,
+          pendingNotification: null,
+          readySent: false,
+          hintCheckInFlight: false,
+          hintQueued: false,
+          cursorLagEntries: 0,
+          cursorLagSince: null,
+          close: () => {
+            if (closed) return;
+            closed = true;
+            liveSseClients.delete(clientId);
+            unsubscribe?.();
+            response.end();
+          },
+        };
+        liveSseClients.set(clientId, client);
+        response.writeHead(200, {
+          "cache-control": "no-store",
+          "connection": "keep-alive",
+          "content-type": "text/event-stream; charset=utf-8",
+          "x-accel-buffering": "no",
+        });
+        request.on("close", client.close);
+        response.on("close", client.close);
+        response.on("error", client.close);
+        const writeEvent = (event: string, data: unknown): boolean => {
+          try {
+            const accepted = response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+            if (!accepted) client.close();
+            return accepted;
+          } catch {
+            client.close();
+            return false;
+          }
+        };
+        const sendAuthorizedHint = async (): Promise<void> => {
+          if (client.hintCheckInFlight || closed || !client.readySent) return;
+          client.hintCheckInFlight = true;
+          try {
+            while (!closed && client.pendingNotification) {
+              const notification = client.pendingNotification;
+              client.pendingNotification = null;
+              let entry: TimelineEntry | null = null;
+              try {
+                entry = await timelineStore?.getTimelineEntry(client.workspaceId, notification.entryId) ?? null;
+              } catch {
+                client.close();
+                return;
+              }
+              if (!entry || entry.workspaceId !== client.workspaceId) continue;
+              if (client.hintQueued) continue;
+              client.hintQueued = true;
+              if (!writeEvent("timeline", { entryId: entry.id })) return;
+              void refreshLiveClientLag(client);
+              return;
+            }
+          } finally {
+            client.hintCheckInFlight = false;
+            if (!closed && client.pendingNotification && !client.hintQueued) void sendAuthorizedHint();
+          }
+        };
+        client.sendPendingHint = () => { void sendAuthorizedHint(); };
+        const onNotification = (notification: TimelineNotification): void => {
+          if (closed) return;
+          client.pendingNotification = notification;
+          if (!client.hintQueued) void sendAuthorizedHint();
+        };
+        try {
+          unsubscribe = await timelineNotifications.subscribeTimeline(onNotification);
+          if (closed) {
+            unsubscribe();
+            return;
+          }
+          timelineReady = true;
+          if (!writeEvent("ready", { clientId })) return;
+          client.readySent = true;
+          void sendAuthorizedHint();
+          // The ready marker is emitted only after LISTEN is active; the browser now recovers durably.
+        } catch {
+          timelineReady = false;
+          client.close();
+        }
+        return;
+      }
       if (requestUrl.pathname === "/api/timeline" || requestUrl.pathname === "/api/timeline/entries") {
         const lookup = await sessionForRequest(request);
         if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
@@ -1148,7 +1413,22 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         }
         try {
           const query = parseTimelineQuery(timelineQueryInput(requestUrl));
-          sendJson(response, 200, await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, query, lookup.session.member.id));
+          const page = await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, query, lookup.session.member.id);
+          const sseClientId = requestUrl.searchParams.get("sseClientId");
+          const liveClient = sseClientId ? liveSseClients.get(sseClientId) : undefined;
+          if (liveClient && liveClient.workspaceId === lookup.session.member.workspaceId && liveClient.memberId === lookup.session.member.id) {
+            const cursor = page.nextCursor ?? page.resumeCursor ?? query.cursor;
+            liveClient.query = cursor ? { ...query, cursor } : { ...query };
+            liveClient.hintQueued = false;
+            const pendingNotification = liveClient.pendingNotification;
+            liveClient.pendingNotification = null;
+            if (pendingNotification) {
+              liveClient.pendingNotification = pendingNotification;
+              liveClient.sendPendingHint?.();
+            }
+            void refreshLiveClientLag(liveClient);
+          }
+          sendJson(response, 200, page);
         } catch (error: unknown) {
           if (error instanceof TimelineQueryValidationError) {
             sendJson(response, 400, { error: "invalid_timeline_query", issues: error.issues });
@@ -1991,6 +2271,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     server,
     status,
     close: async () => {
+      removeTimelineErrorListener?.();
+      for (const client of [...liveSseClients.values()]) client.close();
       await database.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },

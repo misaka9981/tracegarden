@@ -83,6 +83,10 @@ declare module "pg" {
   }
   export interface PoolClient {
     query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
+    on(event: "notification", listener: (message: { channel: string; payload?: string }) => void): this;
+    on(event: "error", listener: (error: unknown) => void): this;
+    removeListener(event: "notification", listener: (message: { channel: string; payload?: string }) => void): this;
+    removeListener(event: "error", listener: (error: unknown) => void): this;
     release(): void;
   }
   export class Pool {

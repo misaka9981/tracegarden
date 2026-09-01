@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { ServerResponse } from "node:http";
 import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../dist/apps/web/src/server.js";
-import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError } from "../dist/packages/db/src/index.js";
+import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError, parseTimelineNotification } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
 import { confirmCorrelationSuggestion, correlationSignalsBetween, createExperiment, ExperimentLifecycleError, ExperimentValidationError, hasCorrelationReview, hasExperimentWrite, parseExperimentInput, rejectCorrelationSuggestion, suggestCorrelationCandidates } from "../dist/packages/domain/src/index.js";
@@ -450,6 +451,59 @@ const normalizedPod = savedScope ? normalizePodObservation(savedScope, scopedRes
 assert.equal(normalizedPod?.sourceIdentity, "lab-cluster:pod-uid-1");
 assert.equal(normalizedPod?.phase, "Running");
 assert.equal(normalizedPod?.ready, true);
+if (savedScope && normalizedPod) {
+  const ownershipTimeline = new MemoryObservationStore(scopeStore);
+  const validCheckpoint = {
+    workspaceId: savedScope.workspaceId,
+    clusterId: savedScope.clusterId,
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "1",
+  };
+  const mismatchedCheckpoint = { ...validCheckpoint, clusterId: "foreign-cluster" };
+  await assert.rejects(
+    () => ownershipTimeline.recordObservationsAndCheckpoint([normalizedPod], mismatchedCheckpoint),
+    /Ingestion Checkpoint Cluster does not belong to its Workspace/,
+  );
+  assert.equal(await ownershipTimeline.countObservations(savedScope.workspaceId), 0);
+  const mismatchedObservation = normalizePodObservation({ ...savedScope, clusterId: "foreign-cluster" }, {
+    kind: "Pod",
+    metadata: { name: "foreign-observation", namespace: "tracegarden", uid: "foreign-observation", resourceVersion: "1" },
+    status: { phase: "Running" },
+  }, "2026-01-01T00:00:01.000Z");
+  await assert.rejects(
+    () => ownershipTimeline.recordObservation(mismatchedObservation),
+    /Observation Cluster does not belong to its Workspace/,
+  );
+  assert.equal(await ownershipTimeline.countObservations(savedScope.workspaceId), 0);
+  const validBatchObservation = normalizePodObservation(savedScope, {
+    kind: "Pod",
+    metadata: { name: "valid-batch-observation", namespace: "tracegarden", uid: "valid-batch-observation", resourceVersion: "1" },
+    status: { phase: "Running" },
+  }, "2026-01-01T00:00:02.000Z");
+  await assert.rejects(
+    () => ownershipTimeline.recordObservations([validBatchObservation, mismatchedObservation]),
+    /Observation Cluster does not belong to its Workspace/,
+  );
+  assert.equal(await ownershipTimeline.countObservations(savedScope.workspaceId), 0);
+  await assert.rejects(
+    () => ownershipTimeline.recordObservationsAndCheckpoint([mismatchedObservation], validCheckpoint),
+    /Observation Cluster does not belong to its Workspace/,
+  );
+  await assert.rejects(
+    () => ownershipTimeline.advanceIngestionCheckpoint(mismatchedCheckpoint),
+    /Ingestion Checkpoint Cluster does not belong to its Workspace/,
+  );
+  assert.equal(await ownershipTimeline.getIngestionCheckpoint(savedScope.workspaceId, savedScope.clusterId, "Pod", "tracegarden"), null);
+  await ownershipTimeline.advanceIngestionCheckpoint(validCheckpoint);
+  await assert.rejects(
+    () => ownershipTimeline.clearIngestionCheckpoint(mismatchedCheckpoint),
+    /Ingestion Checkpoint Cluster does not belong to its Workspace/,
+  );
+  assert.equal((await ownershipTimeline.getIngestionCheckpoint(savedScope.workspaceId, savedScope.clusterId, "Pod", "tracegarden"))?.resourceVersion, "1");
+  await ownershipTimeline.clearIngestionCheckpoint(validCheckpoint);
+  assert.equal(await ownershipTimeline.getIngestionCheckpoint(savedScope.workspaceId, savedScope.clusterId, "Pod", "tracegarden"), null);
+}
 const eventScope = savedScope ? { ...savedScope, resourceKinds: ["Event"] } : null;
 const modernEvent = eventScope ? normalizeObservation(eventScope, {
   kind: "Event",
@@ -598,6 +652,83 @@ if (ownerAdmission.admitted && savedScope) {
   assert.match(completedJobPage, /2026-01-01T00:00:00.000Z/);
   assert.doesNotMatch(completedJobPage, />Recovery<\/h3>/);
   assert.doesNotMatch(completedJobPage, /Attention Item/);
+}
+const liveTimeline = new MemoryObservationStore();
+const liveHints = [];
+const unsubscribeLiveTimeline = await liveTimeline.subscribeTimeline((hint) => liveHints.push(hint));
+assert.deepEqual(parseTimelineNotification(JSON.stringify({ entryId: "entry-1" })), { entryId: "entry-1" });
+assert.equal(parseTimelineNotification(JSON.stringify({ entryId: "entry-1", content: "must not cross the hint boundary" })), null);
+const liveObservation = savedScope ? normalizePodObservation(savedScope, {
+  kind: "Pod",
+  metadata: { name: "live-entry", namespace: "tracegarden", uid: "live-entry-uid", resourceVersion: "1" },
+  status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+}, "2099-01-01T00:00:00.000Z") : null;
+if (liveObservation) {
+  const liveResult = await liveTimeline.recordObservation(liveObservation);
+  assert.deepEqual(liveHints, [{ entryId: liveResult.entry.id }]);
+  const livePage = await liveTimeline.listTimelineEntries("workspace-single", { limit: 1 }, ownerActor.id);
+  assert.equal(livePage.resumeCursor !== undefined, true);
+  if (livePage.resumeCursor) {
+    const [encodedPayload] = livePage.resumeCursor.split(".");
+    const payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"));
+    assert.equal(payload.version, 2);
+    assert.equal(payload.sequence, liveResult.entry.timelineSequence);
+  }
+  const sequenceTimeline = new MemoryObservationStore();
+  const sequenceObservations = [
+    normalizePodObservation(savedScope, {
+      kind: "Pod",
+      metadata: { name: "newer-source-time", namespace: "tracegarden", uid: "sequence-newer", resourceVersion: "1" },
+      status: { phase: "Running" },
+    }, "2099-01-02T00:00:00.000Z"),
+    normalizePodObservation(savedScope, {
+      kind: "Pod",
+      metadata: { name: "older-source-time", namespace: "tracegarden", uid: "sequence-older", resourceVersion: "1" },
+      status: { phase: "Running" },
+    }, "2000-01-01T00:00:00.000Z"),
+  ];
+  const sequenceResults = await sequenceTimeline.recordObservations(sequenceObservations);
+  assert.deepEqual((await sequenceTimeline.listTimelineEntries("workspace-single", { limit: 100 })).entries.map((entry) => entry.observation.name), ["newer-source-time", "older-source-time"]);
+  const sequenceFirstPage = await sequenceTimeline.listTimelineEntries("workspace-single", { limit: 1 }, ownerActor.id);
+  assert.equal(sequenceFirstPage.entries[0]?.id, sequenceResults[0]?.entry.id);
+  const sequenceSecondPage = await sequenceTimeline.listTimelineEntries("workspace-single", { limit: 1, cursor: sequenceFirstPage.nextCursor ?? "" }, ownerActor.id);
+  assert.equal(sequenceSecondPage.entries[0]?.id, sequenceResults[1]?.entry.id);
+}
+unsubscribeLiveTimeline();
+const backpressureRuntime = await createWebRuntime({
+  database: new MemoryDatabase(),
+  identityAdapter: new LocalIdentityAdapter(),
+  environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
+  port: 43209,
+});
+const originalResponseWrite = ServerResponse.prototype.write;
+let forceBackpressure = false;
+let backpressureWriteObserved = false;
+ServerResponse.prototype.write = function (...args) {
+  if (forceBackpressure) {
+    backpressureWriteObserved = true;
+    return false;
+  }
+  return originalResponseWrite.apply(this, args);
+};
+try {
+  const backpressureLogin = await fetch("http://127.0.0.1:43209/auth/login", {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: "identity=owner&lang=en",
+  });
+  forceBackpressure = true;
+  const backpressureStream = await fetch("http://127.0.0.1:43209/api/timeline/stream", {
+    headers: { cookie: backpressureLogin.headers.get("set-cookie") ?? "" },
+  });
+  assert.equal(backpressureStream.status, 200);
+  await backpressureStream.body.cancel();
+  assert.equal(backpressureWriteObserved, true);
+} finally {
+  forceBackpressure = false;
+  ServerResponse.prototype.write = originalResponseWrite;
+  await backpressureRuntime.close();
 }
 const memoryTimeline = new MemoryObservationStore();
 const experimentInput = {
