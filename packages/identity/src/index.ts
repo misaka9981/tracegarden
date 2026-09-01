@@ -8,13 +8,14 @@ export const capabilities = {
   membershipManage: "membership:manage",
   timelineRead: "timeline:read",
   experimentWrite: "experiment:write",
+  clusterConfigure: "cluster:configure",
 } as const;
 
 export type Capability = (typeof capabilities)[keyof typeof capabilities];
 export type Role = "owner" | "operator" | "viewer";
 
 export const roleCapabilities: Readonly<Record<Role, readonly Capability[]>> = {
-  owner: [capabilities.workspaceRead, capabilities.membershipManage, capabilities.timelineRead, capabilities.experimentWrite],
+  owner: [capabilities.workspaceRead, capabilities.membershipManage, capabilities.timelineRead, capabilities.experimentWrite, capabilities.clusterConfigure],
   operator: [capabilities.workspaceRead, capabilities.timelineRead, capabilities.experimentWrite],
   viewer: [capabilities.workspaceRead, capabilities.timelineRead],
 };

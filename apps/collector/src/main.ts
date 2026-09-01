@@ -1,14 +1,25 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { state, type StatusResponse } from "../../../packages/contracts/src/index.js";
+import {
+  collectScopedResources,
+  createKubernetesAdapter,
+  type ClusterScope,
+  type KubernetesObservationAdapter,
+  type KubernetesResource,
+} from "../../../packages/cluster/src/index.js";
 
 type CollectorOptions = Readonly<{
   port?: number;
   host?: string;
+  environment?: Record<string, string | undefined>;
+  scope?: ClusterScope;
+  adapter?: KubernetesObservationAdapter;
 }>;
 
 export type CollectorRuntime = Readonly<{
   server: Server;
   status: () => StatusResponse;
+  collect: () => Promise<readonly KubernetesResource[]>;
   close: () => Promise<void>;
 }>;
 
@@ -26,6 +37,8 @@ export function collectorStatus(): StatusResponse {
 }
 
 export async function createCollectorRuntime(options: CollectorOptions = {}): Promise<CollectorRuntime> {
+  const adapter = options.adapter ?? createKubernetesAdapter(options.environment ?? process.env);
+  const collect = async (): Promise<readonly KubernetesResource[]> => options.scope ? collectScopedResources(options.scope, adapter) : [];
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
     if (request.method !== "GET") {
       response.statusCode = 405;
@@ -46,6 +59,7 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   return {
     server,
     status: collectorStatus,
+    collect,
     close: async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },

@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
 import { collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { createWebRuntime, renderStatusPage } from "../dist/apps/web/src/server.js";
-import { createDatabase, MemoryAdmissionStore, MemoryDatabase } from "../dist/packages/db/src/index.js";
+import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
+import {
+  collectScopedResources,
+  configureClusterScope,
+  DeterministicKubernetesAdapter,
+  createKubernetesAdapter,
+  hasClusterConfigureCapability,
+  productionKubernetesConfiguration,
+  validateClusterScopeInput,
+} from "../dist/packages/cluster/src/index.js";
 
 assert.equal(parseLanguage(undefined), "zh-CN");
 assert.equal(parseLanguage("en"), "en");
@@ -102,6 +111,7 @@ const productionRuntime = await createWebRuntime({
   database: {
     kind: "postgres",
     admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "test-google-subject" }),
+    clusterScope: new MemoryClusterScopeStore(),
     migrate: async () => {},
     ping: async () => true,
     close: async () => {},
@@ -160,6 +170,7 @@ await assert.rejects(
     database: {
       kind: "postgres",
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" }),
+      clusterScope: new MemoryClusterScopeStore(),
       migrate: async () => {},
       ping: async () => true,
       close: async () => {},
@@ -207,6 +218,7 @@ const callbackRuntime = await createWebRuntime({
   database: {
     kind: "postgres",
     admission: callbackAdmissionStore,
+    clusterScope: new MemoryClusterScopeStore(),
     migrate: async () => {},
     ping: async () => true,
     close: async () => {},
@@ -242,6 +254,7 @@ await assert.rejects(
     database: {
       kind: "postgres",
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" }),
+      clusterScope: new MemoryClusterScopeStore(),
       migrate: async () => {},
       ping: async () => true,
       close: async () => {},
@@ -305,11 +318,44 @@ assert.equal(await database.ping(), false);
 await database.migrate();
 assert.equal(await database.ping(), true);
 
+const scopeInput = {
+  clusterId: "lab-cluster",
+  name: "Personal lab",
+  endpoint: "https://cluster.example.test",
+  namespaces: ["tracegarden", "default"],
+  resourceKinds: ["Pod", "Deployment"],
+};
+assert.equal(validateClusterScopeInput(scopeInput).valid, true);
+assert.equal(validateClusterScopeInput({ ...scopeInput, namespaces: ["Not A Namespace"] }).valid, false);
+assert.equal(validateClusterScopeInput({ ...scopeInput, resourceKinds: ["Secret"] }).valid, false);
+const deterministic = new DeterministicKubernetesAdapter([
+  { kind: "Pod", metadata: { name: "in-scope", namespace: "tracegarden" } },
+  { kind: "Pod", metadata: { name: "wrong-namespace", namespace: "kube-system" } },
+  { kind: "Secret", metadata: { name: "wrong-kind", namespace: "tracegarden" } },
+]);
+const scopeStore = new MemoryClusterScopeStore();
+const ownerMember = ownerAdmission.admitted ? ownerAdmission.session.member : null;
+assert.ok(ownerMember);
+const savedScope = ownerMember ? await configureClusterScope(ownerMember, scopeStore, scopeInput) : null;
+assert.equal(savedScope?.clusterId, "lab-cluster");
+assert.ok(ownerMember && hasClusterConfigureCapability(ownerMember));
+const scopedResources = savedScope ? await collectScopedResources(savedScope, deterministic) : [];
+assert.deepEqual(scopedResources.map((resource) => resource.metadata.name), ["in-scope"]);
+assert.equal(deterministic.requests[0]?.clusterId, "lab-cluster");
+const viewerMember = ownerMember ? { ...ownerMember, role: "viewer", capabilities: [capabilities.workspaceRead, capabilities.timelineRead] } : null;
+if (viewerMember) await assert.rejects(configureClusterScope(viewerMember, scopeStore, scopeInput), /cluster:configure/);
+assert.equal(productionKubernetesConfiguration({ NODE_ENV: "production" }), null);
+const inertAdapter = createKubernetesAdapter({ NODE_ENV: "production" });
+assert.equal(inertAdapter.kind, "inert");
+assert.equal(inertAdapter.contacted, false);
+if (savedScope) assert.deepEqual(await collectScopedResources(savedScope, inertAdapter), []);
+
 const collector = collectorStatus();
 assert.equal(collector.status, "ready");
 assert.equal(collector.checks.clusterContacted, false);
-const collectorRuntime = await createCollectorRuntime({ port: 43202, host: "127.0.0.1" });
+const collectorRuntime = await createCollectorRuntime({ port: 43202, host: "127.0.0.1", scope: savedScope ?? undefined, adapter: deterministic });
 try {
+  assert.deepEqual((await collectorRuntime.collect()).map((resource) => resource.metadata.name), ["in-scope"]);
   const collectorResponse = await fetch("http://127.0.0.1:43202/health/readiness");
   assert.equal(collectorResponse.status, 200);
   const collectorReadiness = await collectorResponse.json();
@@ -319,10 +365,98 @@ try {
   await collectorRuntime.close();
 }
 
+const scopeRuntime = await createWebRuntime({
+  database: new MemoryDatabase(),
+  environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
+  port: 43208,
+});
+try {
+  const login = await fetch("http://127.0.0.1:43208/auth/login", {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: "identity=owner&lang=en",
+  });
+  assert.equal(login.status, 303);
+  const cookie = login.headers.get("set-cookie") ?? "";
+  const saved = await fetch("http://127.0.0.1:43208/api/cluster", {
+    method: "PUT",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify(scopeInput),
+  });
+  assert.equal(saved.status, 200);
+  const savedPayload = await saved.json();
+  assert.equal(savedPayload.scope.clusterId, "lab-cluster");
+  const formSave = await fetch("http://127.0.0.1:43208/cluster/configure?lang=en", {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams([
+      ["clusterId", "lab-cluster"],
+      ["name", "Updated lab"],
+      ["endpoint", "https://cluster.example.test"],
+      ["namespaces", "tracegarden\ndefault"],
+      ["resourceKinds", "Pod"],
+      ["resourceKinds", "Deployment"],
+    ]),
+  });
+  assert.equal(formSave.status, 303);
+  const loaded = await fetch("http://127.0.0.1:43208/api/cluster", { headers: { cookie } });
+  assert.equal((await loaded.json()).scope.name, "Updated lab");
+  const invalid = await fetch("http://127.0.0.1:43208/api/cluster", {
+    method: "PUT",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ ...scopeInput, resourceKinds: ["Secret"] }),
+  });
+  assert.equal(invalid.status, 400);
+  const app = await fetch("http://127.0.0.1:43208/app?lang=en", { headers: { cookie } });
+  assert.match(await app.text(), /Cluster observation scope/);
+} finally {
+  await scopeRuntime.close();
+}
+
+const viewerToken = "viewer-cluster-token";
+const viewerScopeRuntime = await createWebRuntime({
+  database: new MemoryDatabase(),
+  admissionStore: {
+    admit: async () => ({ admitted: false, reason: "admission_required" }),
+    getSession: async (token) => token === viewerToken ? {
+      token: viewerToken,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      member: {
+        id: "viewer",
+        workspaceId: "workspace-single",
+        identity: ownerIdentity,
+        role: "viewer",
+        capabilities: [capabilities.workspaceRead, capabilities.timelineRead],
+      },
+    } : null,
+  },
+  identityAdapter,
+  environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
+  port: 43209,
+});
+try {
+  const viewerCookie = `tracegarden_session=${viewerToken}`;
+  const denied = await fetch("http://127.0.0.1:43209/api/cluster", {
+    method: "PUT",
+    headers: { cookie: viewerCookie, "content-type": "application/json" },
+    body: JSON.stringify(scopeInput),
+  });
+  assert.equal(denied.status, 403);
+  const viewerAppZh = await fetch("http://127.0.0.1:43209/app?lang=zh-CN", { headers: { cookie: viewerCookie } });
+  assert.equal(viewerAppZh.status, 200);
+  assert.match(await viewerAppZh.text(), /没有配置 Cluster 观测范围的 Capability/);
+  const viewerAppEn = await fetch("http://127.0.0.1:43209/app?lang=en", { headers: { cookie: viewerCookie } });
+  assert.match(await viewerAppEn.text(), /do not have the Capability to configure/);
+} finally {
+  await viewerScopeRuntime.close();
+}
+
 let migrationFailed = false;
 try {
   await createWebRuntime({
-    database: { kind: "postgres", migrate: async () => { throw new Error("migration failed"); }, ping: async () => true, close: async () => {} },
+    database: { kind: "postgres", clusterScope: new MemoryClusterScopeStore(), migrate: async () => { throw new Error("migration failed"); }, ping: async () => true, close: async () => {} },
     port: 0,
   });
 } catch {
@@ -341,4 +475,4 @@ await assert.rejects(
   createWebRuntime({ database: new MemoryDatabase(), environment: { NODE_ENV: "production" }, port: 0 }),
   /Memory database is not allowed in production/,
 );
-console.log("unit and collector readiness checks passed");
+console.log("unit, Cluster scope, and collector readiness checks passed");

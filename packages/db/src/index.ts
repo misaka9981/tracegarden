@@ -32,12 +32,18 @@ import {
   validateExternalIdentity,
 } from "../../identity/src/index.js";
 import { randomUUID } from "node:crypto";
+import {
+  MemoryClusterScopeStore,
+  type ClusterScope,
+  type ClusterScopeStore,
+} from "../../cluster/src/index.js";
 
 export type DatabaseStatus = "ready" | "not-ready";
 
 export interface DatabaseBoundary {
   readonly kind: "postgres" | "memory";
   readonly admission?: AdmissionStore;
+  readonly clusterScope?: ClusterScopeStore;
   migrate(): Promise<void>;
   ping(): Promise<boolean>;
   close(): Promise<void>;
@@ -47,6 +53,7 @@ export const FOUNDATION_MIGRATION_ID = "0001_foundation";
 export const ADMISSION_MIGRATION_ID = "0002_workspace_admission";
 export const BETTER_AUTH_MIGRATION_ID = "0003_better_auth";
 export const MEMBERSHIP_MIGRATION_ID = "0004_membership_management";
+export const CLUSTER_SCOPE_MIGRATION_ID = "0005_cluster_scope";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -55,6 +62,7 @@ const migrations: readonly Migration[] = [
   { id: ADMISSION_MIGRATION_ID, path: "../migrations/0002_workspace_admission.sql" },
   { id: BETTER_AUTH_MIGRATION_ID, path: "../migrations/0003_better_auth.sql" },
   { id: MEMBERSHIP_MIGRATION_ID, path: "../migrations/0004_membership_management.sql" },
+  { id: CLUSTER_SCOPE_MIGRATION_ID, path: "../migrations/0005_cluster_scope.sql" }
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -222,6 +230,61 @@ export class MemoryAdmissionStore implements AdmissionStore, MembershipStore {
 }
 
 type PoolProvider = () => Promise<Pool>;
+type ClusterRow = Readonly<{
+  id: string;
+  workspace_id: string;
+  name: string;
+  endpoint: string;
+  approved_namespaces: string[];
+  approved_resource_kinds: string[];
+}>;
+
+function clusterFromRow(row: ClusterRow): ClusterScope {
+  return {
+    workspaceId: row.workspace_id,
+    clusterId: row.id,
+    name: row.name,
+    endpoint: row.endpoint,
+    namespaces: [...row.approved_namespaces],
+    resourceKinds: [...row.approved_resource_kinds] as ClusterScope["resourceKinds"],
+  };
+}
+
+export class PostgresClusterScopeStore implements ClusterScopeStore {
+  constructor(private readonly poolProvider: PoolProvider) {}
+
+  async get(workspaceId: string): Promise<ClusterScope | null> {
+    const pool = await this.poolProvider();
+    const result = await pool.query<ClusterRow>(
+      `SELECT id, workspace_id, name, endpoint, approved_namespaces, approved_resource_kinds
+         FROM tracegarden_clusters WHERE workspace_id = $1`,
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    return row ? clusterFromRow(row) : null;
+  }
+
+  async save(scope: ClusterScope): Promise<ClusterScope> {
+    const pool = await this.poolProvider();
+    const result = await pool.query<ClusterRow>(
+      `INSERT INTO tracegarden_clusters
+         (id, workspace_id, name, endpoint, approved_namespaces, approved_resource_kinds, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, now())
+       ON CONFLICT (workspace_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         endpoint = EXCLUDED.endpoint,
+         approved_namespaces = EXCLUDED.approved_namespaces,
+         approved_resource_kinds = EXCLUDED.approved_resource_kinds,
+         updated_at = now()
+       RETURNING id, workspace_id, name, endpoint, approved_namespaces, approved_resource_kinds`,
+      [scope.clusterId, scope.workspaceId, scope.name, scope.endpoint, scope.namespaces, scope.resourceKinds],
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("Cluster scope persistence returned no row");
+    return clusterFromRow(row);
+  }
+}
+
 type MemberRow = Readonly<{
   member_id: string;
   workspace_id: string;
@@ -599,9 +662,12 @@ export class PostgresDatabase implements DatabaseBoundary {
   readonly kind = "postgres" as const;
   private pool: Pool | undefined;
   readonly admission: AdmissionStore;
+  readonly clusterScope: ClusterScopeStore;
 
   constructor(private readonly connectionString: string, bootstrapIdentity: BootstrapIdentity = DEFAULT_LOCAL_BOOTSTRAP) {
-    this.admission = new PostgresAdmissionStore(() => this.getPool(), bootstrapIdentity);
+    const poolProvider = () => this.getPool();
+    this.admission = new PostgresAdmissionStore(poolProvider, bootstrapIdentity);
+    this.clusterScope = new PostgresClusterScopeStore(poolProvider);
   }
 
   private async getPool(): Promise<Pool> {
@@ -677,10 +743,12 @@ export class PostgresDatabase implements DatabaseBoundary {
 export class MemoryDatabase implements DatabaseBoundary {
   readonly kind = "memory" as const;
   readonly admission: MemoryAdmissionStore;
+  readonly clusterScope: MemoryClusterScopeStore;
   private migrationReady = false;
 
   constructor(bootstrapIdentity: BootstrapIdentity = DEFAULT_LOCAL_BOOTSTRAP) {
     this.admission = new MemoryAdmissionStore(bootstrapIdentity);
+    this.clusterScope = new MemoryClusterScopeStore();
   }
 
   async migrate(): Promise<void> {
@@ -693,6 +761,8 @@ export class MemoryDatabase implements DatabaseBoundary {
 
   async close(): Promise<void> {}
 }
+
+export { MemoryClusterScopeStore };
 
 export function createDatabase(environment: Record<string, string | undefined>): DatabaseBoundary {
   if (environment.DATABASE_MODE === "memory") {

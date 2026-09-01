@@ -42,6 +42,19 @@ export type Messages = Readonly<{
   invitationRevoked: string;
   roleChanged: string;
   invalidRequest: string;
+  clusterTitle: string;
+  clusterDescription: string;
+  clusterNotConfigured: string;
+  clusterName: string;
+  clusterEndpoint: string;
+  approvedNamespaces: string;
+  approvedResourceKinds: string;
+  supportedResourceKinds: string;
+  saveCluster: string;
+  clusterSaved: string;
+  clusterConfigurationDenied: string;
+  clusterConfigurationUnavailable: string;
+  clusterConfigurationInvalid: string;
 }>;
 
 export const catalogs: Readonly<Record<Language, Messages>> = {
@@ -87,6 +100,19 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     invitationRevoked: "Invitation 已撤销。",
     roleChanged: "角色已更新。",
     invalidRequest: "请求无效。",
+    clusterTitle: "Cluster 观测范围",
+    clusterDescription: "Owner 可以配置一个 Cluster，并明确批准可观测的命名空间和资源类型。",
+    clusterNotConfigured: "尚未配置 Cluster。",
+    clusterName: "Cluster 名称",
+    clusterEndpoint: "Kubernetes API 地址",
+    approvedNamespaces: "批准的命名空间（每行一个）",
+    approvedResourceKinds: "批准的资源类型",
+    supportedResourceKinds: "支持：Deployment、StatefulSet、DaemonSet、ReplicaSet、Pod、Job、CronJob、Event",
+    saveCluster: "保存 Cluster 范围",
+    clusterSaved: "Cluster 观测范围已保存。",
+    clusterConfigurationDenied: "你没有配置 Cluster 观测范围的 Capability。",
+    clusterConfigurationUnavailable: "Cluster 配置存储当前不可用。",
+    clusterConfigurationInvalid: "Cluster 配置无效，请检查输入。"
   },
   en: {
     appName: "Tracegarden",
@@ -130,6 +156,19 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     invitationRevoked: "Invitation revoked.",
     roleChanged: "Role updated.",
     invalidRequest: "Invalid request.",
+    clusterTitle: "Cluster observation scope",
+    clusterDescription: "The owner can configure one Cluster and explicitly approve namespaces and resource kinds to observe.",
+    clusterNotConfigured: "No Cluster is configured.",
+    clusterName: "Cluster name",
+    clusterEndpoint: "Kubernetes API endpoint",
+    approvedNamespaces: "Approved namespaces (one per line)",
+    approvedResourceKinds: "Approved resource kinds",
+    supportedResourceKinds: "Supported: Deployment, StatefulSet, DaemonSet, ReplicaSet, Pod, Job, CronJob, Event",
+    saveCluster: "Save Cluster scope",
+    clusterSaved: "Cluster observation scope saved.",
+    clusterConfigurationDenied: "You do not have the Capability to configure the Cluster observation scope.",
+    clusterConfigurationUnavailable: "Cluster configuration storage is unavailable.",
+    clusterConfigurationInvalid: "Cluster configuration is invalid. Check the inputs."
   },
 };
 

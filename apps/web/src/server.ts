@@ -3,6 +3,15 @@ import { URL } from "node:url";
 import { state, type StatusResponse } from "../../../packages/contracts/src/index.js";
 import { createDatabase, MemoryAdmissionStore, type DatabaseBoundary } from "../../../packages/db/src/index.js";
 import {
+  configureClusterScope,
+  hasClusterConfigureCapability,
+  MemoryClusterScopeStore,
+  ClusterScopeValidationError,
+  SUPPORTED_RESOURCE_KINDS,
+  type ClusterScope,
+  type ClusterScopeStore,
+} from "../../../packages/cluster/src/index.js";
+import {
   capabilities,
   configuredBootstrapIdentity,
   createIdentityAdapter,
@@ -25,6 +34,7 @@ import { messagesFor, parseLanguage, type Language, type Messages } from "../../
 type WebOptions = Readonly<{
   database?: DatabaseBoundary;
   admissionStore?: AdmissionStore;
+  clusterScopeStore?: ClusterScopeStore;
   identityAdapter?: IdentityAdapter;
   environment?: Record<string, string | undefined>;
   port?: number;
@@ -157,7 +167,57 @@ export function renderLoginPage(language: Language, databaseReady: boolean, adap
 </html>`;
 }
 
-export function renderApplicationPage(language: Language, session: AuthenticatedSession): string {
+function renderClusterSection(
+  language: Language,
+  messages: Messages,
+  member: AuthenticatedSession["member"],
+  scope: ClusterScope | null,
+  feedback?: Readonly<{ saved?: boolean; error?: string }>,
+): string {
+  const namespaces = scope?.namespaces.join("\n") ?? "";
+  const selectedKinds = new Set(scope?.resourceKinds ?? []);
+  const resourceKinds = SUPPORTED_RESOURCE_KINDS.map((kind) => `<label><input type="checkbox" name="resourceKinds" value="${escapeHtml(kind)}"${selectedKinds.has(kind) ? " checked" : ""}> ${escapeHtml(kind)}</label>`).join(" ");
+  const summary = scope
+    ? `<dl>
+        <dt>${escapeHtml(messages.clusterName)}</dt><dd>${escapeHtml(scope.name)}</dd>
+        <dt>${escapeHtml(messages.clusterEndpoint)}</dt><dd>${escapeHtml(scope.endpoint)}</dd>
+        <dt>${escapeHtml(messages.approvedNamespaces)}</dt><dd>${escapeHtml(scope.namespaces.join(", ") || messages.clusterNotConfigured)}</dd>
+        <dt>${escapeHtml(messages.approvedResourceKinds)}</dt><dd>${escapeHtml(scope.resourceKinds.join(", ") || messages.clusterNotConfigured)}</dd>
+      </dl>`
+    : `<p>${escapeHtml(messages.clusterNotConfigured)}</p>`;
+  const form = hasClusterConfigureCapability(member)
+    ? `<form method="post" action="/cluster/configure?lang=${language}">
+        <input type="hidden" name="clusterId" value="${escapeHtml(scope?.clusterId ?? "")}">
+        <label for="cluster-name">${escapeHtml(messages.clusterName)}</label>
+        <input id="cluster-name" name="name" required maxlength="100" value="${escapeHtml(scope?.name ?? "")}">
+        <label for="cluster-endpoint">${escapeHtml(messages.clusterEndpoint)}</label>
+        <input id="cluster-endpoint" name="endpoint" type="url" required value="${escapeHtml(scope?.endpoint ?? "")}">
+        <label for="cluster-namespaces">${escapeHtml(messages.approvedNamespaces)}</label>
+        <textarea id="cluster-namespaces" name="namespaces" rows="4">${escapeHtml(namespaces)}</textarea>
+        <fieldset>
+          <legend>${escapeHtml(messages.approvedResourceKinds)}</legend>
+          <p class="hint">${escapeHtml(messages.supportedResourceKinds)}</p>
+          ${resourceKinds}
+        </fieldset>
+        <button type="submit">${escapeHtml(messages.saveCluster)}</button>
+      </form>`
+    : `<p class="error" role="alert">${escapeHtml(messages.clusterConfigurationDenied)}</p>`;
+  return `<section aria-labelledby="cluster-scope-title">
+      <h2 id="cluster-scope-title">${escapeHtml(messages.clusterTitle)}</h2>
+      <p>${escapeHtml(messages.clusterDescription)}</p>
+      ${feedback?.saved ? `<p role="status">${escapeHtml(messages.clusterSaved)}</p>` : ""}
+      ${feedback?.error ? `<p class="error" role="alert">${escapeHtml(feedback.error)}</p>` : ""}
+      ${summary}
+      ${form}
+    </section>`;
+}
+
+export function renderApplicationPage(
+  language: Language,
+  session: AuthenticatedSession,
+  scope: ClusterScope | null = null,
+  feedback?: Readonly<{ saved?: boolean; error?: string }>,
+): string {
   const messages = messagesFor(language);
   const member = session.member;
   const capabilityList = member.capabilities.map((capability) => `<li>${escapeHtml(capability)}</li>`).join("");
@@ -181,6 +241,7 @@ export function renderApplicationPage(language: Language, session: Authenticated
       <h2>${escapeHtml(messages.capabilities)}</h2>
       <ul class="capabilities">${capabilityList}</ul>
       ${membershipLink}
+      ${renderClusterSection(language, messages, member, scope, feedback)}
       <form method="post" action="/auth/logout?lang=${language}">
         <button type="submit">${escapeHtml(messages.signOut)}</button>
       </form>
@@ -396,14 +457,21 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   }
   const identityAdapter = options.identityAdapter ?? createIdentityAdapter(environment);
   let admissionStore: AdmissionStore;
+  let clusterScopeStore: ClusterScopeStore;
   if (environment.NODE_ENV === "production") {
     if (options.admissionStore || options.identityAdapter || database.kind !== "postgres" || !database.admission) {
       await database.close();
       throw new Error("Production admission must use the database-owned durable store");
     }
+    if (options.clusterScopeStore || !database.clusterScope) {
+      await database.close();
+      throw new Error("Production Cluster scope must use the database-owned durable store");
+    }
     admissionStore = database.admission;
+    clusterScopeStore = database.clusterScope;
   } else {
     admissionStore = options.admissionStore ?? database.admission ?? new MemoryAdmissionStore();
+    clusterScopeStore = options.clusterScopeStore ?? database.clusterScope ?? new MemoryClusterScopeStore();
   }
   if (environment.NODE_ENV === "production") {
     const bootstrapIdentity = configuredBootstrapIdentity(environment);
@@ -495,6 +563,25 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     }
   };
   const membershipStore = hasMembershipStore(admissionStore) ? admissionStore : null;
+
+  const scopeForSession = (session: AuthenticatedSession): Promise<ClusterScope | null> => clusterScopeStore.get(session.member.workspaceId);
+
+  const sendJson = (response: ServerResponse, statusCode: number, payload: unknown): void => {
+    response.statusCode = statusCode;
+    response.setHeader("content-type", "application/json; charset=utf-8");
+    response.end(JSON.stringify(payload));
+  };
+
+  const formScopeInput = (form: URLSearchParams): Record<string, unknown> => {
+    const clusterId = form.get("clusterId")?.trim();
+    return {
+      ...(clusterId ? { clusterId } : {}),
+      name: form.get("name") ?? "",
+      endpoint: form.get("endpoint") ?? "",
+      namespaces: (form.get("namespaces") ?? "").split(/[\n,]/).map((value) => value.trim()).filter(Boolean),
+      resourceKinds: form.getAll("resourceKinds"),
+    };
+  };
 
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
     void (async () => {
@@ -588,6 +675,80 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         response.setHeader("location", payload.url);
         setResponseHeaders(response, authResponse.headers);
         response.end();
+        return;
+      }
+      if (requestUrl.pathname === "/api/cluster" || requestUrl.pathname === "/api/cluster/scope") {
+        const lookup = await sessionForRequest(request);
+        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (method === "GET") {
+          sendJson(response, 200, { scope: await scopeForSession(lookup.session) });
+          return;
+        }
+        if (method !== "POST" && method !== "PUT") {
+          sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        if (!hasClusterConfigureCapability(lookup.session.member)) {
+          sendJson(response, 403, { error: "missing_capability", capability: capabilities.clusterConfigure });
+          return;
+        }
+        let input: unknown;
+        try {
+          input = JSON.parse(await requestBody(request)) as unknown;
+        } catch {
+          sendJson(response, 400, { error: "invalid_json" });
+          return;
+        }
+        try {
+          const scope = await configureClusterScope(lookup.session.member, clusterScopeStore, input);
+          sendJson(response, 200, { scope });
+        } catch (error: unknown) {
+          if (error instanceof ClusterScopeValidationError) {
+            sendJson(response, 400, { error: "invalid_cluster_scope", issues: error.issues });
+            return;
+          }
+          throw error;
+        }
+        return;
+      }
+      if (requestUrl.pathname === "/cluster/configure" && method === "POST") {
+        const lookup = await sessionForRequest(request);
+        const messages = messagesFor(language);
+        if (!lookup.session) {
+          response.statusCode = lookup.rejection ? 403 : 302;
+          if (lookup.rejection) {
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderRejectionPage(language, lookup.rejection));
+          } else {
+            response.setHeader("location", `/?lang=${language}`);
+            response.end();
+          }
+          return;
+        }
+        const scope = await scopeForSession(lookup.session);
+        if (!hasClusterConfigureCapability(lookup.session.member)) {
+          response.statusCode = 403;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.clusterConfigurationDenied }));
+          return;
+        }
+        const form = new URLSearchParams(await requestBody(request));
+        try {
+          await configureClusterScope(lookup.session.member, clusterScopeStore, formScopeInput(form));
+          response.statusCode = 303;
+          response.setHeader("location", `/app?lang=${language}&cluster=saved`);
+          response.end();
+        } catch (error: unknown) {
+          response.statusCode = 400;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          const errorMessage = error instanceof ClusterScopeValidationError
+            ? `${messages.clusterConfigurationInvalid} ${error.issues.map((issue) => issue.message).join(" ")}`
+            : messages.clusterConfigurationUnavailable;
+          response.end(renderApplicationPage(language, lookup.session, scope, { error: errorMessage }));
+        }
         return;
       }
 
@@ -784,7 +945,9 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         }
         response.statusCode = 200;
         response.setHeader("content-type", "text/html; charset=utf-8");
-        response.end(renderApplicationPage(language, lookup.session));
+        response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
+          saved: requestUrl.searchParams.get("cluster") === "saved",
+        }));
         return;
       }
       if (requestUrl.pathname === "/") {
@@ -799,7 +962,9 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           response.statusCode = 403;
           response.end(renderRejectionPage(language, "admission_required"));
         } else {
-          response.end(lookup.session ? renderApplicationPage(language, lookup.session) : renderLoginPage(language, current.checks.database === "ready", identityAdapter));
+          response.end(lookup.session
+            ? renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session))
+            : renderLoginPage(language, current.checks.database === "ready", identityAdapter));
         }
         return;
       }

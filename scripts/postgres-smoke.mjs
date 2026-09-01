@@ -51,8 +51,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management');");
-  assert.equal(migrationCount, "4");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope');");
+  assert.equal(migrationCount, "5");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -81,6 +81,7 @@ try {
     headers: { cookie: ownerCookie, "content-type": "application/json" },
     body: JSON.stringify({ email: "rejected@example.test" }),
   });
+  assert.equal(revokedInvitationResponse.status, 201);
   const revokedInvitation = (await revokedInvitationResponse.json()).invitation;
   const revokeResponse = await fetch(`http://127.0.0.1:${webPort}/api/invitations/${revokedInvitation.id}/revoke`, {
     method: "POST",
@@ -108,6 +109,21 @@ try {
   assert.equal(refreshedInvitedSessionBody.member.role, "operator");
   assert.ok(refreshedInvitedSessionBody.member.capabilities.includes("experiment:write"));
   assert.ok(!refreshedInvitedSessionBody.member.capabilities.includes("membership:manage"));
+  const clusterScope = await fetch(`http://127.0.0.1:${webPort}/api/cluster`, {
+    method: "PUT",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({
+      clusterId: "local-postgres-smoke",
+      name: "Local deterministic Cluster",
+      endpoint: "https://cluster.example.test",
+      namespaces: ["tracegarden"],
+      resourceKinds: ["Pod", "Deployment"],
+    }),
+  });
+  assert.equal(clusterScope.status, 200);
+  assert.equal((await clusterScope.json()).scope.clusterId, "local-postgres-smoke");
+  const clusterCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_clusters;");
+  assert.equal(clusterCount, "1");
   const rejected = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
