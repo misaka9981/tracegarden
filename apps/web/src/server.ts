@@ -1,7 +1,15 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import { state, type StatusResponse } from "../../../packages/contracts/src/index.js";
-import { createDatabase, MemoryAdmissionStore, type DatabaseBoundary } from "../../../packages/db/src/index.js";
+import {
+  createDatabase,
+  MemoryAdmissionStore,
+  parseTimelineQuery,
+  TimelineQueryValidationError,
+  type DatabaseBoundary,
+  type TimelineEntry,
+  type TimelineStore,
+} from "../../../packages/db/src/index.js";
 import {
   configureClusterScope,
   hasClusterConfigureCapability,
@@ -35,6 +43,7 @@ type WebOptions = Readonly<{
   database?: DatabaseBoundary;
   admissionStore?: AdmissionStore;
   clusterScopeStore?: ClusterScopeStore;
+  timelineStore?: TimelineStore;
   identityAdapter?: IdentityAdapter;
   environment?: Record<string, string | undefined>;
   port?: number;
@@ -212,11 +221,33 @@ function renderClusterSection(
     </section>`;
 }
 
+function renderTimelineSection(messages: Messages, entries: readonly TimelineEntry[]): string {
+  const rows = entries.map((entry) => {
+    const observation = entry.observation;
+    const state = observation.phase ?? messages.timelineUnknownState;
+    return `<article data-entry-id="${escapeHtml(entry.id)}">
+        <h3>${escapeHtml(messages.podObservation)}</h3>
+        <p>${escapeHtml(observation.namespace)}/${escapeHtml(observation.name)} · ${escapeHtml(state)}</p>
+        <dl>
+          <dt>${escapeHtml(messages.clusterName)}</dt><dd>${escapeHtml(entry.clusterId)}</dd>
+          <dt>${escapeHtml(messages.resourceIdentity)}</dt><dd>${escapeHtml(observation.sourceIdentity)}</dd>
+          <dt>${escapeHtml(messages.observedAt)}</dt><dd>${escapeHtml(entry.occurredAt)}</dd>
+        </dl>
+      </article>`;
+  }).join("");
+  return `<section aria-labelledby="timeline-title">
+      <h2 id="timeline-title">${escapeHtml(messages.timelineTitle)}</h2>
+      <p>${escapeHtml(messages.timelineDescription)}</p>
+      ${rows || `<p>${escapeHtml(messages.noTimelineEntries)}</p>`}
+    </section>`;
+}
+
 export function renderApplicationPage(
   language: Language,
   session: AuthenticatedSession,
   scope: ClusterScope | null = null,
   feedback?: Readonly<{ saved?: boolean; error?: string }>,
+  timelineEntries: readonly TimelineEntry[] = [],
 ): string {
   const messages = messagesFor(language);
   const member = session.member;
@@ -242,6 +273,7 @@ export function renderApplicationPage(
       <ul class="capabilities">${capabilityList}</ul>
       ${membershipLink}
       ${renderClusterSection(language, messages, member, scope, feedback)}
+      ${hasCapability(member, capabilities.timelineRead) ? renderTimelineSection(messages, timelineEntries) : ""}
       <form method="post" action="/auth/logout?lang=${language}">
         <button type="submit">${escapeHtml(messages.signOut)}</button>
       </form>
@@ -562,7 +594,17 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       return false;
     }
   };
+  const hasTimelineAccess = (session: AuthenticatedSession | null): boolean => {
+    if (!session || !hasWorkspaceAccess(session)) return false;
+    try {
+      requireCapability(session.member, capabilities.timelineRead);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const membershipStore = hasMembershipStore(admissionStore) ? admissionStore : null;
+  const timelineStore = options.timelineStore ?? database.timeline ?? null;
 
   const scopeForSession = (session: AuthenticatedSession): Promise<ClusterScope | null> => clusterScopeStore.get(session.member.workspaceId);
 
@@ -675,6 +717,39 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         response.setHeader("location", payload.url);
         setResponseHeaders(response, authResponse.headers);
         response.end();
+        return;
+      }
+      if (requestUrl.pathname === "/api/timeline" || requestUrl.pathname === "/api/timeline/entries") {
+        const lookup = await sessionForRequest(request);
+        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (!hasTimelineAccess(lookup.session)) {
+          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
+          return;
+        }
+        if (method !== "GET") {
+          sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        if (!timelineStore) {
+          sendJson(response, 503, { error: "timeline_store_unavailable" });
+          return;
+        }
+        try {
+          const query = parseTimelineQuery({
+            ...(requestUrl.searchParams.get("limit") === null ? {} : { limit: requestUrl.searchParams.get("limit") }),
+            ...(requestUrl.searchParams.get("cursor") === null ? {} : { cursor: requestUrl.searchParams.get("cursor") }),
+          });
+          sendJson(response, 200, await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, query));
+        } catch (error: unknown) {
+          if (error instanceof TimelineQueryValidationError) {
+            sendJson(response, 400, { error: "invalid_timeline_query", issues: error.issues });
+            return;
+          }
+          throw error;
+        }
         return;
       }
       if (requestUrl.pathname === "/api/cluster" || requestUrl.pathname === "/api/cluster/scope") {
@@ -923,7 +998,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         response.end(JSON.stringify({ member: lookup.session.member }));
         return;
       }
-      if (requestUrl.pathname === "/app") {
+      if (requestUrl.pathname === "/app" || requestUrl.pathname === "/timeline") {
         const lookup = await sessionForRequest(request);
         if (!lookup.session) {
           if (lookup.rejection) {
@@ -943,11 +1018,14 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           response.end(renderRejectionPage(language, "admission_required"));
           return;
         }
+        const timelineEntries = timelineStore && hasTimelineAccess(lookup.session)
+          ? (await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, { limit: 100 })).entries
+          : [];
         response.statusCode = 200;
         response.setHeader("content-type", "text/html; charset=utf-8");
         response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
           saved: requestUrl.searchParams.get("cluster") === "saved",
-        }));
+        }, timelineEntries));
         return;
       }
       if (requestUrl.pathname === "/") {
@@ -962,9 +1040,14 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           response.statusCode = 403;
           response.end(renderRejectionPage(language, "admission_required"));
         } else {
-          response.end(lookup.session
-            ? renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session))
-            : renderLoginPage(language, current.checks.database === "ready", identityAdapter));
+          if (lookup.session) {
+            const timelineEntries = timelineStore && hasTimelineAccess(lookup.session)
+              ? (await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, { limit: 100 })).entries
+              : [];
+            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), undefined, timelineEntries));
+          } else {
+            response.end(renderLoginPage(language, current.checks.database === "ready", identityAdapter));
+          }
         }
         return;
       }

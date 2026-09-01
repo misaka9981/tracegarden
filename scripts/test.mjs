@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
-import { collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
+import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { createWebRuntime, renderStatusPage } from "../dist/apps/web/src/server.js";
-import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase } from "../dist/packages/db/src/index.js";
+import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
 import {
   collectScopedResources,
   configureClusterScope,
+  ConfiguredKubernetesAdapter,
   DeterministicKubernetesAdapter,
   createKubernetesAdapter,
   hasClusterConfigureCapability,
+  normalizePodObservation,
   productionKubernetesConfiguration,
   validateClusterScopeInput,
 } from "../dist/packages/cluster/src/index.js";
@@ -329,7 +331,7 @@ assert.equal(validateClusterScopeInput(scopeInput).valid, true);
 assert.equal(validateClusterScopeInput({ ...scopeInput, namespaces: ["Not A Namespace"] }).valid, false);
 assert.equal(validateClusterScopeInput({ ...scopeInput, resourceKinds: ["Secret"] }).valid, false);
 const deterministic = new DeterministicKubernetesAdapter([
-  { kind: "Pod", metadata: { name: "in-scope", namespace: "tracegarden" } },
+  { kind: "Pod", metadata: { name: "in-scope", namespace: "tracegarden", uid: "pod-uid-1", resourceVersion: "1" }, status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] } },
   { kind: "Pod", metadata: { name: "wrong-namespace", namespace: "kube-system" } },
   { kind: "Secret", metadata: { name: "wrong-kind", namespace: "tracegarden" } },
 ]);
@@ -342,6 +344,70 @@ assert.ok(ownerMember && hasClusterConfigureCapability(ownerMember));
 const scopedResources = savedScope ? await collectScopedResources(savedScope, deterministic) : [];
 assert.deepEqual(scopedResources.map((resource) => resource.metadata.name), ["in-scope"]);
 assert.equal(deterministic.requests[0]?.clusterId, "lab-cluster");
+const normalizedPod = savedScope ? normalizePodObservation(savedScope, scopedResources[0], "2026-01-01T00:00:00.000Z") : null;
+assert.equal(normalizedPod?.sourceIdentity, "lab-cluster:pod-uid-1");
+assert.equal(normalizedPod?.phase, "Running");
+assert.equal(normalizedPod?.ready, true);
+const memoryTimeline = new MemoryObservationStore();
+const collectorWithPersistence = await createCollectorRuntime({ port: 43203, host: "127.0.0.1", scope: savedScope ?? undefined, adapter: deterministic, observationStore: memoryTimeline });
+try {
+  const firstPersist = await collectorWithPersistence.collectObservations();
+  assert.equal(firstPersist.length, 1);
+  assert.equal(firstPersist[0]?.duplicate, false);
+  assert.equal(firstPersist[0]?.entry.workspaceId, "workspace-single");
+  assert.equal(firstPersist[0]?.entry.clusterId, "lab-cluster");
+  assert.doesNotMatch(JSON.stringify(firstPersist[0]), /conditions/);
+  const duplicatePersist = await collectorWithPersistence.collectObservations();
+  assert.equal(duplicatePersist[0]?.duplicate, true);
+  assert.equal(await memoryTimeline.countObservations("workspace-single"), 1);
+  assert.equal(await memoryTimeline.countTimelineEntries("workspace-single"), 1);
+} finally {
+  await collectorWithPersistence.close();
+}
+class FailingObservationStore extends MemoryObservationStore {
+  async recordObservation() {
+    throw new Error("database write failed");
+  }
+
+  async recordObservations() {
+    throw new Error("database write failed");
+  }
+}
+const failedCollection = await createCollectorRuntime({ port: 43207, host: "127.0.0.1", scope: savedScope ?? undefined, adapter: deterministic, observationStore: new FailingObservationStore() });
+try {
+  await assert.rejects(failedCollection.collectObservations(), (error) => error instanceof CollectorRecoveryError && /persistence failed/.test(error.message));
+} finally {
+  await failedCollection.close();
+}
+let releaseInitialList;
+const initialListBlocked = new Promise((resolve) => { releaseInitialList = resolve; });
+let initialListStarted = false;
+const startupAdapter = {
+  kind: "deterministic",
+  contacted: false,
+  list: async () => {
+    initialListStarted = true;
+    await initialListBlocked;
+    return [];
+  },
+};
+const startup = createCollectorRuntime({ port: 43212, host: "127.0.0.1", scope: savedScope ?? undefined, adapter: startupAdapter, observationStore: new MemoryObservationStore(), collectOnStart: true });
+while (!initialListStarted) await Promise.resolve();
+await assert.rejects(fetch("http://127.0.0.1:43212/health/readiness"));
+releaseInitialList();
+const startedRuntime = await startup;
+try {
+  assert.equal(startedRuntime.status().checks.collector, "ready");
+} finally {
+  await startedRuntime.close();
+}
+const startupFailureStore = new FailingObservationStore();
+await assert.rejects(
+  createCollectorRuntime({ port: 43213, host: "127.0.0.1", scope: savedScope ?? undefined, adapter: deterministic, observationStore: startupFailureStore, collectOnStart: true }),
+  (error) => error instanceof CollectorRecoveryError,
+);
+assert.equal(await startupFailureStore.countObservations("workspace-single"), 0);
+await assert.rejects(fetch("http://127.0.0.1:43213/health/readiness"));
 const viewerMember = ownerMember ? { ...ownerMember, role: "viewer", capabilities: [capabilities.workspaceRead, capabilities.timelineRead] } : null;
 if (viewerMember) await assert.rejects(configureClusterScope(viewerMember, scopeStore, scopeInput), /cluster:configure/);
 assert.equal(productionKubernetesConfiguration({ NODE_ENV: "production" }), null);
@@ -349,6 +415,23 @@ const inertAdapter = createKubernetesAdapter({ NODE_ENV: "production" });
 assert.equal(inertAdapter.kind, "inert");
 assert.equal(inertAdapter.contacted, false);
 if (savedScope) assert.deepEqual(await collectScopedResources(savedScope, inertAdapter), []);
+const configuredAdapter = new ConfiguredKubernetesAdapter({ endpoint: "https://cluster.example.test/environment", token: "local-test-token" });
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (request, init) => {
+  assert.match(String(request), /https:\/\/cluster\.example\.test\/persisted\/api\/v1\/namespaces\/tracegarden\/pods/);
+  assert.equal(init?.headers && init.headers.authorization, "Bearer local-test-token");
+  return new Response(JSON.stringify({ items: [{ metadata: { name: "configured", namespace: "tracegarden", uid: "configured-uid", resourceVersion: "9" }, status: { phase: "Running" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+};
+try {
+  const configuredScope = savedScope ? { ...savedScope, endpoint: "https://cluster.example.test/persisted", namespaces: ["tracegarden"], resourceKinds: ["Pod"] } : null;
+  const configuredResources = configuredScope ? await configuredAdapter.list(configuredScope) : [];
+  assert.equal(configuredResources[0]?.metadata.name, "configured");
+  assert.equal(configuredAdapter.contacted, true);
+  const mismatchedAdapter = new ConfiguredKubernetesAdapter({ endpoint: "https://other-cluster.example.test", token: "local-test-token" });
+  if (configuredScope) await assert.rejects(mismatchedAdapter.list(configuredScope), /does not match/);
+} finally {
+  globalThis.fetch = originalFetch;
+}
 
 const collector = collectorStatus();
 assert.equal(collector.status, "ready");
@@ -365,8 +448,9 @@ try {
   await collectorRuntime.close();
 }
 
+const scopeDatabase = new MemoryDatabase();
 const scopeRuntime = await createWebRuntime({
-  database: new MemoryDatabase(),
+  database: scopeDatabase,
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
   port: 43208,
 });
@@ -409,8 +493,18 @@ try {
     body: JSON.stringify({ ...scopeInput, resourceKinds: ["Secret"] }),
   });
   assert.equal(invalid.status, 400);
+  if (savedScope) {
+    await scopeDatabase.timeline.recordObservation(normalizePodObservation(savedScope, scopedResources[0], "2026-01-01T00:00:00.000Z"));
+  }
+  const timelineResponse = await fetch("http://127.0.0.1:43208/api/timeline?limit=10", { headers: { cookie } });
+  assert.equal(timelineResponse.status, 200);
+  assert.equal((await timelineResponse.json()).entries[0].observation.name, "in-scope");
+  const invalidTimeline = await fetch("http://127.0.0.1:43208/api/timeline?limit=0", { headers: { cookie } });
+  assert.equal(invalidTimeline.status, 400);
   const app = await fetch("http://127.0.0.1:43208/app?lang=en", { headers: { cookie } });
-  assert.match(await app.text(), /Cluster observation scope/);
+  assert.match(await app.text(), /Timeline/);
+  const appChinese = await fetch("http://127.0.0.1:43208/app?lang=zh-CN", { headers: { cookie } });
+  assert.match(await appChinese.text(), /Timeline/);
 } finally {
   await scopeRuntime.close();
 }
@@ -449,6 +543,8 @@ try {
   assert.match(await viewerAppZh.text(), /没有配置 Cluster 观测范围的 Capability/);
   const viewerAppEn = await fetch("http://127.0.0.1:43209/app?lang=en", { headers: { cookie: viewerCookie } });
   assert.match(await viewerAppEn.text(), /do not have the Capability to configure/);
+  const viewerTimeline = await fetch("http://127.0.0.1:43209/api/timeline", { headers: { cookie: viewerCookie } });
+  assert.equal(viewerTimeline.status, 200);
 } finally {
   await viewerScopeRuntime.close();
 }

@@ -205,14 +205,101 @@ export type KubernetesResource = Readonly<{
     namespace?: string | null;
     uid?: string | null;
     resourceVersion?: string | null;
+    [key: string]: unknown;
   }>;
+  status?: Readonly<Record<string, unknown>>;
+  [key: string]: unknown;
 }>;
 
+export type NormalizedPodObservation = Readonly<{
+  kind: "Pod";
+  workspaceId: string;
+  clusterId: string;
+  sourceIdentity: string;
+  sourceKey: string;
+  uid: string;
+  name: string;
+  namespace: string;
+  resourceVersion: string | null;
+  phase: string | null;
+  ready: boolean | null;
+  reason: string | null;
+  observedAt: string;
+}>;
+
+export type PodObservation = NormalizedPodObservation;
+export type Observation = NormalizedPodObservation;
+
+export class ObservationNormalizationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ObservationNormalizationError";
+  }
+}
+
+function optionalString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized || null;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : null;
+}
+
+export function normalizePodObservation(
+  scope: ClusterScope,
+  resource: KubernetesResource,
+  observedAt = new Date().toISOString(),
+): NormalizedPodObservation {
+  if (resource.kind !== "Pod" || !isResourceInScope(scope, resource)) {
+    throw new ObservationNormalizationError("Pod is outside the approved observation scope");
+  }
+  const name = optionalString(resource.metadata.name) ?? "";
+  const namespace = optionalString(resource.metadata.namespace) ?? "";
+  const uid = optionalString(resource.metadata.uid) ?? "";
+  if (!name || !namespace || !uid) {
+    throw new ObservationNormalizationError("Pod observation requires name, namespace, and Kubernetes UID");
+  }
+  if (!Number.isFinite(Date.parse(observedAt))) {
+    throw new ObservationNormalizationError("Pod observation timestamp is invalid");
+  }
+  const status = objectValue(resource.status);
+  const phase = optionalString(status?.phase);
+  const conditions = Array.isArray(status?.conditions) ? status.conditions : [];
+  const readyCondition = conditions
+    .map((condition) => objectValue(condition))
+    .find((condition) => condition?.type === "Ready");
+  const readyStatus = readyCondition?.status;
+  const ready = readyStatus === "True" ? true : readyStatus === "False" ? false : null;
+  const reason = optionalString(status?.reason) ?? optionalString(readyCondition?.reason);
+  const sourceIdentity = `${scope.clusterId}:${uid}`;
+  const resourceVersion = optionalString(resource.metadata.resourceVersion);
+  const sourceKey = `${sourceIdentity}:${resourceVersion ?? "snapshot"}`;
+  return {
+    kind: "Pod",
+    workspaceId: scope.workspaceId,
+    clusterId: scope.clusterId,
+    sourceIdentity,
+    sourceKey,
+    uid,
+    name,
+    namespace,
+    resourceVersion,
+    phase,
+    ready,
+    reason,
+    observedAt: new Date(observedAt).toISOString(),
+  };
+}
+
 export function isResourceInScope(scope: ClusterScope, resource: KubernetesResource): boolean {
+  const metadata = objectValue(resource.metadata);
+  const namespace = metadata?.namespace;
   return isSupportedResourceKind(resource.kind)
     && scope.resourceKinds.includes(resource.kind)
-    && typeof resource.metadata.namespace === "string"
-    && scope.namespaces.includes(resource.metadata.namespace);
+    && typeof namespace === "string"
+    && scope.namespaces.includes(namespace);
 }
 
 export interface KubernetesObservationAdapter {
@@ -263,14 +350,91 @@ export function productionKubernetesConfiguration(
   return { endpoint, token };
 }
 
+function projectedKubernetesStatus(value: unknown): Readonly<Record<string, unknown>> | undefined {
+  const status = objectValue(value);
+  if (!status) return undefined;
+  const conditions = Array.isArray(status.conditions)
+    ? status.conditions.flatMap((condition) => {
+      const source = objectValue(condition);
+      if (!source) return [];
+      const type = optionalString(source.type);
+      const conditionStatus = optionalString(source.status);
+      if (!type || !conditionStatus) return [];
+      return [{
+        type,
+        status: conditionStatus,
+        ...(optionalString(source.reason) ? { reason: optionalString(source.reason) } : {}),
+      }];
+    })
+    : [];
+  return {
+    ...(optionalString(status.phase) ? { phase: optionalString(status.phase) } : {}),
+    ...(optionalString(status.reason) ? { reason: optionalString(status.reason) } : {}),
+    ...(conditions.length > 0 ? { conditions } : {}),
+  };
+}
+
+function projectPodResponse(value: unknown, namespace: string): KubernetesResource {
+  const item = objectValue(value);
+  const metadata = objectValue(item?.metadata);
+  const name = optionalString(metadata?.name);
+  const uid = optionalString(metadata?.uid);
+  if (!name || !uid) throw new Error("Kubernetes Pod list returned an item without identity");
+  const itemNamespace = optionalString(metadata?.namespace) ?? namespace;
+  const resourceVersion = optionalString(metadata?.resourceVersion);
+  const status = projectedKubernetesStatus(item?.status);
+  return {
+    kind: "Pod",
+    metadata: {
+      name,
+      namespace: itemNamespace,
+      uid,
+      ...(resourceVersion ? { resourceVersion } : {}),
+    },
+    ...(status ? { status } : {}),
+  };
+}
+
 export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter {
   readonly kind = "production" as const;
-  readonly contacted = false;
+  contacted = false;
 
   constructor(readonly configuration: KubernetesAdapterConfiguration) {}
 
-  async list(): Promise<readonly KubernetesResource[]> {
-    throw new Error("Configured Kubernetes observation requires an explicit production client");
+  private endpointForScope(scope: ClusterScope): URL {
+    const configuredEndpoint = new URL(this.configuration.endpoint);
+    const scopeEndpoint = new URL(scope.endpoint);
+    if (configuredEndpoint.protocol !== "https:" || scopeEndpoint.protocol !== "https:" || configuredEndpoint.origin !== scopeEndpoint.origin) {
+      throw new Error("Kubernetes scope endpoint does not match the configured observation endpoint");
+    }
+    const basePath = scopeEndpoint.pathname.replace(/\/$/, "");
+    return new URL(`${basePath}/api/v1`, scope.endpoint);
+  }
+
+  async list(scope: ClusterScope): Promise<readonly KubernetesResource[]> {
+    if (!scope.resourceKinds.includes("Pod")) return [];
+    const resources: KubernetesResource[] = [];
+    const apiEndpoint = this.endpointForScope(scope);
+    for (const namespace of scope.namespaces) {
+      const endpoint = new URL(`${apiEndpoint.pathname}/namespaces/${encodeURIComponent(namespace)}/pods`, apiEndpoint.origin);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10_000);
+      try {
+        this.contacted = true;
+        const response = await fetch(endpoint, {
+          headers: { authorization: `Bearer ${this.configuration.token}`, accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`Kubernetes Pod list failed with HTTP ${response.status}`);
+        const body: unknown = await response.json();
+        const items = objectValue(body)?.items;
+        if (!Array.isArray(items)) throw new Error("Kubernetes Pod list returned an invalid response");
+        resources.push(...items.map((item) => projectPodResponse(item, namespace)));
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    return resources.filter((resource) => isResourceInScope(scope, resource));
   }
 }
 

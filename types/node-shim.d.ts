@@ -31,6 +31,7 @@ declare module "node:http" {
 declare module "node:url" {
   export class URL {
     constructor(input: string, base?: string);
+    readonly origin: string;
     readonly pathname: string;
     readonly protocol: string;
     readonly hostname: string;

@@ -3,23 +3,39 @@ import { state, type StatusResponse } from "../../../packages/contracts/src/inde
 import {
   collectScopedResources,
   createKubernetesAdapter,
+  normalizePodObservation,
   type ClusterScope,
   type KubernetesObservationAdapter,
   type KubernetesResource,
+  type NormalizedPodObservation,
 } from "../../../packages/cluster/src/index.js";
+import { createDatabase, type DatabaseBoundary, type ObservationPersistenceResult, type TimelineStore } from "../../../packages/db/src/index.js";
+import { WORKSPACE_ID } from "../../../packages/identity/src/index.js";
 
-type CollectorOptions = Readonly<{
+export type CollectorOptions = Readonly<{
   port?: number;
   host?: string;
   environment?: Record<string, string | undefined>;
   scope?: ClusterScope;
   adapter?: KubernetesObservationAdapter;
+  database?: DatabaseBoundary;
+  observationStore?: TimelineStore;
+  collectOnStart?: boolean;
 }>;
+
+export class CollectorRecoveryError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CollectorRecoveryError";
+  }
+}
 
 export type CollectorRuntime = Readonly<{
   server: Server;
   status: () => StatusResponse;
   collect: () => Promise<readonly KubernetesResource[]>;
+  collectNormalized: () => Promise<readonly NormalizedPodObservation[]>;
+  collectObservations: () => Promise<readonly ObservationPersistenceResult[]>;
   close: () => Promise<void>;
 }>;
 
@@ -37,8 +53,59 @@ export function collectorStatus(): StatusResponse {
 }
 
 export async function createCollectorRuntime(options: CollectorOptions = {}): Promise<CollectorRuntime> {
-  const adapter = options.adapter ?? createKubernetesAdapter(options.environment ?? process.env);
-  const collect = async (): Promise<readonly KubernetesResource[]> => options.scope ? collectScopedResources(options.scope, adapter) : [];
+  const environment = options.environment ?? process.env;
+  const adapter = options.adapter ?? createKubernetesAdapter(environment);
+  const ownsDatabase = !options.database && !options.observationStore && Boolean(environment.DATABASE_URL);
+  const database = options.database ?? (ownsDatabase ? createDatabase(environment) : undefined);
+  const observationStore = options.observationStore ?? database?.timeline;
+  if (database) {
+    try {
+      await database.migrate();
+      if (!(await database.ping())) throw new Error("Tracegarden collector database readiness check failed");
+    } catch (error) {
+      if (ownsDatabase) await database.close();
+      throw error;
+    }
+  }
+  const configuredScope = async (): Promise<ClusterScope | null> => options.scope ?? await database?.clusterScope?.get(WORKSPACE_ID) ?? null;
+  const collect = async (): Promise<readonly KubernetesResource[]> => {
+    const scope = await configuredScope();
+    return scope ? collectScopedResources(scope, adapter) : [];
+  };
+  const collectNormalized = async (): Promise<readonly NormalizedPodObservation[]> => {
+    const scope = await configuredScope();
+    if (!scope) return [];
+    const resources = await collectScopedResources(scope, adapter);
+    return resources
+      .filter((resource) => resource.kind === "Pod")
+      .map((resource) => normalizePodObservation(scope, resource));
+  };
+  const collectObservations = async (): Promise<readonly ObservationPersistenceResult[]> => {
+    if (!observationStore) throw new CollectorRecoveryError("Collector recovery boundary: observation persistence is unavailable");
+    try {
+      const normalized = await collectNormalized();
+      if (observationStore.recordObservations) return await observationStore.recordObservations(normalized);
+      if (options.collectOnStart) throw new Error("Atomic observation batch persistence is required during collector startup");
+      const persisted: ObservationPersistenceResult[] = [];
+      for (const observation of normalized) persisted.push(await observationStore.recordObservation(observation));
+      return persisted;
+    } catch (error) {
+      if (error instanceof CollectorRecoveryError) throw error;
+      throw new CollectorRecoveryError("Collector recovery boundary: Pod observation persistence failed", { cause: error });
+    }
+  };
+  const runtimeStatus = (): StatusResponse => {
+    const base = collectorStatus();
+    return {
+      ...base,
+      checks: {
+        ...base.checks,
+        database: database ? "ready" : "not-ready",
+        migrations: database ? "ready" : "not-ready",
+        clusterContacted: adapter.contacted,
+      },
+    };
+  };
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
     if (request.method !== "GET") {
       response.statusCode = 405;
@@ -46,29 +113,41 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
       response.end(JSON.stringify({ error: "method_not_allowed" }));
       return;
     }
-    const status = collectorStatus();
+    const status = runtimeStatus();
     response.statusCode = 200;
     response.setHeader("content-type", "application/json; charset=utf-8");
     response.end(JSON.stringify(status));
   };
 
+  if (options.collectOnStart) {
+    try {
+      await collectObservations();
+    } catch (error) {
+      if (ownsDatabase) await database?.close();
+      throw error;
+    }
+  }
   const server = createServer(requestHandler);
-  const port = options.port ?? Number(process.env.COLLECTOR_PORT ?? "3001");
-  const host = options.host ?? process.env.HOST ?? "127.0.0.1";
+  const port = options.port ?? Number(environment.COLLECTOR_PORT ?? "3001");
+  const host = options.host ?? environment.HOST ?? "127.0.0.1";
   await new Promise<void>((resolve) => server.listen(port, host, resolve));
   return {
     server,
-    status: collectorStatus,
+    status: runtimeStatus,
     collect,
+    collectNormalized,
+    collectObservations,
     close: async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (ownsDatabase) await database?.close();
     },
   };
 }
 
 if (process.argv[1]?.endsWith("/collector/src/main.js") || process.argv[1]?.endsWith("/collector/src/main.ts")) {
   try {
-    await createCollectorRuntime();
+    await createCollectorRuntime({ collectOnStart: true });
+    console.log("Tracegarden collector initial collection completed");
     console.log(`Tracegarden collector listening on ${process.env.HOST ?? "127.0.0.1"}:${process.env.COLLECTOR_PORT ?? "3001"}`);
   } catch (error: unknown) {
     console.error(error instanceof Error ? error.message : "Tracegarden collector failed to start");

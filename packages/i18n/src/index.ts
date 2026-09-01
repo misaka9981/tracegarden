@@ -55,6 +55,13 @@ export type Messages = Readonly<{
   clusterConfigurationDenied: string;
   clusterConfigurationUnavailable: string;
   clusterConfigurationInvalid: string;
+  timelineTitle: string;
+  timelineDescription: string;
+  noTimelineEntries: string;
+  podObservation: string;
+  resourceIdentity: string;
+  observedAt: string;
+  timelineUnknownState: string;
 }>;
 
 export const catalogs: Readonly<Record<Language, Messages>> = {
@@ -112,7 +119,14 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     clusterSaved: "Cluster 观测范围已保存。",
     clusterConfigurationDenied: "你没有配置 Cluster 观测范围的 Capability。",
     clusterConfigurationUnavailable: "Cluster 配置存储当前不可用。",
-    clusterConfigurationInvalid: "Cluster 配置无效，请检查输入。"
+    clusterConfigurationInvalid: "Cluster 配置无效，请检查输入。",
+    timelineTitle: "Timeline",
+    timelineDescription: "已提交的 Kubernetes Observation 会出现在这里。",
+    noTimelineEntries: "暂无 Timeline Entry。",
+    podObservation: "Pod Observation",
+    resourceIdentity: "资源身份",
+    observedAt: "观测时间",
+    timelineUnknownState: "状态未知"
   },
   en: {
     appName: "Tracegarden",
@@ -168,7 +182,14 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     clusterSaved: "Cluster observation scope saved.",
     clusterConfigurationDenied: "You do not have the Capability to configure the Cluster observation scope.",
     clusterConfigurationUnavailable: "Cluster configuration storage is unavailable.",
-    clusterConfigurationInvalid: "Cluster configuration is invalid. Check the inputs."
+    clusterConfigurationInvalid: "Cluster configuration is invalid. Check the inputs.",
+    timelineTitle: "Timeline",
+    timelineDescription: "Committed Kubernetes Observations appear here.",
+    noTimelineEntries: "No Timeline Entries yet.",
+    podObservation: "Pod Observation",
+    resourceIdentity: "Resource identity",
+    observedAt: "Observed at",
+    timelineUnknownState: "State unknown"
   },
 };
 

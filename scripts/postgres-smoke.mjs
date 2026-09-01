@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createCollectorRuntime } from "../dist/apps/collector/src/main.js";
+import { DeterministicKubernetesAdapter } from "../dist/packages/cluster/src/index.js";
+import { PostgresDatabase } from "../dist/packages/db/src/index.js";
 
 const name = `tracegarden-foundation-pg-${process.pid}`;
 const databasePort = 45433;
@@ -8,6 +11,9 @@ const productionWebPort = 43201;
 let web;
 let productionWeb;
 const databaseUrl = `postgresql://tracegarden:local-only@127.0.0.1:${databasePort}/tracegarden`;
+let collector;
+let collectorDatabase;
+let collectorProcess;
 
 function docker(...args) {
   return execFileSync("docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -51,8 +57,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope');");
-  assert.equal(migrationCount, "5");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline');");
+  assert.equal(migrationCount, "6");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -124,6 +130,78 @@ try {
   assert.equal((await clusterScope.json()).scope.clusterId, "local-postgres-smoke");
   const clusterCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_clusters;");
   assert.equal(clusterCount, "1");
+
+  let collectorOutput = "";
+  collectorProcess = spawn(process.execPath, ["dist/apps/collector/src/main.js"], {
+    env: { ...process.env, DATABASE_URL: databaseUrl, COLLECTOR_PORT: "43211", HOST: "127.0.0.1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  collectorProcess.stdout.on("data", (chunk) => { collectorOutput += chunk; });
+  collectorProcess.stderr.on("data", (chunk) => { collectorOutput += chunk; });
+  let collectorReadiness;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      collectorReadiness = await fetch("http://127.0.0.1:43211/health/readiness");
+      break;
+    } catch {
+      if (attempt === 39) throw new Error(`collector did not become ready: ${collectorOutput}`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  assert.ok(collectorReadiness);
+  assert.equal(collectorReadiness.status, 200);
+  assert.match(collectorOutput, /initial collection completed/);
+
+  collectorDatabase = new PostgresDatabase(databaseUrl);
+  const observationScope = {
+    workspaceId: "workspace-single",
+    clusterId: "local-postgres-smoke",
+    name: "Local deterministic Cluster",
+    endpoint: "https://cluster.example.test",
+    namespaces: ["tracegarden"],
+    resourceKinds: ["Pod"],
+  };
+  const deterministicPod = new DeterministicKubernetesAdapter([{
+    kind: "Pod",
+    metadata: { name: "api", namespace: "tracegarden", uid: "pod-uid-1", resourceVersion: "7" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }]);
+  collector = await createCollectorRuntime({ port: 43203, host: "127.0.0.1", scope: observationScope, adapter: deterministicPod, observationStore: collectorDatabase.timeline });
+  const firstObservation = await collector.collectObservations();
+  assert.equal(firstObservation.length, 1);
+  assert.equal(firstObservation[0].duplicate, false);
+  assert.equal(firstObservation[0].entry.workspaceId, "workspace-single");
+  assert.equal(firstObservation[0].entry.clusterId, "local-postgres-smoke");
+  assert.equal(firstObservation[0].observation.sourceIdentity, "local-postgres-smoke:pod-uid-1");
+  assert.equal(firstObservation[0].observation.phase, "Running");
+  assert.equal(firstObservation[0].observation.ready, true);
+  assert.doesNotMatch(JSON.stringify(firstObservation[0]), /conditions/);
+  const duplicateObservation = await collector.collectObservations();
+  assert.equal(duplicateObservation[0].duplicate, true);
+  assert.equal(await collectorDatabase.timeline.countObservations("workspace-single"), 1);
+  assert.equal(await collectorDatabase.timeline.countTimelineEntries("workspace-single"), 1);
+  docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "CREATE OR REPLACE FUNCTION tracegarden_test_fail_timeline() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'timeline write failed'; END; $$; CREATE TRIGGER tracegarden_test_fail_timeline BEFORE INSERT ON tracegarden_timeline_entries FOR EACH ROW EXECUTE FUNCTION tracegarden_test_fail_timeline();");
+  const failingPodAdapter = new DeterministicKubernetesAdapter([{
+    kind: "Pod",
+    metadata: { name: "api-failure", namespace: "tracegarden", uid: "pod-uid-2", resourceVersion: "8" },
+    status: { phase: "Pending" },
+  }]);
+  try {
+    await assert.rejects(createCollectorRuntime({ port: 43210, host: "127.0.0.1", scope: observationScope, adapter: failingPodAdapter, observationStore: collectorDatabase.timeline, collectOnStart: true }), /Collector recovery boundary/);
+  } finally {
+    docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "DROP TRIGGER tracegarden_test_fail_timeline ON tracegarden_timeline_entries; DROP FUNCTION tracegarden_test_fail_timeline();");
+  }
+  assert.equal(await collectorDatabase.timeline.countObservations("workspace-single"), 1);
+  assert.equal(await collectorDatabase.timeline.countTimelineEntries("workspace-single"), 1);
+  const timelineResponse = await fetch(`http://127.0.0.1:${webPort}/api/timeline?limit=10`, { headers: { cookie: ownerCookie } });
+  assert.equal(timelineResponse.status, 200);
+  const timelineBody = await timelineResponse.json();
+  assert.equal(timelineBody.entries.length, 1);
+  assert.equal(timelineBody.entries[0].observation.name, "api");
+  const timelinePage = await fetch(`http://127.0.0.1:${webPort}/app?lang=en`, { headers: { cookie: ownerCookie } });
+  assert.match(await timelinePage.text(), /Pod Observation/);
+  const timelinePageChinese = await fetch(`http://127.0.0.1:${webPort}/app?lang=zh-CN`, { headers: { cookie: ownerCookie } });
+  assert.match(await timelinePageChinese.text(), /已提交的 Kubernetes Observation 会出现在这里/);
   const rejected = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -217,8 +295,11 @@ try {
   assert.match(googleLocation, /client_id=local-test-client/);
   assert.match(googleLocation, /redirect_uri=https%3A%2F%2Ftracegarden.test%2Fapi%2Fauth%2Fcallback%2Fgoogle/);
   assert.doesNotMatch(googleLocation, /local-test-secret/);
-  console.log("PostgreSQL migration, admission, and Better Auth production integration smoke passed");
+  console.log("PostgreSQL migration, admission, Pod Observation, Timeline, rollback, and Better Auth integration smoke passed");
 } finally {
+  await collector?.close();
+  collectorProcess?.kill("SIGTERM");
+  await collectorDatabase?.close();
   web?.kill("SIGTERM");
   productionWeb?.kill("SIGTERM");
   removeDatabase();
