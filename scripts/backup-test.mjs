@@ -1,0 +1,119 @@
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { decryptBackupBuffer, encryptBackupBuffer, runBackup, safePostgresDatabaseUrl, validateBackupConfiguration } from "./backup.mjs";
+import {
+  assertCleanDatabase,
+  checkRestoredDatabase,
+  REQUIRED_FOREIGN_KEYS,
+  REQUIRED_MIGRATION_IDS,
+  REQUIRED_TABLES,
+} from "./restore-rehearsal.mjs";
+
+const directory = await mkdtemp(join(tmpdir(), "tracegarden-backup-test-"));
+const key = Buffer.alloc(32, 7);
+const keyFile = join(directory, "encryption-key");
+await writeFile(keyFile, key.toString("hex"), { mode: 0o600 });
+const environment = {
+  DATABASE_URL: "postgresql://tracegarden@database.invalid:5432/tracegarden",
+  BACKUP_ENDPOINT: "https://storage.invalid",
+  BACKUP_BUCKET: "tracegarden-backups",
+  BACKUP_SCHEDULE: "0 2 * * *",
+  BACKUP_RETENTION_DAYS: "30",
+  BACKUP_DESTINATION_SCOPE: "off-vm",
+  BACKUP_CREDENTIALS_SOURCE: "kubernetes-secret/backup-storage",
+  BACKUP_ENCRYPTION_MECHANISM: "aes-256-gcm",
+  BACKUP_ENCRYPTION_KEY_FILE: keyFile,
+};
+const plaintext = Buffer.from("offline PostgreSQL custom-format fixture\n");
+try {
+  const artifact = encryptBackupBuffer(plaintext, key);
+  assert.notEqual(artifact.includes(plaintext), true, "plaintext must not be present in the encrypted artifact");
+  assert.deepEqual(decryptBackupBuffer(artifact, key), plaintext);
+  assert.throws(() => decryptBackupBuffer(artifact, Buffer.alloc(32, 8)), /integrity check failed/);
+  assert.throws(() => validateBackupConfiguration({ ...environment, BACKUP_DESTINATION_SCOPE: "same-vm" }), /off-VM/);
+  assert.throws(() => validateBackupConfiguration({ ...environment, BACKUP_ENCRYPTION_MECHANISM: "none" }), /aes-256-gcm/);
+  assert.throws(() => validateBackupConfiguration({ ...environment, BACKUP_CREDENTIALS_SOURCE: "environment" }), /Kubernetes Secret/);
+  assert.throws(() => validateBackupConfiguration({ ...environment, DATABASE_URL: "postgresql://tracegarden@database.invalid:5432/tracegarden?password=leaked" }), /credential-bearing query parameters/);
+  assert.throws(() => validateBackupConfiguration({ ...environment, BACKUP_ENDPOINT: "https://storage.invalid/?X-Amz-Credential=leaked" }), /query parameters/);
+  assert.throws(() => validateBackupConfiguration({ ...environment, BACKUP_ENDPOINT: "https://:" }), /valid HTTPS URL/);
+  assert.throws(() => validateBackupConfiguration({ ...environment, BACKUP_ENDPOINT: "https://storage.invalid/a b" }), /valid HTTPS URL/);
+  assert.deepEqual(safePostgresDatabaseUrl("postgresql://tracegarden:secret@database.invalid:5432/tracegarden?sslmode=require"), {
+    url: "postgresql://tracegarden@database.invalid:5432/tracegarden?sslmode=require",
+    password: "secret",
+  });
+
+  const cleanClient = { query: async () => ({ rows: [] }) };
+  await assertCleanDatabase(cleanClient);
+  await assert.rejects(
+    assertCleanDatabase({ query: async () => ({ rows: [{ table_schema: "public", table_name: "tracegarden_workspaces" }] }) }),
+    /clean PostgreSQL database/,
+  );
+  const makeRestoredClient = ({ missingTables = [], missingMigrations = [], missingForeignKeys = [], invalidForeignKeys = [] } = {}) => ({
+    query: async (sql) => {
+      if (sql.includes("information_schema.tables")) return { rows: REQUIRED_TABLES
+        .filter((table) => !missingTables.includes(table))
+        .map((table_name) => ({ table_name })) };
+      if (sql.includes("SELECT id FROM public.tracegarden_schema_migrations")) return { rows: REQUIRED_MIGRATION_IDS
+        .filter((id) => !missingMigrations.includes(id))
+        .map((id) => ({ id })) };
+      if (sql.includes("pg_constraint")) return { rows: REQUIRED_FOREIGN_KEYS
+        .filter((conname) => !missingForeignKeys.includes(conname))
+        .map((conname) => ({ conname, convalidated: !invalidForeignKeys.includes(conname) })) };
+      if (sql.includes("GROUP BY")) return { rows: [{ id: "workspace", name: "Workspace", timeline_entries: "1" }] };
+      return { rows: [{ count: "1" }] };
+    },
+  });
+  assert.deepEqual(await checkRestoredDatabase(makeRestoredClient()), {
+    counts: Object.fromEntries(REQUIRED_TABLES.map((table) => [table, 1])),
+    applicationReadable: true,
+    migrationCoverage: true,
+    tablesVerified: true,
+    foreignKeysValidated: true,
+  });
+  await assert.rejects(
+    checkRestoredDatabase(makeRestoredClient({ missingMigrations: ["0014_observation_retention"] })),
+    /migration coverage/,
+  );
+  await assert.rejects(
+    checkRestoredDatabase(makeRestoredClient({ missingTables: ["tracegarden_audit_records"] })),
+    /schema is incomplete/,
+  );
+  await assert.rejects(
+    checkRestoredDatabase(makeRestoredClient({ missingTables: ["tracegarden_correlation_suggestions"] })),
+    /schema is incomplete/,
+  );
+  await assert.rejects(
+    checkRestoredDatabase(makeRestoredClient({ missingTables: ["tracegarden_retention_policies"] })),
+    /schema is incomplete/,
+  );
+  await assert.rejects(
+    checkRestoredDatabase(makeRestoredClient({ missingForeignKeys: ["tracegarden_confirmed_links_confirmed_by_member_id_fkey"] })),
+    /foreign-key constraints/,
+  );
+  await assert.rejects(
+    checkRestoredDatabase(makeRestoredClient({ invalidForeignKeys: ["tracegarden_confirmed_links_confirmed_by_member_id_fkey"] })),
+    /foreign-key constraints/,
+  );
+  await assert.rejects(
+    checkRestoredDatabase(makeRestoredClient({ invalidForeignKeys: ["tracegarden_retention_policies_workspace_id_fkey"] })),
+    /foreign-key constraints/,
+  );
+
+  let uploaded;
+  const result = await runBackup({
+    environment,
+    dump: async () => plaintext,
+    upload: async (request) => { uploaded = await readFile(request.artifactPath); },
+    now: new Date("2026-01-02T03:04:05.000Z"),
+  });
+  assert.ok(uploaded);
+  assert.notEqual(uploaded.includes(plaintext), true, "uploader must receive encrypted bytes only");
+  assert.deepEqual(decryptBackupBuffer(uploaded, key), plaintext);
+  assert.match(result.artifactName, /^tracegarden\/20260102T030405Z-[a-f0-9]{12}\.dump\.enc$/);
+  assert.equal(result.retentionDays, 30);
+  console.log("offline backup encryption, off-VM gate, and credential-free upload boundary passed");
+} finally {
+  await rm(directory, { recursive: true, force: true });
+}

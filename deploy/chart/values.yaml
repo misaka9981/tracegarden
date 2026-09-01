@@ -10,6 +10,10 @@ images:
   migrate:
     repository: ghcr.io/misaka3389/tracegarden-migrate
     digest: sha256:0ed108dbe1b1ed6e4e20863d050e5a7f1a9ee0e19854138d9405147a8b61019d
+  backup:
+    repository: ghcr.io/misaka3389/tracegarden-backup
+    # Replace this release placeholder with the published backup image attestation.
+    digest: sha256:4444444444444444444444444444444444444444444444444444444444444444
   postgres:
     repository: postgres
     digest: sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7
@@ -43,6 +47,35 @@ migration:
   databaseReadyRetrySeconds: 2
   schemaReadyTimeoutSeconds: 600
   schemaReadyRetrySeconds: 2
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+backup:
+  # The CronJob remains suspended until every backup and restore gate is explicit.
+  enabled: false
+  endpoint: ""
+  # Replace the documentation-only CIDR with the authorized endpoint range when enabling.
+  endpointCIDRs:
+    - 192.0.2.0/24
+  bucket: ""
+  schedule: ""
+  retentionDays: 0
+  offVm: true
+  region: auto
+  encryption:
+    mechanism: ""
+    keySecret:
+      existingSecret: ""
+      key: ""
+  credentials:
+    existingSecret: ""
+    accessKeyIdKey: ""
+    secretAccessKeyKey: ""
   resources:
     requests:
       cpu: 50m

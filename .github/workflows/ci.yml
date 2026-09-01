@@ -58,6 +58,7 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm build
       - run: pnpm test
+      - run: pnpm test:backup
 
   postgres:
     name: PostgreSQL integration tests
@@ -402,12 +403,24 @@ jobs:
           subject-name: ${{ env.IMAGE_PREFIX }}-migrate
           subject-digest: ${{ steps.migrate.outputs.digest }}
           push-to-registry: true
+      - name: Publish backup image
+        id: backup
+        run: |
+          set -eu
+          docker buildx build --platform linux/arm64 --file deploy/docker/backup.Dockerfile --tag "${IMAGE_PREFIX}-backup:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/backup.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/backup.json")" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-backup
+          subject-digest: ${{ steps.backup.outputs.digest }}
+          push-to-registry: true
       - name: Record immutable image digests
         run: |
           {
             echo "web=${{ steps.web.outputs.digest }}"
             echo "collector=${{ steps.collector.outputs.digest }}"
             echo "migrate=${{ steps.migrate.outputs.digest }}"
+            echo "backup=${{ steps.backup.outputs.digest }}"
           } | tee "$RUNNER_TEMP/tracegarden-image-digests.txt"
       - name: Persist digest, SBOM, and provenance evidence
         run: |
@@ -417,8 +430,9 @@ jobs:
           cp "$RUNNER_TEMP/web.json" "$evidence/web-build-metadata.json"
           cp "$RUNNER_TEMP/collector.json" "$evidence/collector-build-metadata.json"
           cp "$RUNNER_TEMP/migrate.json" "$evidence/migrate-build-metadata.json"
+          cp "$RUNNER_TEMP/backup.json" "$evidence/backup-build-metadata.json"
           cp "$RUNNER_TEMP/tracegarden-image-digests.txt" "$evidence/image-digests.txt"
-          for service in web collector migrate; do
+          for service in web collector migrate backup; do
             digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/${service}.json")
             test "$digest" != "null" && printf '%s\n' "$digest" > "$evidence/${service}-digest.txt"
             docker buildx imagetools inspect --raw "${IMAGE_PREFIX}-${service}@${digest}" > "$evidence/${service}-manifest.json"

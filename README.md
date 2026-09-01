@@ -13,6 +13,7 @@ pnpm lint
 pnpm typecheck
 pnpm build
 pnpm test
+pnpm test:backup
 pnpm test:browser
 pnpm test:container
 pnpm test:postgres

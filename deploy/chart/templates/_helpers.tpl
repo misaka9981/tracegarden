@@ -38,6 +38,40 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- printf "%s@%s" $image.repository $image.digest -}}
 {{- end }}
 
+{{/* Backup configuration is fail-closed; an incomplete path stays suspended. */}}
+{{- define "tracegarden.validateBackup" -}}
+{{- $endpointPattern := "^https://([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(/[^\\s?#]*)?$" }}
+{{- $numericHostEndpointPattern := "^https://[0-9]+(\\.[0-9]+)*(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(/[^\\s?#]*)?$" }}
+{{- $ipv4EndpointPattern := "^https://((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(/[^\\s?#]*)?$" }}
+{{- $ipv4CidrPattern := "^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(0|[12][0-9]|3[0-2])$" }}
+{{- $ipv6CidrPattern := "^(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:((:[0-9A-Fa-f]{1,4}){1,6})|:((:[0-9A-Fa-f]{1,4}){1,7}|:))/(0|[1-9][0-9]|1[01][0-9]|12[0-8])$" }}
+{{- if .Values.backup.endpoint }}
+{{- $endpoint := .Values.backup.endpoint }}
+{{- if not (regexMatch $endpointPattern $endpoint) }}{{ fail "backup.endpoint must be a semantic HTTPS URL without credentials, query parameters, or fragments" }}{{ end }}
+{{- if and (regexMatch $numericHostEndpointPattern $endpoint) (not (regexMatch $ipv4EndpointPattern $endpoint)) }}{{ fail "backup.endpoint must contain a valid IPv4 address or DNS hostname" }}{{ end }}
+{{- end }}
+{{- range .Values.backup.endpointCIDRs }}
+{{- if not (or (regexMatch $ipv4CidrPattern .) (regexMatch $ipv6CidrPattern .)) }}{{ fail "backup.endpointCIDRs must contain valid IPv4 or IPv6 CIDRs" }}{{ end }}
+{{- end }}
+{{- if .Values.backup.enabled }}
+{{- $_ := required "backup.endpoint is required when backup.enabled is true" .Values.backup.endpoint }}
+{{- range .Values.backup.endpointCIDRs }}
+{{- $cidr := lower . }}
+{{- if or (hasPrefix "192.0.2." $cidr) (hasPrefix "198.51.100." $cidr) (hasPrefix "203.0.113." $cidr) (hasPrefix "2001:db8:" $cidr) }}{{ fail "backup.endpointCIDRs must not use TEST-NET or documentation-only CIDRs when backup.enabled is true" }}{{ end }}
+{{- end }}
+{{- $_ := required "backup.bucket is required when backup.enabled is true" .Values.backup.bucket }}
+{{- $_ := required "backup.schedule is required when backup.enabled is true" .Values.backup.schedule }}
+{{- if le (int .Values.backup.retentionDays) 0 }}{{ fail "backup.retentionDays must be positive when backup.enabled is true" }}{{ end }}
+{{- if not .Values.backup.offVm }}{{ fail "backup.offVm must remain true; same-VM copies are not disaster recovery" }}{{ end }}
+{{- if ne .Values.backup.encryption.mechanism "aes-256-gcm" }}{{ fail "backup.encryption.mechanism must be aes-256-gcm" }}{{ end }}
+{{- $_ := required "backup.encryption.keySecret.existingSecret is required when backup.enabled is true" .Values.backup.encryption.keySecret.existingSecret }}
+{{- $_ := required "backup.encryption.keySecret.key is required when backup.enabled is true" .Values.backup.encryption.keySecret.key }}
+{{- $_ := required "backup.credentials.existingSecret is required when backup.enabled is true" .Values.backup.credentials.existingSecret }}
+{{- $_ := required "backup.credentials.accessKeyIdKey is required when backup.enabled is true" .Values.backup.credentials.accessKeyIdKey }}
+{{- $_ := required "backup.credentials.secretAccessKeyKey is required when backup.enabled is true" .Values.backup.credentials.secretAccessKeyKey }}
+{{- end }}
+{{- end }}
+
 {{/* Revision for the regular migration Job; changes create a new immutable Job. */}}
 {{- define "tracegarden.migrationRevision" -}}
 {{- printf "%s|%d|%d|%d|%d" .Values.images.migrate.digest .Values.migration.backoffLimit .Values.migration.activeDeadlineSeconds .Values.migration.databaseReadyTimeoutSeconds .Values.migration.databaseReadyRetrySeconds | sha256sum | trunc 12 }}

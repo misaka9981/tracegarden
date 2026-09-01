@@ -124,6 +124,10 @@ spec:
             matchLabels:
               {{- include "tracegarden.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: migration
+        - podSelector:
+            matchLabels:
+              {{- include "tracegarden.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: backup
       ports:
         - protocol: TCP
           port: {{ .Values.postgres.port }}
@@ -161,3 +165,45 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracegarden.fullname" . }}-backup
+  labels:
+    {{- include "tracegarden.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tracegarden.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: backup
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "tracegarden.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: {{ .Values.postgres.port }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace | quote }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.dnsPodSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- range .Values.backup.endpointCIDRs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}

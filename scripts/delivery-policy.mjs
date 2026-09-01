@@ -37,6 +37,7 @@ for (const command of [
   "pnpm lint",
   "pnpm typecheck",
   "pnpm test",
+  "pnpm test:backup",
   "pnpm test:postgres",
   "pnpm test:browser",
   "pnpm test:container",
@@ -78,7 +79,7 @@ if (/--platform linux\/arm64/.test(workflowText) && !workflowText.includes("runs
 }
 if (/:latest\b|:main\b|:master\b|:edge\b/.test(workflowText)) errors.push("workflow suite must not publish mutable image tags");
 
-for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Dockerfile", "deploy/docker/migrate.Dockerfile"]) {
+for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Dockerfile", "deploy/docker/migrate.Dockerfile", "deploy/docker/backup.Dockerfile"]) {
   const source = await readFile(path, "utf8");
   const bases = [...source.matchAll(/^FROM\s+(\S+)/gm)].map(([, image]) => image);
   if (!bases.length || bases.some((image) => !immutableDigest.test(image))) errors.push(`${path}: every base image must be digest-pinned`);

@@ -8,6 +8,7 @@ const checksumPath = "deploy/kubeconform-schemas/SHA256SUMS";
 const schemaDirectory = ".ci/kubeconform-schemas/v1.31.0-standalone-strict";
 const schemaFiles = [
   "configmap-v1.json",
+  "cronjob-batch-v1.json",
   "deployment-apps-v1.json",
   "limitrange-v1.json",
   "ingress-networking-v1.json",

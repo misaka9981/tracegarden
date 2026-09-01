@@ -23,6 +23,7 @@
     "start": "node dist/apps/web/src/main.js",
     "pretest": "pnpm build",
     "test": "node scripts/test.mjs && node scripts/collector-resilience.mjs && node scripts/delivery-test.mjs",
+    "test:backup": "node scripts/backup-test.mjs"
     "pretest:browser": "pnpm build && pnpm exec playwright install chromium",
     "test:browser": "node scripts/browser-smoke.mjs",
     "test:container": "node scripts/container-smoke.mjs",
@@ -38,7 +39,7 @@
     "preview:validate": "DELIVERY_RENDER=true node scripts/delivery-test.mjs",
     "pretest:chart": "pnpm delivery:schema",
     "test:chart": "node scripts/chart-test.mjs",
-    "check": "pnpm env:check && pnpm delivery:policy && pnpm format:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test && pnpm test:chart && pnpm test:browser && pnpm test:postgres && pnpm test:container"
+    "check": "pnpm env:check && pnpm delivery:policy && pnpm format:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test && pnpm test:backup && pnpm test:chart && pnpm test:browser && pnpm test:postgres && pnpm test:container"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0",

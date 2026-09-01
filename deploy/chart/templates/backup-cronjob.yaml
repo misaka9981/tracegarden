@@ -1,0 +1,110 @@
+{{ include "tracegarden.validateBackup" . }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "tracegarden.fullname" . }}-backup
+  labels:
+    {{- include "tracegarden.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    tracegarden.dev/backup-status: {{ ternary "configured" "disabled-until-explicitly-configured" .Values.backup.enabled | quote }}
+spec:
+  schedule: {{ if .Values.backup.enabled }}{{ .Values.backup.schedule | quote }}{{ else }}"0 0 31 2 *"{{ end }}
+  suspend: {{ not .Values.backup.enabled }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "tracegarden.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: backup
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            {{- include "tracegarden.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              image: {{ include "tracegarden.image" (dict "root" . "component" "backup") | quote }}
+              imagePullPolicy: IfNotPresent
+              command: ["node", "/app/backup.mjs"]
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "tracegarden.databaseSecret" . }}
+                      key: {{ .Values.secrets.database.urlKey | quote }}
+                {{- if .Values.backup.enabled }}
+                - name: BACKUP_ENDPOINT
+                  value: {{ .Values.backup.endpoint | quote }}
+                {{- end }}
+                - name: BACKUP_BUCKET
+                  value: {{ .Values.backup.bucket | quote }}
+                - name: BACKUP_SCHEDULE
+                  value: {{ if .Values.backup.enabled }}{{ .Values.backup.schedule | quote }}{{ else }}""{{ end }}
+                - name: BACKUP_RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | quote }}
+                - name: BACKUP_DESTINATION_SCOPE
+                  value: off-vm
+                - name: BACKUP_CREDENTIALS_SOURCE
+                  value: {{ if .Values.backup.enabled }}{{ printf "kubernetes-secret/%s" .Values.backup.credentials.existingSecret | quote }}{{ else }}disabled{{ end }}
+                - name: BACKUP_ENCRYPTION_MECHANISM
+                  value: {{ .Values.backup.encryption.mechanism | quote }}
+                - name: BACKUP_ENCRYPTION_KEY_FILE
+                  value: /var/run/tracegarden-backup/encryption-key
+                - name: AWS_DEFAULT_REGION
+                  value: {{ .Values.backup.region | quote }}
+                {{- if .Values.backup.enabled }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.credentials.existingSecret | quote }}
+                      key: {{ .Values.backup.credentials.accessKeyIdKey | quote }}
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.credentials.existingSecret | quote }}
+                      key: {{ .Values.backup.credentials.secretAccessKeyKey | quote }}
+                {{- end }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if .Values.backup.enabled }}
+                - name: encryption-key
+                  mountPath: /var/run/tracegarden-backup
+                  readOnly: true
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            {{- if .Values.backup.enabled }}
+            - name: encryption-key
+              secret:
+                secretName: {{ .Values.backup.encryption.keySecret.existingSecret | quote }}
+                defaultMode: 256
+                items:
+                  - key: {{ .Values.backup.encryption.keySecret.key | quote }}
+                    path: encryption-key
+            {{- end }}
