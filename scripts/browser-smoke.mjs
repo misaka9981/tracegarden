@@ -15,18 +15,50 @@ let browser;
 try {
   browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  let ready = false;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/health/live`);
+      if (response.ok) {
+        ready = true;
+        break;
+      }
+    } catch {
+      // The web process is still starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(ready, true, `web process did not become ready: ${output}`);
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "domcontentloaded" });
   assert.equal(await page.title(), "Tracegarden · 应用状态");
   assert.equal(await page.locator("html").getAttribute("lang"), "zh-CN");
   assert.match(await page.locator("h1").innerText(), /应用状态/);
   assert.match(await page.locator("body").innerText(), /简体中文/);
+  assert.match(await page.locator("body").innerText(), /登录 Tracegarden/);
   assert.doesNotMatch(await page.content(), /DATABASE_URL|postgres(ql)?:\/\//i);
 
-  await page.goto(`http://127.0.0.1:${port}/?lang=en`, { waitUntil: "domcontentloaded" });
-  assert.equal(await page.title(), "Tracegarden · Application status");
+  await page.locator("#identity").selectOption("owner");
+  await page.getByRole("button", { name: "登录" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.equal(await page.locator("html").getAttribute("lang"), "zh-CN");
+  assert.match(await page.locator("h1").innerText(), /共享 Workspace/);
+  assert.match(await page.locator("body").innerText(), /owner@example.test/);
+
+  await page.goto(`http://127.0.0.1:${port}/app?lang=en`, { waitUntil: "domcontentloaded" });
+  assert.equal(await page.title(), "Tracegarden · Shared Workspace");
   assert.equal(await page.locator("html").getAttribute("lang"), "en");
-  assert.match(await page.locator("h1").innerText(), /Application status/);
-  assert.match(await page.locator("body").innerText(), /PostgreSQL database/);
+  assert.match(await page.locator("h1").innerText(), /Shared Workspace/);
+  assert.match(await page.locator("body").innerText(), /workspace:read/);
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  await page.locator("#identity").selectOption("rejected");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  assert.equal(await page.title(), "Tracegarden · Workspace access denied");
+  assert.match(await page.locator("body").innerText(), /no valid Workspace admission/);
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Sign in to Tracegarden/);
   console.log("Playwright browser smoke passed");
 } finally {
   await browser?.close();

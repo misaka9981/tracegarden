@@ -2,6 +2,20 @@ const [major, minor] = process.versions.node.split(".").map(Number);
 const failures = [];
 if (major !== 26 || minor !== 8) failures.push(`Node.js 26.8.x is required (found ${process.version})`);
 if (process.env.NODE_ENV === "production" && !process.env.DATABASE_URL) failures.push("DATABASE_URL is required in production");
+if (process.env.NODE_ENV === "production" && (!process.env.BETTER_AUTH_SECRET?.trim() || !process.env.BETTER_AUTH_URL?.trim())) failures.push("BETTER_AUTH_SECRET and BETTER_AUTH_URL are required in production");
+if (process.env.NODE_ENV === "production" && (!process.env.GOOGLE_CLIENT_ID?.trim() || !process.env.GOOGLE_CLIENT_SECRET?.trim() || !process.env.GOOGLE_REDIRECT_URI?.trim())) {
+  failures.push("GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI are required in production");
+}
+if (process.env.NODE_ENV === "production" && (!process.env.TRACEGARDEN_BOOTSTRAP_ISSUER?.trim() || !process.env.TRACEGARDEN_BOOTSTRAP_SUBJECT?.trim())) {
+  failures.push("TRACEGARDEN_BOOTSTRAP_ISSUER and TRACEGARDEN_BOOTSTRAP_SUBJECT are required in production");
+}
+if (process.env.NODE_ENV === "production" && process.env.BETTER_AUTH_URL?.trim()) {
+  try {
+    if (new URL(process.env.BETTER_AUTH_URL).protocol !== "https:") failures.push("BETTER_AUTH_URL must be HTTPS in production");
+  } catch {
+    failures.push("BETTER_AUTH_URL must be HTTPS in production");
+  }
+}
 if (process.env.DATABASE_MODE === "memory" && process.env.NODE_ENV !== "test") failures.push("DATABASE_MODE=memory is restricted to test runs");
 if (process.env.DATABASE_URL?.startsWith("postgres://") || process.env.DATABASE_URL?.startsWith("postgresql://")) {
   console.log("DATABASE_URL is configured without printing its value");

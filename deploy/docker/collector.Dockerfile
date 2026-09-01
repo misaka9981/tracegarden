@@ -7,6 +7,7 @@ COPY apps/collector/package.json apps/collector/package.json
 COPY packages/contracts/package.json packages/contracts/package.json
 COPY packages/db/package.json packages/db/package.json
 COPY packages/i18n/package.json packages/i18n/package.json
+COPY packages/identity/package.json packages/identity/package.json
 RUN pnpm install --frozen-lockfile
 COPY apps apps
 COPY packages packages

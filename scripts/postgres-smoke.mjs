@@ -4,7 +4,9 @@ import { execFileSync, spawn } from "node:child_process";
 const name = `tracegarden-foundation-pg-${process.pid}`;
 const databasePort = 45433;
 const webPort = 43200;
+const productionWebPort = 43201;
 let web;
+let productionWeb;
 const databaseUrl = `postgresql://tracegarden:local-only@127.0.0.1:${databasePort}/tracegarden`;
 
 function docker(...args) {
@@ -19,7 +21,7 @@ try {
   docker("run", "-d", "--name", name, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", "postgres:18.3-alpine");
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
-      docker("exec", name, "pg_isready", "-U", "tracegarden", "-d", "tracegarden");
+      docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT 1");
       break;
     } catch {
       if (attempt === 39) throw new Error("PostgreSQL did not become ready");
@@ -49,10 +51,76 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id = '0001_foundation';");
-  assert.equal(migrationCount, "1");
-  console.log("PostgreSQL migration and web readiness smoke passed");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth');");
+  assert.equal(migrationCount, "3");
+  const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: "identity=owner&lang=en",
+  });
+  assert.equal(login.status, 303);
+  const session = await fetch(`http://127.0.0.1:${webPort}/api/session`, {
+    headers: { cookie: login.headers.get("set-cookie") ?? "" },
+  });
+  assert.equal(session.status, 200);
+  const sessionBody = await session.json();
+  assert.equal(sessionBody.member.identity.issuer, "https://local.tracegarden.test");
+  assert.equal(sessionBody.member.identity.subject, "owner");
+  const rejected = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: "identity=rejected&lang=en",
+  });
+  assert.equal(rejected.status, 403);
+  assert.match(await rejected.text(), /no valid Workspace admission/);
+  const memberCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_members;");
+  assert.equal(memberCount, "1");
+
+  productionWeb = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
+    env: {
+      ...process.env,
+      NODE_ENV: "production",
+      DATABASE_URL: databaseUrl,
+      BETTER_AUTH_SECRET: "local-test-secret",
+      BETTER_AUTH_URL: "https://tracegarden.test",
+      GOOGLE_CLIENT_ID: "local-test-client",
+      GOOGLE_CLIENT_SECRET: "local-test-secret",
+      GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
+      TRACEGARDEN_BOOTSTRAP_ISSUER: "https://accounts.google.com",
+      TRACEGARDEN_BOOTSTRAP_SUBJECT: "local-test-bootstrap",
+      PORT: String(productionWebPort),
+      HOST: "127.0.0.1",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let productionOutput = "";
+  productionWeb.stdout.on("data", (chunk) => { productionOutput += chunk; });
+  productionWeb.stderr.on("data", (chunk) => { productionOutput += chunk; });
+  let productionReadiness;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      productionReadiness = await fetch(`http://127.0.0.1:${productionWebPort}/health/readiness`);
+      break;
+    } catch {
+      if (attempt === 39) throw new Error(`production web did not become ready: ${productionOutput}`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  assert.ok(productionReadiness);
+  assert.equal(productionReadiness.status, 200);
+  const productionLogin = await fetch(`http://127.0.0.1:${productionWebPort}/?lang=en`, { redirect: "manual" });
+  assert.equal(productionLogin.status, 200);
+  assert.match(await productionLogin.text(), /Sign in with Google/);
+  const googleRedirect = await fetch(`http://127.0.0.1:${productionWebPort}/auth/google`, { redirect: "manual" });
+  assert.equal(googleRedirect.status, 302);
+  const googleLocation = googleRedirect.headers.get("location") ?? "";
+  assert.match(googleLocation, /client_id=local-test-client/);
+  assert.match(googleLocation, /redirect_uri=https%3A%2F%2Ftracegarden.test%2Fapi%2Fauth%2Fcallback%2Fgoogle/);
+  assert.doesNotMatch(googleLocation, /local-test-secret/);
+  console.log("PostgreSQL migration, admission, and Better Auth production integration smoke passed");
 } finally {
   web?.kill("SIGTERM");
+  productionWeb?.kill("SIGTERM");
   removeDatabase();
 }

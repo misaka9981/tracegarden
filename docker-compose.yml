@@ -20,6 +20,13 @@ services:
       dockerfile: deploy/docker/web.Dockerfile
     environment:
       DATABASE_URL: postgresql://tracegarden:local-only@postgres:5432/tracegarden
+      BETTER_AUTH_SECRET: local-container-only
+      BETTER_AUTH_URL: https://tracegarden.example
+      GOOGLE_CLIENT_ID: local-container-smoke
+      GOOGLE_CLIENT_SECRET: local-container-only
+      GOOGLE_REDIRECT_URI: https://tracegarden.example/api/auth/callback/google
+      TRACEGARDEN_BOOTSTRAP_ISSUER: https://accounts.google.com
+      TRACEGARDEN_BOOTSTRAP_SUBJECT: local-container-bootstrap
       PORT: "3000"
       HOST: 0.0.0.0
     depends_on:

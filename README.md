@@ -33,7 +33,7 @@ For PostgreSQL-backed development, copy `.env.example`, start `postgres:18.3-alp
 - Node.js 26.8.x and TypeScript 7.0.2
 - pnpm workspaces and Turborepo task metadata
 - PostgreSQL 18 with a repository-owned migration boundary
-- TanStack Start, React, tRPC, Zod, Drizzle, Better Auth, and Kubernetes adapters are subsequent foundation/domain increments; this ticket deliberately keeps the executable path dependency-light.
+- TanStack Start, React, tRPC, Zod, Drizzle, and Kubernetes adapters remain subsequent foundation/domain increments; Better Auth now owns production Google identity and sessions.
 
 ## Safety boundary
 

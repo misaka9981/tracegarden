@@ -9,11 +9,12 @@ declare module "node:http" {
   export interface IncomingMessage {
     method?: string;
     url?: string;
+    headers?: Record<string, string | undefined>;
     on(event: string, listener: (...args: unknown[]) => void): this;
   }
   export interface ServerResponse {
     statusCode: number;
-    setHeader(name: string, value: string): void;
+    setHeader(name: string, value: string | string[]): void;
     end(body?: string): void;
     writeHead(statusCode: number, headers?: Record<string, string>): void;
     write(chunk: string): boolean;
@@ -31,7 +32,10 @@ declare module "node:url" {
   export class URL {
     constructor(input: string, base?: string);
     readonly pathname: string;
+    readonly protocol: string;
+    readonly hostname: string;
     readonly searchParams: URLSearchParams;
+    toString(): string;
   }
   export function fileURLToPath(url: URL): string;
 }
@@ -61,13 +65,22 @@ declare module "node:assert/strict" {
   export default assert;
 }
 
+declare module "node:crypto" {
+  export function randomUUID(): string;
+}
+
 declare module "pg" {
   export interface QueryResult<T = Record<string, unknown>> {
     rows: T[];
     rowCount: number;
   }
+  export interface PoolClient {
+    query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
+    release(): void;
+  }
   export class Pool {
     constructor(options?: Record<string, unknown>);
+    connect(): Promise<PoolClient>;
     query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
     end(): Promise<void>;
   }
