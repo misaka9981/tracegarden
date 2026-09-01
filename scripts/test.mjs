@@ -5,7 +5,7 @@ import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../di
 import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError, parseTimelineNotification } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
-import { confirmCorrelationSuggestion, correlationSignalsBetween, createExperiment, ExperimentLifecycleError, ExperimentValidationError, hasCorrelationReview, hasExperimentWrite, parseExperimentInput, rejectCorrelationSuggestion, suggestCorrelationCandidates } from "../dist/packages/domain/src/index.js";
+import { confirmCorrelationSuggestion, correlationSignalsBetween, createExperiment, ExperimentLifecycleError, ExperimentValidationError, hasCorrelationReview, hasExperimentWrite, hasRetentionManagement, parseExperimentInput, rejectCorrelationSuggestion, runRetentionCleanup, suggestCorrelationCandidates, updateRetentionPolicy } from "../dist/packages/domain/src/index.js";
 import {
   boundRecentLogWindow,
   ConfiguredKubernetesLogAdapter,
@@ -444,6 +444,33 @@ assert.ok(ownerMember);
 const savedScope = ownerMember ? await configureClusterScope(ownerMember, scopeStore, scopeInput) : null;
 assert.equal(savedScope?.clusterId, "lab-cluster");
 assert.ok(ownerMember && hasClusterConfigureCapability(ownerMember));
+assert.ok(ownerMember && hasRetentionManagement(ownerMember));
+const retentionTimeline = new MemoryObservationStore(scopeStore);
+assert.equal((await retentionTimeline.getRetentionPolicy("workspace-single")).retentionDays, 90);
+if (savedScope && ownerMember) {
+  const retentionObservation = (uid, observedAt) => normalizePodObservation(savedScope, {
+    kind: "Pod",
+    metadata: { name: uid, namespace: "tracegarden", uid, resourceVersion: uid },
+    status: { phase: "Running" },
+  }, observedAt);
+  await retentionTimeline.recordObservation(retentionObservation("retention-old", "2025-12-31T00:00:00.000Z"));
+  const retentionAttention = retentionObservation("retention-attention", "2025-12-31T00:00:00.000Z");
+  const retentionAttentionResult = await retentionTimeline.recordObservation({ ...retentionAttention, phase: "Failed", attention: true, attentionReason: "pod_not_ready" });
+  await retentionTimeline.reviewAttentionItem("workspace-single", ownerMember.id, retentionAttentionResult.entry.id);
+  await retentionTimeline.recordObservation(retentionObservation("retention-boundary", "2026-01-01T00:00:00.000Z"));
+  await updateRetentionPolicy(ownerMember, retentionTimeline, { retentionDays: 1 });
+  await assert.rejects(() => updateRetentionPolicy(invitedAdmission.admitted ? invitedAdmission.session.member : ownerMember, retentionTimeline, 7), /Missing capability/);
+  const cleanup = await runRetentionCleanup(ownerMember, retentionTimeline, "2026-01-02T00:00:00.000Z");
+  assert.equal(cleanup.deletedObservations, 2);
+  assert.equal(cleanup.deletedTimelineEntries, 2);
+  assert.equal(cleanup.protectedObservations, 0);
+  assert.equal((await retentionTimeline.countObservations("workspace-single")), 1);
+  assert.equal(retentionTimeline.attentionReviews.size, 0);
+  assert.equal(retentionTimeline.ingestionOrders.size, 1);
+  const retry = await runRetentionCleanup(ownerMember, retentionTimeline, "2026-01-02T00:00:00.000Z");
+  assert.equal(retry.deletedObservations, 0);
+  assert.equal(retry.failures, 0);
+}
 const scopedResources = savedScope ? await collectScopedResources(savedScope, deterministic) : [];
 assert.deepEqual(scopedResources.map((resource) => resource.metadata.name), ["in-scope"]);
 assert.equal(deterministic.requests[0]?.clusterId, "lab-cluster");
@@ -839,6 +866,53 @@ try {
 } finally {
   await collectorWithPersistence.close();
 }
+let scheduledRetentionCleanup;
+let retentionCleanupCalls = 0;
+let retentionCleanupCancelled = false;
+const injectedRetentionStore = {
+  getRetentionPolicy: async () => ({ workspaceId: "workspace-single", retentionDays: 90, updatedAt: "2026-01-01T00:00:00.000Z" }),
+  updateRetentionPolicy: async (_workspaceId, retentionDays) => ({ workspaceId: "workspace-single", retentionDays: Number(retentionDays), updatedAt: "2026-01-01T00:00:00.000Z" }),
+  cleanupRetention: async () => {
+    retentionCleanupCalls += 1;
+    return { workspaceId: "workspace-single", retentionDays: 90, cutoff: "", eligibleObservations: 0, protectedObservations: 0, deletedObservations: 0, deletedTimelineEntries: 0, failures: 0, failureCount: 0, retryable: true };
+  },
+};
+const scheduledCollector = await createCollectorRuntime({
+  port: 43214,
+  host: "127.0.0.1",
+  scope: savedScope ?? undefined,
+  adapter: deterministic,
+  observationStore: new MemoryObservationStore(),
+  retentionStore: injectedRetentionStore,
+  retentionCleanupIntervalMs: 123,
+  retentionCleanupScheduler: (task, intervalMs) => {
+    assert.equal(intervalMs, 123);
+    scheduledRetentionCleanup = task;
+    return () => { retentionCleanupCancelled = true; };
+  },
+});
+try {
+  assert.ok(scheduledRetentionCleanup);
+  scheduledRetentionCleanup();
+  assert.equal(retentionCleanupCalls, 1);
+} finally {
+  await scheduledCollector.close();
+}
+assert.equal(retentionCleanupCancelled, true);
+scheduledRetentionCleanup();
+assert.equal(retentionCleanupCalls, 1);
+await assert.rejects(
+  createCollectorRuntime({ environment: { NODE_ENV: "production" }, adapter: deterministic, database: {} }),
+  /Production collector stores must be database-owned/,
+);
+await assert.rejects(
+  createCollectorRuntime({ environment: { NODE_ENV: "production" }, adapter: deterministic, observationStore: new MemoryObservationStore() }),
+  /Production collector stores must be database-owned/,
+);
+await assert.rejects(
+  createCollectorRuntime({ environment: { NODE_ENV: "production" }, adapter: deterministic, retentionStore: injectedRetentionStore }),
+  /Production collector stores must be database-owned/,
+);
 class FailingObservationStore extends MemoryObservationStore {
   async recordObservation() {
     throw new Error("database write failed");

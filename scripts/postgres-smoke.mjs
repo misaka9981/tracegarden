@@ -4,7 +4,7 @@ import pg from "pg";
 import { execFileSync, spawn } from "node:child_process";
 import { createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { DeterministicKubernetesAdapter, normalizeObservation, normalizePodObservation } from "../dist/packages/cluster/src/index.js";
-import { PostgresDatabase, TimelineQueryValidationError } from "../dist/packages/db/src/index.js";
+import { PostgresDatabase, PostgresObservationStore, TimelineQueryValidationError } from "../dist/packages/db/src/index.js";
 import { FakeKubernetesLogAdapter, requestRecentLogWindow } from "../dist/packages/logs/src/index.js";
 
 const name = `tracegarden-foundation-pg-${process.pid}`;
@@ -137,8 +137,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention', '0011_structured_experiments', '0012_correlation_links', '0013_live_timeline');");
-  assert.equal(migrationCount, "13");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention', '0011_structured_experiments', '0012_correlation_links', '0013_live_timeline', '0014_observation_retention');");
+  assert.equal(migrationCount, "14");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -154,6 +154,22 @@ try {
   assert.equal(sessionBody.member.identity.issuer, "https://local.tracegarden.test");
   assert.equal(sessionBody.member.identity.subject, "owner");
   const ownerCookie = login.headers.get("set-cookie") ?? "";
+  const retentionDefaultResponse = await fetch(`http://127.0.0.1:${webPort}/api/retention`, { headers: { cookie: ownerCookie } });
+  assert.equal(retentionDefaultResponse.status, 200);
+  assert.equal((await retentionDefaultResponse.json()).policy.retentionDays, 90);
+  const retentionUpdateResponse = await fetch(`http://127.0.0.1:${webPort}/api/retention`, {
+    method: "PUT",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ retentionDays: 30 }),
+  });
+  assert.equal(retentionUpdateResponse.status, 200);
+  assert.equal((await retentionUpdateResponse.json()).policy.retentionDays, 30);
+  const invalidRetentionResponse = await fetch(`http://127.0.0.1:${webPort}/api/retention`, {
+    method: "PATCH",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ retentionDays: 0 }),
+  });
+  assert.equal(invalidRetentionResponse.status, 400);
   const invitationResponse = await fetch(`http://127.0.0.1:${webPort}/api/invitations`, {
     method: "POST",
     headers: { cookie: ownerCookie, "content-type": "application/json" },
@@ -195,6 +211,13 @@ try {
   assert.equal(refreshedInvitedSessionBody.member.role, "operator");
   assert.ok(refreshedInvitedSessionBody.member.capabilities.includes("experiment:write"));
   assert.ok(!refreshedInvitedSessionBody.member.capabilities.includes("membership:manage"));
+  assert.ok(!refreshedInvitedSessionBody.member.capabilities.includes("retention:manage"));
+  const deniedRetentionUpdate = await fetch(`http://127.0.0.1:${webPort}/api/retention`, {
+    method: "PUT",
+    headers: { cookie: invitedLogin.headers.get("set-cookie") ?? "", "content-type": "application/json" },
+    body: JSON.stringify({ retentionDays: 7 }),
+  });
+  assert.equal(deniedRetentionUpdate.status, 403);
   const clusterScope = await fetch(`http://127.0.0.1:${webPort}/api/cluster`, {
     method: "PUT",
     headers: { cookie: ownerCookie, "content-type": "application/json" },
@@ -208,6 +231,115 @@ try {
   });
   assert.equal(clusterScope.status, 200);
   assert.equal((await clusterScope.json()).scope.clusterId, "local-postgres-smoke");
+  const retentionDatabase = new PostgresDatabase(databaseUrl);
+  try {
+    const retentionScope = {
+      workspaceId: "workspace-single",
+      clusterId: "local-postgres-smoke",
+      name: "Local deterministic Cluster",
+      endpoint: "https://cluster.example.test",
+      namespaces: ["tracegarden"],
+      resourceKinds: ["Pod"],
+    };
+    const retentionObservation = (uid, observedAt) => normalizePodObservation(retentionScope, {
+      kind: "Pod",
+      metadata: { name: uid, namespace: "tracegarden", uid, resourceVersion: uid },
+      status: { phase: "Running" },
+    }, observedAt);
+    const deletedCandidate = await retentionDatabase.timeline.recordObservation(retentionObservation("retention-pg-deleted", "2025-12-31T00:00:00.000Z"));
+    const protectedCandidate = await retentionDatabase.timeline.recordObservation(retentionObservation("retention-pg-protected", "2025-12-31T00:00:00.000Z"));
+    await retentionDatabase.timeline.recordObservation(retentionObservation("retention-pg-boundary", "2026-01-01T00:00:00.000Z"));
+    const retentionExperiment = await retentionDatabase.experiments.createExperiment("workspace-single", sessionBody.member.id, {
+      hypothesis: "retention protection", change: "none", observation: "context", conclusion: "", state: "active", tags: [], workloads: [], gitRevision: null,
+    });
+    const retentionClient = new pg.Client(databaseUrl);
+    await retentionClient.connect();
+    try {
+      await retentionClient.query(
+        `INSERT INTO tracegarden_correlation_suggestions (id, workspace_id, left_entry_id, right_entry_id, signals, status)
+         VALUES ('retention-protected-suggestion', 'workspace-single', $1, $2, ARRAY['time'], 'confirmed')`,
+        [protectedCandidate.entry.id, retentionExperiment.timelineEntryId],
+      );
+      await retentionClient.query(
+        `INSERT INTO tracegarden_confirmed_links (id, workspace_id, suggestion_id, left_entry_id, right_entry_id, confirmed_by_member_id)
+         VALUES ('retention-protected-link', 'workspace-single', 'retention-protected-suggestion', $1, $2, $3)`,
+        [protectedCandidate.entry.id, retentionExperiment.timelineEntryId, sessionBody.member.id],
+      );
+    } finally {
+      await retentionClient.end();
+    }
+    await retentionDatabase.timeline.updateRetentionPolicy("workspace-single", 1);
+    const retentionCleanup = await retentionDatabase.timeline.cleanupRetention("workspace-single", "2026-01-02T00:00:00.000Z");
+    assert.equal(retentionCleanup.deletedObservations, 1);
+    assert.equal(retentionCleanup.protectedObservations, 1);
+    assert.equal(retentionCleanup.deletedTimelineEntries, 1);
+    assert.equal(await retentionDatabase.timeline.getTimelineEntry("workspace-single", deletedCandidate.entry.id), null);
+    assert.ok(await retentionDatabase.timeline.getTimelineEntry("workspace-single", protectedCandidate.entry.id));
+    assert.equal((await retentionDatabase.timeline.cleanupRetention("workspace-single", "2026-01-02T00:00:00.000Z")).deletedObservations, 0);
+    await retentionDatabase.timeline.recordObservation(retentionObservation("retention-pg-partial", "2025-12-31T00:00:00.000Z"));
+    const retentionFailureClient = new pg.Client(databaseUrl);
+    await retentionFailureClient.connect();
+    try {
+      await retentionFailureClient.query("CREATE OR REPLACE FUNCTION tracegarden_test_fail_retention_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'retention delete failed'; END; $$; CREATE TRIGGER tracegarden_test_fail_retention_delete BEFORE DELETE ON tracegarden_observations FOR EACH ROW EXECUTE FUNCTION tracegarden_test_fail_retention_delete();");
+    } finally {
+      await retentionFailureClient.end();
+    }
+    const partialFailure = await retentionDatabase.timeline.cleanupRetention("workspace-single", "2026-01-02T00:00:00.000Z");
+    assert.equal(partialFailure.failures, 1);
+    assert.equal(partialFailure.deletedObservations, 0);
+    const retentionTriggerCleanupClient = new pg.Client(databaseUrl);
+    await retentionTriggerCleanupClient.connect();
+    try {
+      await retentionTriggerCleanupClient.query("DROP TRIGGER tracegarden_test_fail_retention_delete ON tracegarden_observations; DROP FUNCTION tracegarden_test_fail_retention_delete();");
+    } finally {
+      await retentionTriggerCleanupClient.end();
+    }
+    const recoveredPartialFailure = await retentionDatabase.timeline.cleanupRetention("workspace-single", "2026-01-02T00:00:00.000Z");
+    assert.equal(recoveredPartialFailure.failures, 0);
+    assert.equal(recoveredPartialFailure.deletedObservations, 1);
+    const retentionCleanupClient = new pg.Client(databaseUrl);
+    await retentionCleanupClient.connect();
+    try {
+      await retentionCleanupClient.query("DELETE FROM tracegarden_confirmed_links WHERE id = 'retention-protected-link'");
+      await retentionCleanupClient.query("DELETE FROM tracegarden_correlation_suggestions WHERE id = 'retention-protected-suggestion'");
+      await retentionCleanupClient.query("DELETE FROM tracegarden_experiments WHERE id = $1", [retentionExperiment.id]);
+      await retentionCleanupClient.query("DELETE FROM tracegarden_observations WHERE source_identity IN ('local-postgres-smoke:retention-pg-protected', 'local-postgres-smoke:retention-pg-boundary', 'local-postgres-smoke:retention-pg-partial')");
+    } finally {
+      await retentionCleanupClient.end();
+    }
+  } finally {
+    await retentionDatabase.close();
+  }
+  let failRetentionTransaction = true;
+  const failingRetentionClient = {
+    query: async (sql) => {
+      if (sql.includes("tracegarden_retention_policies") && (sql.includes("RETURNING") || sql.includes("SELECT workspace_id, retention_days"))) {
+        return { rows: [{ workspace_id: "workspace-single", retention_days: 1, updated_at: "2026-01-01T00:00:00.000Z" }], rowCount: 1 };
+      }
+      if (sql.startsWith("WITH candidates")) {
+        if (failRetentionTransaction) {
+          failRetentionTransaction = false;
+          throw new Error("simulated retention transaction failure");
+        }
+        return { rows: [{ candidates: "1", eligible_observations: "1", deleted_observations: "1" }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => {},
+  };
+  const failingRetentionPool = {
+    query: async (sql) => sql.includes("SELECT workspace_id, retention_days")
+      ? { rows: [{ workspace_id: "workspace-single", retention_days: 1, updated_at: "2026-01-01T00:00:00.000Z" }], rowCount: 1 }
+      : { rows: [], rowCount: 0 },
+    connect: async () => failingRetentionClient,
+  };
+  const failingRetentionStore = new PostgresObservationStore(async () => failingRetentionPool);
+  const failedRetentionCleanup = await failingRetentionStore.cleanupRetention("workspace-single", "2026-01-02T00:00:00.000Z");
+  assert.equal(failedRetentionCleanup.failures, 1);
+  assert.equal(failedRetentionCleanup.deletedObservations, 0);
+  const recoveredRetentionCleanup = await failingRetentionStore.cleanupRetention("workspace-single", "2026-01-02T00:00:00.000Z");
+  assert.equal(recoveredRetentionCleanup.failures, 0);
+  assert.equal(recoveredRetentionCleanup.deletedObservations, 1);
   const experimentCreateResponse = await fetch(`http://127.0.0.1:${webPort}/api/experiments`, {
     method: "POST",
     headers: { cookie: ownerCookie, "content-type": "application/json" },
@@ -905,6 +1037,204 @@ try {
     await rollbackTransactionClient.end();
     await rollbackNotificationClient.end();
   }
+
+  const refreshFailureObservation = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "refresh-failure", namespace: "tracegarden", uid: "pod-uid-refresh-failure", resourceVersion: "refresh-failure-1" },
+    status: { phase: "Running" },
+  }, "2099-12-01T00:00:00.000Z");
+  const originalRefreshCorrelationSuggestions = timelineStore.refreshCorrelationSuggestions;
+  const originalConsoleError = console.error;
+  const refreshErrors = [];
+  console.error = (...args) => refreshErrors.push(args.join(" "));
+  timelineStore.refreshCorrelationSuggestions = async () => {
+    throw new Error("refresh failure payload must not be logged");
+  };
+  let refreshFailureEntryId;
+  try {
+    const refreshFailureResult = await timelineStore.recordObservationsAndCheckpoint([refreshFailureObservation], {
+      workspaceId: observationScope.workspaceId,
+      clusterId: observationScope.clusterId,
+      namespace: "tracegarden",
+      resourceKind: "Pod",
+      resourceVersion: "refresh-failure-1",
+    });
+    assert.equal(refreshFailureResult[0]?.duplicate, false);
+    refreshFailureEntryId = refreshFailureResult[0]?.entry.id;
+  } finally {
+    timelineStore.refreshCorrelationSuggestions = originalRefreshCorrelationSuggestions;
+    console.error = originalConsoleError;
+  }
+  assert.deepEqual(refreshErrors, ["Tracegarden correlation refresh failed after durable persistence"]);
+  assert.doesNotMatch(refreshErrors.join(" "), /refresh-failure|payload/);
+  assert.equal((await timelineStore.getIngestionCheckpoint("workspace-single", observationScope.clusterId, "Pod", "tracegarden"))?.resourceVersion, "refresh-failure-1");
+  assert.ok(refreshFailureEntryId);
+  assert.ok(await timelineStore.getTimelineEntry("workspace-single", refreshFailureEntryId));
+
+  const concurrentNamespaces = ["concurrent-alpha", "concurrent-beta", "concurrent-gamma", "concurrent-delta", "concurrent-epsilon"];
+  const concurrentWrites = Promise.all(concurrentNamespaces.map((namespace, index) => {
+    const observation = normalizePodObservation({ ...observationScope, namespaces: [namespace] }, {
+      kind: "Pod",
+      metadata: { name: `concurrent-${index}`, namespace, uid: `pod-uid-concurrent-${index}`, resourceVersion: "1" },
+      status: { phase: "Running" },
+    }, "2099-12-02T00:00:00.000Z");
+    return timelineStore.recordObservationsAndCheckpoint([observation], {
+      workspaceId: observationScope.workspaceId,
+      clusterId: observationScope.clusterId,
+      namespace,
+      resourceKind: "Pod",
+      resourceVersion: "1",
+    });
+  }));
+  let concurrentTimeout;
+  const concurrentResults = await Promise.race([
+    concurrentWrites,
+    new Promise((_, reject) => {
+      concurrentTimeout = setTimeout(() => reject(new Error("concurrent namespace writes timed out")), 5000);
+    }),
+  ]);
+  clearTimeout(concurrentTimeout);
+  assert.equal(concurrentResults.length, concurrentNamespaces.length);
+  const concurrentCheckpoints = await Promise.all(concurrentNamespaces.map((namespace) => timelineStore.getIngestionCheckpoint("workspace-single", observationScope.clusterId, "Pod", namespace)));
+  assert.ok(concurrentCheckpoints.every((checkpoint) => checkpoint?.resourceVersion === "1"));
+
+  const originalExperimentRefreshCorrelationSuggestions = timelineStore.refreshCorrelationSuggestions;
+  const originalExperimentConsoleError = console.error;
+  const experimentRefreshErrors = [];
+  console.error = (...args) => experimentRefreshErrors.push(args.join(" "));
+  timelineStore.refreshCorrelationSuggestions = async () => {
+    throw new Error("experiment refresh payload must not be logged");
+  };
+  let refreshFailureExperiment;
+  let refreshFailureUpdatedExperiment;
+  try {
+    refreshFailureExperiment = await timelineStore.createExperiment("workspace-single", sessionBody.member.id, {
+      hypothesis: "deterministic refresh failure",
+      change: "test create persistence",
+      observation: "durable create",
+      conclusion: "",
+      state: "active",
+      tags: [],
+      workloads: [],
+      gitRevision: null,
+    });
+    refreshFailureUpdatedExperiment = await timelineStore.updateExperiment("workspace-single", refreshFailureExperiment.id, {
+      conclusion: "durable update",
+      state: "concluded",
+      tags: ["refresh-failure"],
+    });
+  } finally {
+    timelineStore.refreshCorrelationSuggestions = originalExperimentRefreshCorrelationSuggestions;
+    console.error = originalExperimentConsoleError;
+  }
+  assert.equal(refreshFailureExperiment.state, "active");
+  assert.equal(refreshFailureUpdatedExperiment?.state, "concluded");
+  assert.deepEqual(experimentRefreshErrors, [
+    "Tracegarden correlation refresh failed after durable persistence",
+    "Tracegarden correlation refresh failed after durable persistence",
+  ]);
+  assert.doesNotMatch(experimentRefreshErrors.join(" "), /deterministic|payload/);
+
+  const postCommitPool = collectorDatabase.pool;
+  assert.ok(postCommitPool);
+  const originalPostCommitPoolQuery = postCommitPool.query;
+  let postCommitPoolQueries = 0;
+  postCommitPool.query = async () => {
+    postCommitPoolQueries += 1;
+    throw new Error("post-commit readback payload must not be requested");
+  };
+  let noReadbackExperiment;
+  let noReadbackUpdatedExperiment;
+  try {
+    noReadbackExperiment = await timelineStore.createExperiment("workspace-single", sessionBody.member.id, {
+      hypothesis: "post-commit readback failure",
+      change: "test durable create",
+      observation: "no readback",
+      conclusion: "",
+      state: "active",
+      tags: [],
+      workloads: [],
+      gitRevision: null,
+    });
+    noReadbackUpdatedExperiment = await timelineStore.updateExperiment("workspace-single", noReadbackExperiment.id, {
+      conclusion: "no readback update",
+      state: "concluded",
+      tags: ["post-commit-readback"],
+    });
+  } finally {
+    postCommitPool.query = originalPostCommitPoolQuery;
+  }
+  assert.equal(postCommitPoolQueries, 0);
+  assert.equal(noReadbackExperiment.state, "active");
+  assert.equal(noReadbackUpdatedExperiment?.state, "concluded");
+  assert.equal((await timelineStore.getExperiment("workspace-single", noReadbackExperiment.id))?.state, "concluded");
+
+  let retentionGetterQueries = 0;
+  const retentionGetterFailurePool = {
+    query: async () => {
+      retentionGetterQueries += 1;
+      if (retentionGetterQueries === 2) throw new Error("injected retention readback failure");
+      return { rows: [{ workspace_id: "workspace-single", retention_days: 90, updated_at: "2026-01-01T00:00:00.000Z" }], rowCount: 1 };
+    },
+  };
+  const retentionGetterFailureStore = new PostgresObservationStore(async () => retentionGetterFailurePool);
+  const injectedFailurePolicy = await retentionGetterFailureStore.getRetentionPolicy("workspace-single");
+  assert.equal(injectedFailurePolicy.retentionDays, 90);
+  assert.equal(retentionGetterQueries, 1);
+
+  const retentionConcurrencyClient = new pg.Client(databaseUrl);
+  await retentionConcurrencyClient.connect();
+  try {
+    await retentionConcurrencyClient.query("DELETE FROM tracegarden_retention_policies WHERE workspace_id = 'workspace-single'");
+  } finally {
+    await retentionConcurrencyClient.end();
+  }
+  const concurrentRetentionPolicies = await Promise.all(Array.from({ length: 5 }, () => timelineStore.getRetentionPolicy("workspace-single")));
+  assert.deepEqual(concurrentRetentionPolicies.map((policy) => policy.retentionDays), [90, 90, 90, 90, 90]);
+  const retentionCountClient = new pg.Client(databaseUrl);
+  await retentionCountClient.connect();
+  try {
+    const retentionCount = await retentionCountClient.query("SELECT count(*)::text AS count FROM tracegarden_retention_policies WHERE workspace_id = 'workspace-single'");
+    assert.equal(retentionCount.rows[0]?.count, "1");
+  } finally {
+    await retentionCountClient.end();
+  }
+
+  const concurrentExperimentCreates = Promise.all(Array.from({ length: 5 }, (_, index) => timelineStore.createExperiment("workspace-single", sessionBody.member.id, {
+    hypothesis: `concurrent create ${index}`,
+    change: "pool-size-five create",
+    observation: "durable create",
+    conclusion: "",
+    state: "active",
+    tags: [],
+    workloads: [],
+    gitRevision: null,
+  })));
+  let concurrentExperimentCreateTimeout;
+  const concurrentCreatedExperiments = await Promise.race([
+    concurrentExperimentCreates,
+    new Promise((_, reject) => {
+      concurrentExperimentCreateTimeout = setTimeout(() => reject(new Error("concurrent experiment creates timed out")), 5000);
+    }),
+  ]);
+  clearTimeout(concurrentExperimentCreateTimeout);
+  assert.equal(concurrentCreatedExperiments.length, 5);
+
+  const concurrentExperimentUpdates = Promise.all(concurrentCreatedExperiments.map((createdExperiment, index) => timelineStore.updateExperiment("workspace-single", createdExperiment.id, {
+    conclusion: `concurrent update ${index}`,
+    state: "concluded",
+    tags: ["pool-size-five"],
+  })));
+  let concurrentExperimentUpdateTimeout;
+  const concurrentUpdatedExperiments = await Promise.race([
+    concurrentExperimentUpdates,
+    new Promise((_, reject) => {
+      concurrentExperimentUpdateTimeout = setTimeout(() => reject(new Error("concurrent experiment updates timed out")), 5000);
+    }),
+  ]);
+  clearTimeout(concurrentExperimentUpdateTimeout);
+  assert.equal(concurrentUpdatedExperiments.length, 5);
+  assert.ok(concurrentUpdatedExperiments.every((experiment) => experiment?.state === "concluded"));
 
   productionWeb = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
     env: {

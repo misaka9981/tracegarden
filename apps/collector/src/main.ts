@@ -24,6 +24,7 @@ import {
   type TimelineStore,
 } from "../../../packages/db/src/index.js";
 import { WORKSPACE_ID } from "../../../packages/identity/src/index.js";
+import type { RetentionStore } from "../../../packages/domain/src/index.js";
 
 export type CollectorBackoffPolicy = Readonly<{
   initialDelayMs: number;
@@ -51,6 +52,8 @@ export type CollectorSignals = Readonly<{
   failedNamespaces: readonly string[];
 }>;
 
+export type CollectorRetentionScheduler = (task: () => void, intervalMs: number) => () => void;
+
 export type CollectorOptions = Readonly<{
   port?: number;
   host?: string;
@@ -59,10 +62,13 @@ export type CollectorOptions = Readonly<{
   adapter?: KubernetesObservationAdapter;
   database?: DatabaseBoundary;
   observationStore?: TimelineStore;
+  retentionStore?: RetentionStore;
   collectOnStart?: boolean;
   backoff?: Partial<CollectorBackoffPolicy>;
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   now?: () => Date;
+  retentionCleanupIntervalMs?: number;
+  retentionCleanupScheduler?: CollectorRetentionScheduler;
 }>;
 
 export type CollectorWatchOptions = Readonly<{
@@ -187,6 +193,14 @@ function checkpointIdentity(scope: ClusterScope, namespace: string): Omit<Ingest
   };
 }
 
+function hasRetentionStore(value: unknown): value is RetentionStore {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<RetentionStore>;
+  return typeof candidate.getRetentionPolicy === "function"
+    && typeof candidate.updateRetentionPolicy === "function"
+    && typeof candidate.cleanupRetention === "function";
+}
+
 function isGone(error: unknown): boolean {
   return error instanceof KubernetesWatchGoneError
     || (typeof error === "object" && error !== null
@@ -220,10 +234,19 @@ function shouldAdvanceResourceVersion(candidate: string, current: string | null)
 
 export async function createCollectorRuntime(options: CollectorOptions = {}): Promise<CollectorRuntime> {
   const environment = options.environment ?? process.env;
+  const production = environment.NODE_ENV === "production";
+  if (production && (options.database || options.observationStore || options.retentionStore)) {
+    throw new Error("Production collector stores must be database-owned");
+  }
   const adapter = options.adapter ?? createKubernetesAdapter(environment);
-  const ownsDatabase = !options.database && !options.observationStore && Boolean(environment.DATABASE_URL);
+  const ownsDatabase = !options.database && !options.observationStore && !options.retentionStore && Boolean(environment.DATABASE_URL);
   const database = options.database ?? (ownsDatabase ? createDatabase(environment) : undefined);
   const observationStore = options.observationStore ?? database?.timeline;
+  const retentionStore = options.retentionStore ?? database?.retention ?? (hasRetentionStore(observationStore) ? observationStore : undefined);
+  if (production && (!ownsDatabase || database?.kind !== "postgres" || !database.timeline || !database.retention || observationStore !== database.timeline || retentionStore !== database.retention || !hasRetentionStore(retentionStore))) {
+    if (ownsDatabase) await database?.close();
+    throw new Error("Production collector requires database-owned observation and retention stores");
+  }
   if (database) {
     try {
       await database.migrate();
@@ -246,6 +269,11 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   }
   const now = options.now ?? (() => new Date());
   const sleep = options.sleep ?? defaultSleep;
+  const configuredRetentionInterval = options.retentionCleanupIntervalMs
+    ?? (environment.RETENTION_CLEANUP_INTERVAL_MS ? Number(environment.RETENTION_CLEANUP_INTERVAL_MS) : 24 * 60 * 60 * 1000);
+  if (!Number.isSafeInteger(configuredRetentionInterval) || configuredRetentionInterval <= 0) {
+    throw new Error("Invalid retention cleanup interval");
+  }
   const signalState = {
     lagSeconds: 0,
     reconnects: 0,
@@ -270,6 +298,22 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   let stopping = false;
   const shutdownController = new AbortController();
   let activeWatch: Promise<void> | null = null;
+  let activeRetentionCleanup: Promise<void> | null = null;
+  let cancelRetentionCleanup: (() => void) | undefined;
+  const runScheduledRetentionCleanup = async (): Promise<void> => {
+    if (!retentionStore || stopping) return;
+    try {
+      const result = await retentionStore.cleanupRetention(WORKSPACE_ID, now());
+      if (result.failures > 0) console.error(`Tracegarden retention cleanup failed; failures: ${result.failures}`);
+    } catch {
+      console.error("Tracegarden retention cleanup failed; retrying on the next schedule");
+    }
+  };
+  const scheduleRetentionCleanup = options.retentionCleanupScheduler ?? ((task: () => void, intervalMs: number): (() => void) => {
+    const timer = setInterval(task, intervalMs);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  });
 
   const configuredScope = async (): Promise<ClusterScope | null> => options.scope ?? await database?.clusterScope?.get(WORKSPACE_ID) ?? null;
 
@@ -563,6 +607,15 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   const port = options.port ?? Number(environment.COLLECTOR_PORT ?? "3001");
   const host = options.host ?? environment.HOST ?? "127.0.0.1";
   await new Promise<void>((resolve) => server.listen(port, host, resolve));
+  if (retentionStore) {
+    cancelRetentionCleanup = scheduleRetentionCleanup(() => {
+      const run = runScheduledRetentionCleanup();
+      activeRetentionCleanup = run;
+      void run.finally(() => {
+        if (activeRetentionCleanup === run) activeRetentionCleanup = null;
+      });
+    }, configuredRetentionInterval);
+  }
   return {
     server,
     status: runtimeStatus,
@@ -573,9 +626,12 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     runWatch,
     close: async () => {
       stopping = true;
+      cancelRetentionCleanup?.();
+      cancelRetentionCleanup = undefined;
       shutdownController.abort();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await activeWatch?.catch(() => undefined);
+      await activeRetentionCleanup?.catch(() => undefined);
       if (ownsDatabase) await database?.close();
     },
   };

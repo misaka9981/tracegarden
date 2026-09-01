@@ -48,7 +48,9 @@ import {
 } from "../../cluster/src/index.js";
 import {
   createExperimentRecord,
+  DEFAULT_RETENTION_DAYS,
   ExperimentValidationError,
+  parseRetentionDays,
   updateExperimentRecord,
   suggestCorrelationCandidates,
   type ConfirmedLinkRecord,
@@ -60,6 +62,9 @@ import {
   type ExperimentRecord,
   type ExperimentState,
   type ExperimentWorkload,
+  type RetentionCleanupResult,
+  type RetentionPolicy,
+  type RetentionStore,
 } from "../../domain/src/index.js";
 
 export type DatabaseStatus = "ready" | "not-ready";
@@ -70,6 +75,7 @@ export interface DatabaseBoundary {
   readonly clusterScope?: ClusterScopeStore;
   readonly timeline?: TimelineStore;
   readonly experiments?: ExperimentStore;
+  readonly retention?: RetentionStore;
   migrate(): Promise<void>;
   ping(): Promise<boolean>;
   close(): Promise<void>;
@@ -88,6 +94,7 @@ export const TIMELINE_ATTENTION_MIGRATION_ID = "0010_timeline_attention";
 export const STRUCTURED_EXPERIMENTS_MIGRATION_ID = "0011_structured_experiments";
 export const CORRELATION_LINKS_MIGRATION_ID = "0012_correlation_links";
 export const LIVE_TIMELINE_MIGRATION_ID = "0013_live_timeline";
+export const OBSERVATION_RETENTION_MIGRATION_ID = "0014_observation_retention";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -105,6 +112,7 @@ const migrations: readonly Migration[] = [
   { id: STRUCTURED_EXPERIMENTS_MIGRATION_ID, path: "../migrations/0011_structured_experiments.sql" },
   { id: CORRELATION_LINKS_MIGRATION_ID, path: "../migrations/0012_correlation_links.sql" },
   { id: LIVE_TIMELINE_MIGRATION_ID, path: "../migrations/0013_live_timeline.sql" },
+  { id: OBSERVATION_RETENTION_MIGRATION_ID, path: "../migrations/0014_observation_retention.sql" },
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -576,6 +584,9 @@ export interface TimelineStore {
   getCorrelationSuggestion?(workspaceId: string, id: string): Promise<CorrelationSuggestionRecord | null>;
   decideCorrelationSuggestion?(workspaceId: string, id: string, memberId: string, decision: CorrelationDecision): Promise<CorrelationDecisionResult | null>;
   listConfirmedLinks?(workspaceId: string, entryId?: string): Promise<readonly ConfirmedLinkRecord[]>;
+  getRetentionPolicy?(workspaceId: string): Promise<RetentionPolicy>;
+  updateRetentionPolicy?(workspaceId: string, retentionDays: unknown): Promise<RetentionPolicy>;
+  cleanupRetention?(workspaceId: string, now?: Date | string): Promise<RetentionCleanupResult>;
 }
 
 export function isAttentionObservation(observation: Pick<NormalizedObservation, "attention">): boolean {
@@ -716,6 +727,7 @@ export class MemoryObservationStore implements TimelineStore, TimelineNotificati
   private readonly attentionReviews = new Set<string>();
   private readonly correlationSuggestions = new Map<string, CorrelationSuggestionRecord>();
   private readonly confirmedLinks = new Map<string, ConfirmedLinkRecord>();
+  private readonly retentionPolicies = new Map<string, RetentionPolicy>();
   private readonly timelineListeners = new Set<TimelineNotificationListener>();
 
   private readonly cursorSecret: string;
@@ -1042,6 +1054,66 @@ export class MemoryObservationStore implements TimelineStore, TimelineNotificati
   async countTimelineEntries(workspaceId: string): Promise<number> {
     return [...this.entries.values()].filter((entry) => entry.workspaceId === workspaceId).length;
   }
+
+  async getRetentionPolicy(workspaceId: string): Promise<RetentionPolicy> {
+    if (!workspaceId.trim()) throw new Error("Retention Workspace is required");
+    const existing = this.retentionPolicies.get(workspaceId);
+    if (existing) return { ...existing };
+    const policy: RetentionPolicy = {
+      workspaceId,
+      retentionDays: DEFAULT_RETENTION_DAYS,
+      updatedAt: new Date().toISOString(),
+    };
+    this.retentionPolicies.set(workspaceId, policy);
+    return { ...policy };
+  }
+
+  async updateRetentionPolicy(workspaceId: string, retentionDays: unknown): Promise<RetentionPolicy> {
+    if (!workspaceId.trim()) throw new Error("Retention Workspace is required");
+    const policy: RetentionPolicy = {
+      workspaceId,
+      retentionDays: parseRetentionDays(retentionDays),
+      updatedAt: new Date().toISOString(),
+    };
+    this.retentionPolicies.set(workspaceId, policy);
+    return { ...policy };
+  }
+
+  async cleanupRetention(workspaceId: string, now: Date | string = new Date()): Promise<RetentionCleanupResult> {
+    const policy = await this.getRetentionPolicy(workspaceId);
+    const cleanupAt = now instanceof Date ? now : new Date(now);
+    if (!Number.isFinite(cleanupAt.getTime())) throw new Error("Retention cleanup time is invalid");
+    const cutoff = new Date(cleanupAt.getTime() - policy.retentionDays * 24 * 60 * 60 * 1000);
+    const protectedEntryIds = new Set([...this.confirmedLinks.values()].flatMap((link) => [link.leftEntryId, link.rightEntryId]));
+    const candidates = [...this.entries.values()]
+      .filter((entry): entry is StoredTimelineEntry & { entryType: "observation" } => entry.entryType === "observation")
+      .filter((entry) => entry.workspaceId === workspaceId && Date.parse(entry.occurredAt) < cutoff.getTime());
+    const protectedObservations = candidates.filter((entry) => protectedEntryIds.has(entry.id)).length;
+    const eligible = candidates.filter((entry) => !protectedEntryIds.has(entry.id));
+    const deletedEntryIds = new Set(eligible.map((entry) => entry.id));
+    for (const entry of eligible) this.entries.delete(entry.id);
+    const deletedObservationKeys = new Set(eligible.map((entry) => observationKey(entry.observation)));
+    for (const key of deletedObservationKeys) {
+      this.observations.delete(key);
+      this.ingestionOrders.delete(key);
+    }
+    for (const key of this.attentionReviews) if ([...deletedEntryIds].some((entryId) => key.startsWith(`${entryId}\u0000`))) this.attentionReviews.delete(key);
+    for (const [key, suggestion] of this.correlationSuggestions) {
+      if (deletedEntryIds.has(suggestion.leftEntryId) || deletedEntryIds.has(suggestion.rightEntryId)) this.correlationSuggestions.delete(key);
+    }
+    return {
+      workspaceId,
+      retentionDays: policy.retentionDays,
+      cutoff: cutoff.toISOString(),
+      eligibleObservations: eligible.length,
+      protectedObservations,
+      deletedObservations: eligible.length,
+      deletedTimelineEntries: eligible.length,
+      failures: 0,
+      failureCount: 0,
+      retryable: true,
+    };
+  }
 }
 
 export const MemoryTimelineStore = MemoryObservationStore;
@@ -1098,6 +1170,20 @@ export class PostgresClusterScopeStore implements ClusterScopeStore {
     if (!row) throw new Error("Cluster scope persistence returned no row");
     return clusterFromRow(row);
   }
+}
+
+type RetentionPolicyRow = Readonly<{
+  workspace_id: string;
+  retention_days: number;
+  updated_at: string | Date;
+}>;
+
+function retentionPolicyFromRow(row: RetentionPolicyRow): RetentionPolicy {
+  return {
+    workspaceId: row.workspace_id,
+    retentionDays: row.retention_days,
+    updatedAt: timestamp(row.updated_at) ?? new Date(0).toISOString(),
+  };
 }
 
 type ObservationRow = Readonly<{
@@ -1706,10 +1792,19 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
     return result;
   }
 
+  private async refreshCorrelationSuggestionsBestEffort(workspaceId: string): Promise<void> {
+    try {
+      await this.refreshCorrelationSuggestions(workspaceId);
+    } catch {
+      console.error("Tracegarden correlation refresh failed after durable persistence");
+    }
+  }
+
   async recordObservations(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]> {
     if (observations.length === 0) return [];
     const pool = await this.poolProvider();
     const client = await pool.connect();
+    let results: ObservationPersistenceResult[];
     try {
       await client.query("BEGIN");
       await client.query(timelineWriterLock);
@@ -1723,17 +1818,19 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
           [observation.workspaceId, observation.clusterId, observation.sourceIdentity],
         );
       }
-      const results: ObservationPersistenceResult[] = [];
+      results = [];
       for (const observation of observations) results.push(await this.recordObservationInTransaction(client, observation));
       await client.query("COMMIT");
-      for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) await this.refreshCorrelationSuggestions(workspaceId);
-      return results;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw new Error("Tracegarden observation persistence failed", { cause: error });
     } finally {
       client.release();
     }
+    for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) {
+      await this.refreshCorrelationSuggestionsBestEffort(workspaceId);
+    }
+    return results;
   }
 
   async recordObservationsAndCheckpoint(
@@ -1742,21 +1839,24 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
   ): Promise<readonly ObservationPersistenceResult[]> {
     const pool = await this.poolProvider();
     const client = await pool.connect();
+    let results: ObservationPersistenceResult[];
     try {
       await client.query("BEGIN");
       await client.query(timelineWriterLock);
-      const results: ObservationPersistenceResult[] = [];
+      results = [];
       for (const observation of observations) results.push(await this.recordObservationInTransaction(client, observation));
       await this.saveCheckpointInTransaction(client, checkpoint);
       await client.query("COMMIT");
-      for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) await this.refreshCorrelationSuggestions(workspaceId);
-      return results;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw new Error("Tracegarden observation checkpoint persistence failed", { cause: error });
     } finally {
       client.release();
     }
+    for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) {
+      await this.refreshCorrelationSuggestionsBestEffort(workspaceId);
+    }
+    return results;
   }
 
   async getIngestionCheckpoint(workspaceId: string, clusterId: string, resourceKind: string, namespace: string): Promise<IngestionCheckpoint | null> {
@@ -1843,13 +1943,6 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
         [timelineEntryId, workspaceId, experiment.workloads[0]?.clusterId ?? null, experiment.id, experiment.createdAt],
       );
       await client.query("COMMIT");
-      const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.id = $1`, [timelineEntryId]);
-      const row = result.rows[0];
-      if (!row) throw new Error("Experiment persistence returned no row");
-      const entry = timelineEntryFromRow(row);
-      if (entry.entryType !== "experiment") throw new Error("Experiment persistence returned the wrong Timeline entry");
-      await this.refreshCorrelationSuggestions(workspaceId);
-      return cloneExperiment(entry.experiment);
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       if (error instanceof ExperimentValidationError) throw error;
@@ -1857,11 +1950,14 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
     } finally {
       client.release();
     }
+    await this.refreshCorrelationSuggestionsBestEffort(workspaceId);
+    return cloneExperiment(experiment);
   }
 
   async updateExperiment(workspaceId: string, id: string, input: unknown): Promise<ExperimentRecord | null> {
     const pool = await this.poolProvider();
     const client = await pool.connect();
+    let updated: ExperimentRecord | undefined;
     try {
       await client.query("BEGIN");
       await client.query(timelineWriterLock);
@@ -1877,7 +1973,7 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
       const currentRow = currentResult.rows[0];
       if (!currentRow || currentRow.entry_type !== "experiment") throw new Error("Experiment Timeline entry is missing");
       const current = experimentFromTimelineRow(currentRow);
-      const updated = updateExperimentRecord(current, input);
+      updated = updateExperimentRecord(current, input);
       await validateExperimentClustersInDatabase(client, workspaceId, updated.workloads);
       await client.query(
         `UPDATE tracegarden_experiments
@@ -1901,13 +1997,6 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
         [updated.workloads[0]?.clusterId ?? null, current.timelineEntryId, workspaceId],
       );
       await client.query("COMMIT");
-      const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.experiment_id = $1 AND t.workspace_id = $2`, [id, workspaceId]);
-      const row = result.rows[0];
-      if (!row) throw new Error("Experiment update returned no row");
-      const entry = timelineEntryFromRow(row);
-      if (entry.entryType !== "experiment") throw new Error("Experiment update returned the wrong Timeline entry");
-      await this.refreshCorrelationSuggestions(workspaceId);
-      return cloneExperiment(entry.experiment);
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       if (error instanceof Error && (error.name === "ExperimentValidationError" || error.name === "ExperimentLifecycleError")) throw error;
@@ -1915,6 +2004,9 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
     } finally {
       client.release();
     }
+    if (!updated) throw new Error("Experiment update returned no row");
+    await this.refreshCorrelationSuggestionsBestEffort(workspaceId);
+    return cloneExperiment(updated);
   }
 
   async getExperiment(workspaceId: string, id: string): Promise<ExperimentRecord | null> {
@@ -1940,24 +2032,24 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
     }));
   }
 
-  private async allTimelineEntriesForCorrelation(workspaceId: string): Promise<readonly TimelineEntry[]> {
-    const entries: TimelineEntry[] = [];
-    let cursor: string | undefined;
-    while (true) {
-      const page = await this.listTimelineEntries(workspaceId, { limit: 100, ...(cursor ? { cursor } : {}) });
-      entries.push(...page.entries);
-      if (!page.nextCursor) return entries;
-      cursor = page.nextCursor;
-    }
+  private async allTimelineEntriesForCorrelation(
+    client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[] }> },
+    workspaceId: string,
+  ): Promise<readonly TimelineEntry[]> {
+    const result = await client.query<TimelineJoinRow>(
+      `${timelineSelect} WHERE t.workspace_id = $1 ORDER BY t.timeline_sequence`,
+      [workspaceId],
+    );
+    return result.rows.map(timelineEntryFromRow);
   }
 
   private async refreshCorrelationSuggestions(workspaceId: string): Promise<void> {
-    const candidates = suggestCorrelationCandidates((await this.allTimelineEntriesForCorrelation(workspaceId)).map(correlationEntryFor));
-    if (candidates.length === 0) return;
     const pool = await this.poolProvider();
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query(timelineWriterLock);
+      const candidates = suggestCorrelationCandidates((await this.allTimelineEntriesForCorrelation(client, workspaceId)).map(correlationEntryFor));
       for (const candidate of candidates) {
         await client.query(
           `INSERT INTO tracegarden_correlation_suggestions
@@ -2010,6 +2102,7 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query(timelineWriterLock);
       const result = await client.query<CorrelationSuggestionRow>(
         `SELECT id, workspace_id, left_entry_id, right_entry_id, signals, status, created_at, decided_at, decided_by_member_id
            FROM tracegarden_correlation_suggestions
@@ -2222,6 +2315,129 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
     const result = await pool.query<{ count: string }>("SELECT count(*)::text AS count FROM tracegarden_timeline_entries WHERE workspace_id = $1", [workspaceId]);
     return Number(result.rows[0]?.count ?? "0");
   }
+
+  private async retentionPolicyInTransaction(
+    client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[] }> },
+    workspaceId: string,
+  ): Promise<RetentionPolicy> {
+    const result = await client.query<RetentionPolicyRow>(
+      `INSERT INTO tracegarden_retention_policies (workspace_id)
+       VALUES ($1)
+       ON CONFLICT (workspace_id) DO UPDATE SET workspace_id = EXCLUDED.workspace_id
+       RETURNING workspace_id, retention_days, updated_at`,
+      [workspaceId],
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("Retention policy persistence returned no row");
+    return retentionPolicyFromRow(row);
+  }
+
+  async getRetentionPolicy(workspaceId: string): Promise<RetentionPolicy> {
+    if (!workspaceId.trim()) throw new Error("Retention Workspace is required");
+    const pool = await this.poolProvider();
+    return this.retentionPolicyInTransaction(pool, workspaceId);
+  }
+
+  async updateRetentionPolicy(workspaceId: string, retentionDays: unknown): Promise<RetentionPolicy> {
+    if (!workspaceId.trim()) throw new Error("Retention Workspace is required");
+    const days = parseRetentionDays(retentionDays);
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(timelineWriterLock);
+      const result = await client.query<RetentionPolicyRow>(
+        `INSERT INTO tracegarden_retention_policies (workspace_id, retention_days, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (workspace_id) DO UPDATE SET retention_days = EXCLUDED.retention_days, updated_at = now()
+         RETURNING workspace_id, retention_days, updated_at`,
+        [workspaceId, days],
+      );
+      const row = result.rows[0];
+      if (!row) throw new Error("Retention policy update returned no row");
+      await client.query("COMMIT");
+      return retentionPolicyFromRow(row);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async cleanupRetention(workspaceId: string, now: Date | string = new Date()): Promise<RetentionCleanupResult> {
+    if (!workspaceId.trim()) throw new Error("Retention Workspace is required");
+    const cleanupAt = now instanceof Date ? now : new Date(now);
+    if (!Number.isFinite(cleanupAt.getTime())) throw new Error("Retention cleanup time is invalid");
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    let policy: RetentionPolicy | undefined;
+    let cutoff = new Date(cleanupAt.getTime() - DEFAULT_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    try {
+      await client.query("BEGIN");
+      await client.query(timelineWriterLock);
+      policy = await this.retentionPolicyInTransaction(client, workspaceId);
+      cutoff = new Date(cleanupAt.getTime() - policy.retentionDays * 24 * 60 * 60 * 1000).toISOString();
+      const result = await client.query<{ candidates: string; eligible_observations: string; deleted_observations: string }>(
+        `WITH candidates AS MATERIALIZED (
+           SELECT o.id, t.id AS entry_id
+             FROM tracegarden_observations o
+             JOIN tracegarden_timeline_entries t ON t.observation_id = o.id
+            WHERE o.workspace_id = $1 AND o.observed_at < $2::timestamptz
+         ), eligible AS MATERIALIZED (
+           SELECT candidates.id
+             FROM candidates
+            WHERE NOT EXISTS (
+              SELECT 1 FROM tracegarden_confirmed_links link
+               WHERE link.workspace_id = $1
+                 AND (link.left_entry_id = candidates.entry_id OR link.right_entry_id = candidates.entry_id)
+            )
+         ), deleted AS (
+           DELETE FROM tracegarden_observations o
+            USING eligible e
+            WHERE o.id = e.id
+            RETURNING o.id
+         )
+         SELECT (SELECT count(*)::text FROM candidates) AS candidates,
+                (SELECT count(*)::text FROM eligible) AS eligible_observations,
+                (SELECT count(*)::text FROM deleted) AS deleted_observations`,
+        [workspaceId, cutoff],
+      );
+      await client.query("COMMIT");
+      const row = result.rows[0];
+      const candidates = Number(row?.candidates ?? "0");
+      const eligibleObservations = Number(row?.eligible_observations ?? "0");
+      const deletedObservations = Number(row?.deleted_observations ?? "0");
+      return {
+        workspaceId,
+        retentionDays: policy.retentionDays,
+        cutoff,
+        eligibleObservations,
+        protectedObservations: Math.max(0, candidates - eligibleObservations),
+        deletedObservations,
+        deletedTimelineEntries: deletedObservations,
+        failures: 0,
+        failureCount: 0,
+        retryable: true,
+      };
+    } catch {
+      await client.query("ROLLBACK").catch(() => undefined);
+      return {
+        workspaceId,
+        retentionDays: policy?.retentionDays ?? DEFAULT_RETENTION_DAYS,
+        cutoff,
+        eligibleObservations: 0,
+        protectedObservations: 0,
+        deletedObservations: 0,
+        deletedTimelineEntries: 0,
+        failures: 1,
+        failureCount: 1,
+        retryable: true,
+      };
+    } finally {
+      client.release();
+    }
+  }
 }
 
 type MemberRow = Readonly<{
@@ -2341,6 +2557,10 @@ export class PostgresAdmissionStore implements AdmissionStore, MembershipStore, 
       await client.query(
         "INSERT INTO tracegarden_workspaces (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
         [WORKSPACE_ID, "Tracegarden Workspace"],
+      );
+      await client.query(
+        "INSERT INTO tracegarden_retention_policies (workspace_id) VALUES ($1) ON CONFLICT (workspace_id) DO NOTHING",
+        [WORKSPACE_ID],
       );
       const existing = await client.query<MemberRow>(
         `SELECT m.id AS member_id, m.workspace_id, m.role,
@@ -2627,6 +2847,7 @@ export class PostgresDatabase implements DatabaseBoundary {
   readonly clusterScope: ClusterScopeStore;
   readonly timeline: PostgresObservationStore;
   readonly experiments: ExperimentStore;
+  readonly retention: RetentionStore;
 
   constructor(
     private readonly connectionString: string,
@@ -2639,6 +2860,7 @@ export class PostgresDatabase implements DatabaseBoundary {
     this.clusterScope = new PostgresClusterScopeStore(poolProvider);
     this.timeline = new PostgresObservationStore(poolProvider, cursorSecret);
     this.experiments = this.timeline;
+    this.retention = this.timeline;
   }
 
   private async getPool(): Promise<Pool> {
@@ -2729,6 +2951,7 @@ export class MemoryDatabase implements DatabaseBoundary {
   readonly clusterScope: MemoryClusterScopeStore;
   readonly timeline: MemoryObservationStore;
   readonly experiments: ExperimentStore;
+  readonly retention: RetentionStore;
   private migrationReady = false;
 
   constructor(bootstrapIdentity: BootstrapIdentity = DEFAULT_LOCAL_BOOTSTRAP) {
@@ -2736,6 +2959,7 @@ export class MemoryDatabase implements DatabaseBoundary {
     this.clusterScope = new MemoryClusterScopeStore();
     this.timeline = new MemoryObservationStore(this.clusterScope);
     this.experiments = this.timeline;
+    this.retention = this.timeline;
   }
 
   async migrate(): Promise<void> {

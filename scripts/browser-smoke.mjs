@@ -70,12 +70,20 @@ try {
   assert.match(await page.locator("body").innerText(), /owner@example.test/);
   assert.match(await page.locator("body").innerText(), /Recent Log Window/);
   assert.match(await page.locator("body").innerText(), /logs:read/);
+  assert.match(await page.locator("body").innerText(), /Observation 保留策略/);
+  assert.equal(await page.locator("#retention-days").inputValue(), "90");
+  await page.locator("#retention-days").fill("30");
+  await page.getByRole("button", { name: "保存保留策略" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Observation 保留策略已保存/);
+  assert.equal(await page.locator("#retention-days").inputValue(), "30");
 
   await page.goto(`http://127.0.0.1:${port}/app?lang=en`, { waitUntil: "domcontentloaded" });
   assert.equal(await page.title(), "Tracegarden · Shared Workspace");
   assert.equal(await page.locator("html").getAttribute("lang"), "en");
   assert.match(await page.locator("h1").innerText(), /Shared Workspace/);
   assert.match(await page.locator("body").innerText(), /workspace:read/);
+  assert.match(await page.locator("body").innerText(), /Observation retention/);
 
   await page.goto(`http://127.0.0.1:${port}/app?lang=zh-CN`, { waitUntil: "domcontentloaded" });
   await page.getByLabel("假设").fill("**浏览器假设**");
@@ -135,6 +143,12 @@ try {
   assert.equal(await page.locator('textarea[name="hypothesis"]').count(), 0);
   assert.equal(await page.getByRole("button", { name: "Create Experiment" }).count(), 0);
   assert.equal(await page.locator('a[href^="/members"]').count(), 0);
+  assert.match(await page.locator("body").innerText(), /You do not have the Capability to manage Observation retention/);
+  assert.equal(await page.getByRole("button", { name: "Save retention policy" }).count(), 0);
+  const viewerRetentionAttempt = await page.evaluate(async () => (await fetch("/api/retention", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ retentionDays: 7 }) })).status);
+  assert.equal(viewerRetentionAttempt, 403);
+  const viewerCleanupAttempt = await page.evaluate(async () => (await fetch("/api/retention/cleanup", { method: "POST" })).status);
+  assert.equal(viewerCleanupAttempt, 403);
   const viewerInvitationAttempt = await page.evaluate(async () => (await fetch("/api/invitations", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: "another@example.test" }) })).status);
   assert.equal(viewerInvitationAttempt, 403);
   const viewerRoleAttempt = await page.evaluate(async () => (await fetch("/api/members/not-authorized/role", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ role: "owner" }) })).status);
@@ -152,6 +166,9 @@ try {
   await page.locator("#identity").selectOption("owner");
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.waitForLoadState("domcontentloaded");
+  await page.getByRole("button", { name: "Run cleanup" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Cleanup complete: eligible 0, protected 0, deleted 0 Observations/);
   await page.goto(`http://127.0.0.1:${port}/members?lang=en`, { waitUntil: "domcontentloaded" });
   const invitedRole = page.locator('select[aria-label="Role: invited@example.test"]');
   await invitedRole.selectOption("operator");

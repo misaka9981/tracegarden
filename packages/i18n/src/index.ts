@@ -149,6 +149,17 @@ export type Messages = Readonly<{
   correlationReviewDenied: string;
   confirmedLink: string;
   confirmedBy: string;
+  retentionTitle: string;
+  retentionDescription: string;
+  retentionDays: string;
+  saveRetention: string;
+  runRetentionCleanup: string;
+  retentionSaved: string;
+  retentionCleanupComplete: string;
+  retentionCleanupFailed: string;
+  retentionManageDenied: string;
+  retentionUnavailable: string;
+  retentionInvalid: string;
 }>;
 
 export const catalogs: Readonly<Record<Language, Messages>> = {
@@ -311,6 +322,17 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     correlationReviewDenied: "你没有审核 Correlation Suggestion 的 Capability。",
     confirmedLink: "Confirmed Link",
     confirmedBy: "确认 Member",
+    retentionTitle: "Observation 保留策略",
+    retentionDescription: "普通 Observation 按 Workspace 策略保留；Experiments 和参与 Confirmed Link 的 Timeline Entry 不会被例行清理。",
+    retentionDays: "保留天数",
+    saveRetention: "保存保留策略",
+    runRetentionCleanup: "运行清理",
+    retentionSaved: "Observation 保留策略已保存。",
+    retentionCleanupComplete: "清理完成：符合条件 {eligible} 个，保留受保护 {protected} 个，删除 {deleted} 个 Observation 和 {entries} 个 Timeline Entry；失败 {failures}。",
+    retentionCleanupFailed: "清理未完成；没有删除记录，可安全重试。",
+    retentionManageDenied: "你没有管理 Observation 保留策略的 Capability。",
+    retentionUnavailable: "Observation 保留服务当前不可用。",
+    retentionInvalid: "Observation 保留策略无效，请输入有效的天数。",
   },
   en: {
     appName: "Tracegarden",
@@ -471,6 +493,17 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     correlationReviewDenied: "You do not have the Capability to review Correlation Suggestions.",
     confirmedLink: "Confirmed Link",
     confirmedBy: "Confirming Member",
+    retentionTitle: "Observation retention",
+    retentionDescription: "Ordinary Observations follow the Workspace policy; Experiments and Timeline Entries in Confirmed Links survive routine cleanup.",
+    retentionDays: "Retention days",
+    saveRetention: "Save retention policy",
+    runRetentionCleanup: "Run cleanup",
+    retentionSaved: "Observation retention policy saved.",
+    retentionCleanupComplete: "Cleanup complete: eligible {eligible}, protected {protected}, deleted {deleted} Observations and {entries} Timeline Entries; failures: {failures}.",
+    retentionCleanupFailed: "Cleanup did not complete; no records were deleted and it is safe to retry.",
+    retentionManageDenied: "You do not have the Capability to manage Observation retention.",
+    retentionUnavailable: "Observation retention is currently unavailable.",
+    retentionInvalid: "The Observation retention policy is invalid. Enter a valid number of days.",
   },
 };
 

@@ -453,3 +453,84 @@ export async function rejectCorrelationSuggestion(
   requireCorrelationReview(member);
   return store.decideCorrelationSuggestion(member.workspaceId, id, member.id, "reject");
 }
+
+export const DEFAULT_RETENTION_DAYS = 90;
+export const MIN_RETENTION_DAYS = 1;
+export const MAX_RETENTION_DAYS = 3650;
+
+export type RetentionPolicy = Readonly<{
+  workspaceId: string;
+  retentionDays: number;
+  updatedAt: string;
+}>;
+
+export type RetentionCleanupResult = Readonly<{
+  workspaceId: string;
+  retentionDays: number;
+  cutoff: string;
+  eligibleObservations: number;
+  protectedObservations: number;
+  deletedObservations: number;
+  deletedTimelineEntries: number;
+  failures: number;
+  failureCount: number;
+  retryable: boolean;
+}>;
+
+export type RetentionValidationIssue = Readonly<{ field: string; message: string }>;
+
+export class RetentionValidationError extends Error {
+  constructor(readonly issues: readonly RetentionValidationIssue[]) {
+    super("Invalid Observation retention policy");
+    this.name = "RetentionValidationError";
+  }
+}
+
+export function parseRetentionDays(value: unknown): number {
+  const input = record(value);
+  const selected: unknown = input ? input.retentionDays ?? input.days : value;
+  const days = typeof selected === "number"
+    ? selected
+    : typeof selected === "string" && /^\d+$/.test(selected.trim())
+      ? Number(selected.trim())
+      : Number.NaN;
+  if (!Number.isSafeInteger(days) || days < MIN_RETENTION_DAYS || days > MAX_RETENTION_DAYS) {
+    throw new RetentionValidationError([{
+      field: "retentionDays",
+      message: `must be an integer from ${MIN_RETENTION_DAYS} to ${MAX_RETENTION_DAYS}`,
+    }]);
+  }
+  return days;
+}
+
+export function requireRetentionManagement(member: Pick<MemberRecord, "capabilities">): void {
+  requireCapability(member, capabilities.retentionManage);
+}
+
+export function hasRetentionManagement(member: Pick<MemberRecord, "capabilities">): boolean {
+  return member.capabilities.includes(capabilities.retentionManage);
+}
+
+export interface RetentionStore {
+  getRetentionPolicy(workspaceId: string): Promise<RetentionPolicy>;
+  updateRetentionPolicy(workspaceId: string, retentionDays: unknown): Promise<RetentionPolicy>;
+  cleanupRetention(workspaceId: string, now?: Date | string): Promise<RetentionCleanupResult>;
+}
+
+export async function updateRetentionPolicy(
+  member: Pick<MemberRecord, "workspaceId" | "capabilities">,
+  store: RetentionStore,
+  retentionDays: unknown,
+): Promise<RetentionPolicy> {
+  requireRetentionManagement(member);
+  return store.updateRetentionPolicy(member.workspaceId, retentionDays);
+}
+
+export async function runRetentionCleanup(
+  member: Pick<MemberRecord, "workspaceId" | "capabilities">,
+  store: RetentionStore,
+  now?: Date | string,
+): Promise<RetentionCleanupResult> {
+  requireRetentionManagement(member);
+  return store.cleanupRetention(member.workspaceId, now);
+}

@@ -54,9 +54,16 @@ import {
   confirmCorrelationSuggestion,
   rejectCorrelationSuggestion,
   hasCorrelationReview,
+  hasRetentionManagement,
+  runRetentionCleanup,
+  updateRetentionPolicy,
+  RetentionValidationError,
   type ConfirmedLinkRecord,
   type CorrelationSuggestionRecord,
   type ExperimentRecord,
+  type RetentionCleanupResult,
+  type RetentionPolicy,
+  type RetentionStore,
 } from "../../../packages/domain/src/index.js";
 import {
   createKubernetesLogAdapter,
@@ -73,6 +80,7 @@ type WebOptions = Readonly<{
   clusterScopeStore?: ClusterScopeStore;
   timelineStore?: TimelineStore;
   experimentStore?: ExperimentStore;
+  retentionStore?: RetentionStore;
   identityAdapter?: IdentityAdapter;
   logAdapter?: KubernetesLogAdapter;
   environment?: Record<string, string | undefined>;
@@ -598,12 +606,13 @@ export function renderApplicationPage(
   language: Language,
   session: AuthenticatedSession,
   scope: ClusterScope | null = null,
-  feedback?: Readonly<{ saved?: boolean; error?: string; logResult?: RecentLogWindow; logError?: string; attentionReviewed?: boolean; experimentSaved?: "created" | "updated"; experimentError?: string; correlationDecision?: "confirmed" | "rejected"; correlationError?: string }>,
+  feedback?: Readonly<{ saved?: boolean; error?: string; logResult?: RecentLogWindow; logError?: string; attentionReviewed?: boolean; experimentSaved?: "created" | "updated"; experimentError?: string; correlationDecision?: "confirmed" | "rejected"; correlationError?: string; retentionSaved?: boolean; retentionResult?: RetentionCleanupResult; retentionError?: string }>,
   timelineEntries: readonly TimelineEntry[] = [],
   timelinePageOrExperiments: TimelinePage | readonly ExperimentRecord[] = [],
   timelineQuery?: TimelineQuery,
   experiments: readonly ExperimentRecord[] = [],
   correlationSuggestions: readonly CorrelationSuggestionRecord[] = [],
+  retentionPolicy: RetentionPolicy | null = null,
 ): string {
   const messages = messagesFor(language);
   const member = session.member;
@@ -635,6 +644,11 @@ export function renderApplicationPage(
       <ul class="capabilities">${capabilityList}</ul>
       ${membershipLink}
       ${renderClusterSection(language, messages, member, scope, feedback)}
+      ${renderRetentionSection(language, messages, member, retentionPolicy, {
+        ...(feedback?.retentionSaved ? { saved: feedback.retentionSaved } : {}),
+        ...(feedback?.retentionResult ? { result: feedback.retentionResult } : {}),
+        ...(feedback?.retentionError ? { error: feedback.retentionError } : {}),
+      })}
       ${hasCapability(member, capabilities.timelineRead) ? renderTimelineSection(language, messages, timelinePage, timelineQuery ?? { limit: 100 }, feedback?.attentionReviewed) : ""}
       ${hasCapability(member, capabilities.timelineRead) ? renderExperimentsSection(language, messages, member, listedExperiments, {
         ...(feedback?.experimentSaved ? { saved: feedback.experimentSaved } : {}),
@@ -656,6 +670,41 @@ export function renderApplicationPage(
 
 function invitationStatus(invitation: InvitationRecord, messages: Messages): string {
   return invitation.revokedAt ? messages.revoked : invitation.acceptedAt ? messages.accepted : messages.pending;
+}
+
+function renderRetentionSection(
+  language: Language,
+  messages: Messages,
+  member: AuthenticatedSession["member"],
+  policy: RetentionPolicy | null,
+  feedback?: Readonly<{ saved?: boolean; result?: RetentionCleanupResult; error?: string }>,
+): string {
+  const policyDays = policy?.retentionDays ?? 90;
+  const result = feedback?.result;
+  const resultMessage = result
+    ? result.failures > 0
+      ? messages.retentionCleanupFailed
+      : retentionMessage(messages.retentionCleanupComplete, result)
+    : "";
+  const controls = hasRetentionManagement(member)
+    ? `<form method="post" action="/retention/update?lang=${language}">
+        <label for="retention-days">${escapeHtml(messages.retentionDays)}</label>
+        <input id="retention-days" name="retentionDays" type="number" min="1" max="3650" step="1" required value="${policyDays}">
+        <button type="submit">${escapeHtml(messages.saveRetention)}</button>
+      </form>
+      <form method="post" action="/retention/cleanup?lang=${language}">
+        <button type="submit">${escapeHtml(messages.runRetentionCleanup)}</button>
+      </form>`
+    : `<p class="error" role="alert">${escapeHtml(messages.retentionManageDenied)}</p>`;
+  return `<section aria-labelledby="retention-title">
+      <h2 id="retention-title">${escapeHtml(messages.retentionTitle)}</h2>
+      <p>${escapeHtml(messages.retentionDescription)}</p>
+      ${feedback?.saved ? `<p class="notice" role="status">${escapeHtml(messages.retentionSaved)}</p>` : ""}
+      ${feedback?.error ? `<p class="error" role="alert">${escapeHtml(feedback.error)}</p>` : ""}
+      ${resultMessage ? `<p class="${result?.failures ? "error" : "notice"}" role="status">${escapeHtml(resultMessage)}</p>` : ""}
+      <p><strong>${escapeHtml(messages.retentionDays)}:</strong> ${policyDays}</p>
+      ${controls}
+    </section>`;
 }
 
 function renderRecentLogsSection(
@@ -896,6 +945,43 @@ function hasCorrelationStore(value: TimelineStore | null): value is TimelineStor
     && typeof candidate.listConfirmedLinks === "function";
 }
 
+function hasRetentionStore(value: unknown): value is RetentionStore {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<RetentionStore>;
+  return typeof candidate.getRetentionPolicy === "function"
+    && typeof candidate.updateRetentionPolicy === "function"
+    && typeof candidate.cleanupRetention === "function";
+}
+
+function retentionMessage(template: string, result: RetentionCleanupResult): string {
+  return template.replace("{eligible}", String(result.eligibleObservations))
+    .replace("{protected}", String(result.protectedObservations))
+    .replace("{deleted}", String(result.deletedObservations))
+    .replace("{entries}", String(result.deletedTimelineEntries))
+    .replace("{failures}", String(result.failures));
+}
+
+function retentionCleanupQueryResult(url: URL, policy: RetentionPolicy | null): RetentionCleanupResult | undefined {
+  if (url.searchParams.get("retention") !== "cleanup" || !policy) return undefined;
+  const integer = (name: string): number => {
+    const value = Number(url.searchParams.get(name));
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  };
+  const failures = integer("failures");
+  return {
+    workspaceId: policy.workspaceId,
+    retentionDays: policy.retentionDays,
+    cutoff: "",
+    eligibleObservations: integer("eligible"),
+    protectedObservations: integer("protected"),
+    deletedObservations: integer("deleted"),
+    deletedTimelineEntries: integer("entries"),
+    failures,
+    failureCount: failures,
+    retryable: true,
+  };
+}
+
 function requestHeaders(request: IncomingMessage): Headers {
   const headers = new Headers();
   for (const [name, value] of Object.entries(request.headers ?? {})) {
@@ -952,6 +1038,10 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     if (!hasCorrelationStore(database.timeline ?? null)) {
       await database.close();
       throw new Error("Production Correlation must use the database-owned durable store");
+    }
+    if (options.retentionStore || !hasRetentionStore(database.retention ?? database.timeline ?? null)) {
+      await database.close();
+      throw new Error("Production Retention must use the database-owned durable store");
     }
     admissionStore = database.admission;
     clusterScopeStore = database.clusterScope;
@@ -1111,6 +1201,9 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   const experimentStore = environment.NODE_ENV === "production"
     ? database.experiments ?? null
     : options.experimentStore ?? database.experiments ?? (hasExperimentStore(timelineStore) ? timelineStore : null);
+  const retentionStore: RetentionStore | null = environment.NODE_ENV === "production"
+    ? database.retention ?? (hasRetentionStore(database.timeline) ? database.timeline : null)
+    : options.retentionStore ?? database.retention ?? (hasRetentionStore(timelineStore) ? timelineStore : null);
   const logAuditStore = hasLogAuditStore(admissionStore) ? admissionStore : undefined;
   const timelineNotifications = timelineStore && "subscribeTimeline" in timelineStore && typeof timelineStore.subscribeTimeline === "function"
     ? timelineStore as TimelineNotificationSource
@@ -1124,6 +1217,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   const scopeForSession = (session: AuthenticatedSession): Promise<ClusterScope | null> => clusterScopeStore.get(session.member.workspaceId);
   const correlationSuggestionsForSession = async (session: AuthenticatedSession): Promise<readonly CorrelationSuggestionRecord[]> =>
     hasCorrelationStore(timelineStore) ? timelineStore.listCorrelationSuggestions(session.member.workspaceId) : [];
+  const retentionPolicyForSession = async (session: AuthenticatedSession): Promise<RetentionPolicy | null> =>
+    retentionStore ? retentionStore.getRetentionPolicy(session.member.workspaceId) : null;
 
   const sendJson = (response: ServerResponse, statusCode: number, payload: unknown): void => {
     response.statusCode = statusCode;
@@ -1190,6 +1285,19 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       }
     }
     return formExperimentInput(new URLSearchParams(body));
+  };
+
+  const parseRetentionRequest = async (request: IncomingMessage): Promise<unknown> => {
+    const body = await requestBody(request);
+    if (request.headers?.["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() === "application/json") {
+      try {
+        return JSON.parse(body) as unknown;
+      } catch {
+        return null;
+      }
+    }
+    const form = new URLSearchParams(body);
+    return { retentionDays: form.get("retentionDays") ?? form.get("days") ?? "" };
   };
 
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
@@ -1474,6 +1582,46 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           return;
         }
         sendJson(response, 200, result);
+        return;
+      }
+      const retentionPolicyPath = requestUrl.pathname === "/api/retention" || requestUrl.pathname === "/api/retention/policy";
+      const retentionCleanupPath = requestUrl.pathname === "/api/retention/cleanup" || requestUrl.pathname === "/api/retention/run";
+      if (retentionPolicyPath || retentionCleanupPath) {
+        const lookup = await sessionForRequest(request);
+        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (!retentionStore) {
+          sendJson(response, 503, { error: "retention_store_unavailable" });
+          return;
+        }
+        if (retentionPolicyPath && method === "GET") {
+          sendJson(response, 200, { policy: await retentionStore.getRetentionPolicy(lookup.session.member.workspaceId) });
+          return;
+        }
+        if ((retentionPolicyPath && (method === "PUT" || method === "PATCH" || method === "POST")) || (retentionCleanupPath && method === "POST")) {
+          if (!hasRetentionManagement(lookup.session.member)) {
+            sendJson(response, 403, { error: "missing_capability", capability: capabilities.retentionManage });
+            return;
+          }
+          try {
+            if (retentionCleanupPath) {
+              sendJson(response, 200, { result: await runRetentionCleanup(lookup.session.member, retentionStore) });
+            } else {
+              const policy = await updateRetentionPolicy(lookup.session.member, retentionStore, await parseRetentionRequest(request));
+              sendJson(response, 200, { policy });
+            }
+          } catch (error: unknown) {
+            if (error instanceof RetentionValidationError) {
+              sendJson(response, 400, { error: "invalid_retention_policy", issues: error.issues });
+              return;
+            }
+            throw error;
+          }
+          return;
+        }
+        sendJson(response, 405, { error: "method_not_allowed" });
         return;
       }
       const correlationDecisionMatch = requestUrl.pathname.match(/^\/api\/correlations\/suggestions\/([^/]+)\/(confirm|reject)$/);
@@ -1895,6 +2043,67 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         }
         return;
       }
+      const retentionUpdatePage = requestUrl.pathname === "/retention/update" && method === "POST";
+      const retentionCleanupPage = requestUrl.pathname === "/retention/cleanup" && method === "POST";
+      if (retentionUpdatePage || retentionCleanupPage) {
+        const lookup = await sessionForRequest(request);
+        const messages = messagesFor(language);
+        if (!lookup.session) {
+          response.statusCode = lookup.rejection ? 403 : 302;
+          if (lookup.rejection) {
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderRejectionPage(language, lookup.rejection));
+          } else {
+            response.setHeader("location", `/?lang=${language}`);
+            response.end();
+          }
+          return;
+        }
+        const scope = await scopeForSession(lookup.session);
+        const policy = await retentionPolicyForSession(lookup.session);
+        if (!retentionStore) {
+          response.statusCode = 503;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { retentionError: messages.retentionUnavailable }, [], [], undefined, [], [], policy));
+          return;
+        }
+        if (!hasRetentionManagement(lookup.session.member)) {
+          response.statusCode = 403;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { retentionError: messages.retentionManageDenied }, [], [], undefined, [], [], policy));
+          return;
+        }
+        try {
+          if (retentionCleanupPage) {
+            const result = await runRetentionCleanup(lookup.session.member, retentionStore);
+            response.statusCode = 303;
+            const cleanupQuery = new URLSearchParams({
+              lang: language,
+              retention: "cleanup",
+              eligible: String(result.eligibleObservations),
+              protected: String(result.protectedObservations),
+              deleted: String(result.deletedObservations),
+              entries: String(result.deletedTimelineEntries),
+              failures: String(result.failures),
+            });
+            response.setHeader("location", `/app?${cleanupQuery.toString()}`);
+          } else {
+            const fields = requestFields(await requestBody(request), request.headers?.["content-type"]);
+            if (!fields) throw new RetentionValidationError([{ field: "retentionDays", message: "must be a valid request" }]);
+            await updateRetentionPolicy(lookup.session.member, retentionStore, fields);
+            response.statusCode = 303;
+            response.setHeader("location", `/app?lang=${language}&retention=updated`);
+          }
+          response.end();
+        } catch (error: unknown) {
+          response.statusCode = error instanceof RetentionValidationError ? 400 : 503;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, {
+            retentionError: error instanceof RetentionValidationError ? messages.retentionInvalid : messages.retentionUnavailable,
+          }, [], [], undefined, [], [], policy));
+        }
+        return;
+      }
       if (requestUrl.pathname === "/api/cluster" || requestUrl.pathname === "/api/cluster/scope") {
         const lookup = await sessionForRequest(request);
         if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
@@ -2189,6 +2398,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         const correlationSuggestions = hasTimelineAccess(lookup.session)
           ? await correlationSuggestionsForSession(lookup.session)
           : [];
+        const retentionPolicy = await retentionPolicyForSession(lookup.session);
+        const cleanupResult = retentionCleanupQueryResult(requestUrl, retentionPolicy);
         const experimentNotice = requestUrl.searchParams.get("experiment");
         response.statusCode = 200;
         response.setHeader("content-type", "text/html; charset=utf-8");
@@ -2199,7 +2410,9 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           ...(experimentNotice === "updated" ? { experimentSaved: "updated" as const } : {}),
           ...(requestUrl.searchParams.get("correlation") === "confirmed" ? { correlationDecision: "confirmed" as const } : {}),
           ...(requestUrl.searchParams.get("correlation") === "rejected" ? { correlationDecision: "rejected" as const } : {}),
-        }, timelinePage.entries, timelinePage, timelineQuery, experiments, correlationSuggestions));
+          ...(requestUrl.searchParams.get("retention") === "updated" ? { retentionSaved: true } : {}),
+          ...(cleanupResult === undefined ? {} : { retentionResult: cleanupResult }),
+        }, timelinePage.entries, timelinePage, timelineQuery, experiments, correlationSuggestions, retentionPolicy));
         return;
       }
       if (requestUrl.pathname === "/") {
@@ -2241,11 +2454,15 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
             const correlationSuggestions = hasTimelineAccess(lookup.session)
               ? await correlationSuggestionsForSession(lookup.session)
               : [];
+            const retentionPolicy = await retentionPolicyForSession(lookup.session);
+            const cleanupResult = retentionCleanupQueryResult(requestUrl, retentionPolicy);
             response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
               attentionReviewed: requestUrl.searchParams.get("attention") === "reviewed",
               ...(requestUrl.searchParams.get("correlation") === "confirmed" ? { correlationDecision: "confirmed" as const } : {}),
               ...(requestUrl.searchParams.get("correlation") === "rejected" ? { correlationDecision: "rejected" as const } : {}),
-            }, timelinePage.entries, timelinePage, timelineQuery, experiments, correlationSuggestions));
+              ...(requestUrl.searchParams.get("retention") === "updated" ? { retentionSaved: true } : {}),
+              ...(cleanupResult === undefined ? {} : { retentionResult: cleanupResult }),
+            }, timelinePage.entries, timelinePage, timelineQuery, experiments, correlationSuggestions, retentionPolicy));
           } else {
             response.end(renderLoginPage(language, current.checks.database === "ready", identityAdapter));
           }
