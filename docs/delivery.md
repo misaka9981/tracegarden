@@ -18,7 +18,7 @@ Pull requests run required checks before they are eligible for preview or merge:
 8. Helm render and Kubernetes schema validation.
 9. Dependency, image, secret-pattern, and supply-chain checks selected during implementation.
 
-Actions receive explicit least-privilege permissions and third-party actions are pinned to immutable commits. Built images use commit-SHA tags and immutable digests; release builds also produce an SBOM and provenance attestation.
+Actions receive explicit least-privilege permissions and third-party actions are pinned to immutable commits. Built images use commit-SHA tags and immutable digests; release builds also produce an SBOM and provenance attestation. The ARM64 container and publication jobs use native ARM runners; Helm, kubeconform, and Trivy run from digest-pinned images. Manifest checks first verify and extract the checked-in Kubernetes 1.31 strict schema bundle, then pass its local path to network-disabled kubeconform. High and critical CVEs fail the image job, whose reports are retained as an artifact. The repository workflow keeps GHCR publication configuration-only: its `publish` job runs only when the repository variables `ENABLE_GHCR_PUBLICATION=true` and `GHCR_NAMESPACE` are explicitly configured, and it uses the short-lived `GITHUB_TOKEN` with package and attestation permissions only. `GHCR_NAMESPACE` must be the lower-case intended private owner. Publication retains digest, SBOM, and provenance metadata plus immutable image manifests as an artifact without application secrets.
 
 ## Pull-request previews
 

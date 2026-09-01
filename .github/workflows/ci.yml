@@ -1,0 +1,302 @@
+name: Tracegarden CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: tracegarden-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 26.8.1
+  PNPM_VERSION: 11.9.0
+  NODE_IMAGE: node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89
+  POSTGRES_IMAGE: postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7
+  HELM_IMAGE: docker.io/alpine/helm:3.17.3@sha256:d899e6316789fec04ee95300a18e454b7942539cbb3d89bde3e0655d6ca2e895
+  KUBECONFORM_IMAGE: ghcr.io/yannh/kubeconform:v0.6.7@sha256:0925177fb05b44ce18574076141b5c3d83235e1904d3f952182ac99ddc45762c
+  TRIVY_IMAGE: docker.io/aquasec/trivy:0.59.1@sha256:029e990b328d149bf0a9ffe355919041e1f86192db2df47e217f8a36dd42ceac
+
+jobs:
+  policy:
+    name: Offline delivery policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+      - run: node scripts/delivery-policy.mjs
+
+  static:
+    name: Frozen install, types, lint, and domain tests
+    needs: policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+      - run: npm install --global pnpm@${PNPM_VERSION}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm env:check
+      - run: pnpm format:check
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm test
+
+  postgres:
+    name: PostgreSQL integration tests
+    needs: policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+      - run: npm install --global pnpm@${PNPM_VERSION}
+      - run: pnpm install --frozen-lockfile
+      - run: docker pull "$POSTGRES_IMAGE"
+      - run: pnpm test:postgres
+
+  browser:
+    name: Playwright browser smoke tests
+    needs: policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+      - run: npm install --global pnpm@${PNPM_VERSION}
+      - run: pnpm install --frozen-lockfile
+      - run: docker pull "$POSTGRES_IMAGE"
+      - run: pnpm test:browser
+
+  container:
+    name: Non-root container smoke tests and image CVE scan
+    needs: policy
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    env:
+      CONTAINER_SMOKE_PROJECT: tracegarden-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CONTAINER_SMOKE_IMAGE_FILE: ${{ runner.temp }}/tracegarden-image-ids.txt
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+      - run: npm install --global pnpm@${PNPM_VERSION}
+      - run: docker pull --platform linux/arm64 "$NODE_IMAGE"
+      - run: docker pull --platform linux/arm64 "$POSTGRES_IMAGE"
+      - run: pnpm test:container
+      - name: Scan built images for actionable CVEs
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/tracegarden-cve" "$RUNNER_TEMP/trivy-cache"
+          test -s "$CONTAINER_SMOKE_IMAGE_FILE"
+          failed=0
+          while IFS='=' read -r service image; do
+            test -n "$service" && test -n "$image"
+            status=0
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP/tracegarden-cve:/reports" \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+              "$TRIVY_IMAGE" image --format json --output "/reports/${service}.json" \
+              --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "$image" || status=$?
+            if [ "$status" -ne 0 ]; then failed=1; fi
+          done < "$CONTAINER_SMOKE_IMAGE_FILE"
+          exit "$failed"
+      - name: Upload image CVE evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tracegarden-${{ github.sha }}-image-security-evidence
+          path: |
+            ${{ runner.temp }}/tracegarden-image-ids.txt
+            ${{ runner.temp }}/tracegarden-cve
+          if-no-files-found: warn
+          retention-days: 30
+
+  manifests:
+    name: Offline Helm render and schema validation
+    needs: policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      KUBECONFORM_SCHEMA_LOCATION: /work/.ci/kubeconform-schemas/v1.31.0-standalone-strict/
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+      - run: npm install --global pnpm@${PNPM_VERSION}
+      - name: Provision checksummed local Kubernetes schemas
+        run: |
+          set -eu
+          sha256sum -c deploy/kubeconform-schemas/SHA256SUMS
+          pnpm delivery:schema
+      - name: Install digest-pinned offline manifest tools
+        run: |
+          set -eu
+          docker pull "$HELM_IMAGE"
+          docker pull "$KUBECONFORM_IMAGE"
+          mkdir -p "$RUNNER_TEMP/tracegarden-tools"
+          cat > "$RUNNER_TEMP/tracegarden-tools/helm" <<'EOF'
+          #!/bin/sh
+          exec docker run --rm -i --network none -v "$GITHUB_WORKSPACE:/work:ro" -w /work "$HELM_IMAGE" "$@"
+          EOF
+          cat > "$RUNNER_TEMP/tracegarden-tools/kubeconform" <<'EOF'
+          #!/bin/sh
+          exec docker run --rm -i --network none -v "$GITHUB_WORKSPACE:/work:ro" -w /work "$KUBECONFORM_IMAGE" "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/tracegarden-tools/helm" "$RUNNER_TEMP/tracegarden-tools/kubeconform"
+          echo "$RUNNER_TEMP/tracegarden-tools" >> "$GITHUB_PATH"
+      - run: command -v helm && command -v kubeconform
+      - run: pnpm test:chart
+      - run: pnpm chart:render
+      - run: pnpm chart:validate
+
+  security:
+    name: Dependency, image, secret, and supply-chain checks
+    needs: [policy, container]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+      - run: npm install --global pnpm@${PNPM_VERSION}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --audit-level=high
+      - run: node scripts/delivery-policy.mjs
+      - name: Fail on committed secret patterns
+        shell: bash
+        run: |
+          if git grep -nE '(BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,})' -- ':!pnpm-lock.yaml'; then
+            echo 'actionable secret-pattern finding';
+            exit 1;
+          fi
+      - run: git diff --check
+
+  publish:
+    name: Publish commit-SHA images with attestations
+    if: vars.ENABLE_GHCR_PUBLICATION == 'true' && vars.GHCR_NAMESPACE != '' && (github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v'))
+    needs: [static, postgres, browser, container, manifests, security]
+    runs-on: ubuntu-24.04-arm
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      # Set GHCR_NAMESPACE to the lower-case intended private owner before enabling publication.
+      GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
+      IMAGE_PREFIX: ghcr.io/${{ vars.GHCR_NAMESPACE }}/tracegarden
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - name: Verify publication namespace configuration
+        run: test "$GHCR_NAMESPACE" = "${GHCR_NAMESPACE,,}"
+      - name: Login to the configured private GHCR namespace
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish web image
+        id: web
+        run: |
+          set -eu
+          docker buildx build --platform linux/arm64 --file deploy/docker/web.Dockerfile --tag "${IMAGE_PREFIX}-web:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/web.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/web.json")" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-web
+          subject-digest: ${{ steps.web.outputs.digest }}
+          push-to-registry: true
+      - name: Publish collector image
+        id: collector
+        run: |
+          set -eu
+          docker buildx build --platform linux/arm64 --file deploy/docker/collector.Dockerfile --tag "${IMAGE_PREFIX}-collector:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/collector.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/collector.json")" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-collector
+          subject-digest: ${{ steps.collector.outputs.digest }}
+          push-to-registry: true
+      - name: Publish migration image
+        id: migrate
+        run: |
+          set -eu
+          docker buildx build --platform linux/arm64 --file deploy/docker/migrate.Dockerfile --tag "${IMAGE_PREFIX}-migrate:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/migrate.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/migrate.json")" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-migrate
+          subject-digest: ${{ steps.migrate.outputs.digest }}
+          push-to-registry: true
+      - name: Record immutable image digests
+        run: |
+          {
+            echo "web=${{ steps.web.outputs.digest }}"
+            echo "collector=${{ steps.collector.outputs.digest }}"
+            echo "migrate=${{ steps.migrate.outputs.digest }}"
+          } | tee "$RUNNER_TEMP/tracegarden-image-digests.txt"
+      - name: Persist digest, SBOM, and provenance evidence
+        run: |
+          set -eu
+          evidence="$RUNNER_TEMP/tracegarden-supply-chain-evidence"
+          mkdir -p "$evidence"
+          cp "$RUNNER_TEMP/web.json" "$evidence/web-build-metadata.json"
+          cp "$RUNNER_TEMP/collector.json" "$evidence/collector-build-metadata.json"
+          cp "$RUNNER_TEMP/migrate.json" "$evidence/migrate-build-metadata.json"
+          cp "$RUNNER_TEMP/tracegarden-image-digests.txt" "$evidence/image-digests.txt"
+          for service in web collector migrate; do
+            digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/${service}.json")
+            test "$digest" != "null" && printf '%s\n' "$digest" > "$evidence/${service}-digest.txt"
+            docker buildx imagetools inspect --raw "${IMAGE_PREFIX}-${service}@${digest}" > "$evidence/${service}-manifest.json"
+          done
+          jq -n \
+            --arg commit "$GITHUB_SHA" \
+            --arg source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            '{commit: $commit, source: $source, sbom: "buildx --sbom=true", provenance: "buildx --provenance=mode=max", evidence: "image manifests and build metadata"}' \
+            > "$evidence/attestation-evidence.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tracegarden-${{ github.sha }}-supply-chain-evidence
+          path: ${{ runner.temp }}/tracegarden-supply-chain-evidence
+          if-no-files-found: error
+          retention-days: 90

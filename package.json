@@ -10,6 +10,8 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "clean": "node scripts/clean.mjs",
+    "delivery:policy": "node scripts/delivery-policy.mjs",
+    "delivery:schema": "node scripts/provision-kubeconform-schemas.mjs",
     "db:migrate": "node scripts/migrate.mjs",
     "predb:migrate": "pnpm build",
     "collector": "node dist/apps/collector/src/main.js",
@@ -28,9 +30,10 @@
     "test:postgres": "node scripts/postgres-smoke.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "chart:render": "KUBECONFIG=/dev/null helm template tracegarden deploy/chart --namespace tracegarden --kube-version 1.31.0",
-    "chart:validate": "KUBECONFIG=/dev/null helm template tracegarden deploy/chart --namespace tracegarden --kube-version 1.31.0 | kubeconform -strict -kubernetes-version 1.31.0 -summary",
+    "chart:validate": "SCHEMA_DIR=\"${KUBECONFORM_SCHEMA_LOCATION:-file://$PWD/.ci/kubeconform-schemas/v1.31.0-standalone-strict/}\" && KUBECONFIG=/dev/null helm template tracegarden deploy/chart --namespace tracegarden --kube-version 1.31.0 | kubeconform -schema-location \"${SCHEMA_DIR}{{ .ResourceKind }}{{ .KindSuffix }}.json\" -strict -kubernetes-version 1.31.0 -summary",
+    "pretest:chart": "pnpm delivery:schema",
     "test:chart": "node scripts/chart-test.mjs",
-    "check": "pnpm env:check && pnpm format:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test && pnpm test:chart && pnpm test:browser && pnpm test:postgres && pnpm test:container"
+    "check": "pnpm env:check && pnpm delivery:policy && pnpm format:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test && pnpm test:chart && pnpm test:browser && pnpm test:postgres && pnpm test:container"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0",

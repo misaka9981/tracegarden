@@ -21,7 +21,7 @@ services:
       dockerfile: deploy/docker/migrate.Dockerfile
     platform: linux/arm64
     environment:
-      DATABASE_URL: postgresql://tracegarden:local-only@postgres:5432/tracegarden
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql://tracegarden:local-only@postgres:5432/tracegarden}
     depends_on:
       postgres:
         condition: service_healthy

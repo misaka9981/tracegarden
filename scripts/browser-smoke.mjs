@@ -8,6 +8,7 @@ const port = 43191;
 const databasePort = 45434;
 const databaseName = `tracegarden-browser-pg-${process.pid}`;
 const databaseUrl = `postgresql://tracegarden:local-only@127.0.0.1:${databasePort}/tracegarden`;
+const postgresImage = "postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7";
 let child;
 let output = "";
 let browser;
@@ -22,7 +23,7 @@ function removeDatabase() {
 
 removeDatabase();
 try {
-  docker("run", "-d", "--name", databaseName, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", "postgres:18.3-alpine");
+  docker("run", "-d", "--name", databaseName, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", postgresImage);
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       docker("exec", databaseName, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT 1");

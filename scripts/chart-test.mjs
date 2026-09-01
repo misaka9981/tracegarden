@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url)));
 assert.match(packageJson.scripts["chart:render"], /KUBECONFIG=\/dev\/null helm template/);
 assert.match(packageJson.scripts["chart:validate"], /helm template/);
 assert.match(packageJson.scripts["chart:validate"], /kubeconform/);
+assert.match(packageJson.scripts["chart:validate"], /schema-location/);
+assert.match(packageJson.scripts["chart:validate"], /KUBECONFORM_SCHEMA_LOCATION/);
 
 const schema = JSON.parse(await readFile(new URL("../deploy/chart/values.schema.json", import.meta.url)));
 const values = await readFile(new URL("../deploy/chart/values.yaml", import.meta.url), "utf8");
@@ -83,6 +86,10 @@ assert.match(deployments, /automountServiceAccountToken: true/);
 assert.match(deployments, /serviceAccountName: .*logsServiceAccount/);
 assert.match(deployments, /serviceAccountName: .*observationServiceAccount/);
 
+const schemaDirectory = process.env.KUBECONFORM_SCHEMA_LOCATION?.trim()
+  || `${pathToFileURL(`${process.cwd()}/.ci/kubeconform-schemas/v1.31.0-standalone-strict`).href}/`;
+const schemaLocation = `${schemaDirectory}{{ .ResourceKind }}{{ .KindSuffix }}.json`;
+
 function renderAndValidate(extraArgs = []) {
   const render = spawnSync("helm", [
     "template", "tracegarden", "deploy/chart", "--namespace", "tracegarden", "--kube-version", "1.31.0", ...extraArgs,
@@ -91,7 +98,7 @@ function renderAndValidate(extraArgs = []) {
     env: { ...process.env, KUBECONFIG: "/dev/null" },
   });
   assert.equal(render.status, 0, render.stderr || "helm template failed");
-  const validation = spawnSync("kubeconform", ["-strict", "-kubernetes-version", "1.31.0", "-summary"], {
+  const validation = spawnSync("kubeconform", ["-schema-location", schemaLocation, "-strict", "-kubernetes-version", "1.31.0", "-summary"], {
     encoding: "utf8",
     input: render.stdout,
     env: { ...process.env, KUBECONFIG: "/dev/null" },

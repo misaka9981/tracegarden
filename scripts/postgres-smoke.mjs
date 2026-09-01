@@ -8,6 +8,7 @@ import { PostgresDatabase, PostgresObservationStore, TimelineQueryValidationErro
 import { FakeKubernetesLogAdapter, requestRecentLogWindow } from "../dist/packages/logs/src/index.js";
 
 const name = `tracegarden-foundation-pg-${process.pid}`;
+const postgresImage = "postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7";
 const databasePort = 45433;
 const webPort = 43200;
 const productionWebPort = 43201;
@@ -29,7 +30,7 @@ function removeDatabase() {
 
 removeDatabase();
 try {
-  docker("run", "-d", "--name", name, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", "postgres:18.3-alpine");
+  docker("run", "-d", "--name", name, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", postgresImage);
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT 1");

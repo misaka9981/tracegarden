@@ -2,4 +2,7 @@ node_modules
 dist
 .git
 .scratch
+.ci
+# CI-only schema bundle; runtime images do not need delivery tooling.
+deploy/kubeconform-schemas
 .env
