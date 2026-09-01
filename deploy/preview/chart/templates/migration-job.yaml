@@ -1,0 +1,63 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}-migration
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    tracegarden.dev/data-scope: preview-only
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "tracegarden-preview.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      automountServiceAccountToken: false
+      priorityClassName: tracegarden-preview
+      preemptionPolicy: Never
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migration
+          image: {{ include "tracegarden-preview.image" (dict "root" . "component" "migrate") | quote }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATABASE_URL
+              value: {{ printf "postgresql://tracegarden_preview:preview-only-pr-%d@%s:5432/tracegarden_preview" (int .Values.preview.number) (include "tracegarden-preview.postgresService" .) | quote }}
+            - name: MIGRATION_DATABASE_READY_TIMEOUT_SECONDS
+              value: "120"
+            - name: MIGRATION_DATABASE_READY_RETRY_SECONDS
+              value: "2"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

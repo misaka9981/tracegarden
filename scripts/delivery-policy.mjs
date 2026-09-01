@@ -42,6 +42,7 @@ for (const command of [
   "pnpm test:container",
   "pnpm test:chart",
   "pnpm chart:validate",
+  "pnpm preview:validate",
   "pnpm audit --audit-level=high",
 ]) {
   if (!workflowText.includes(command)) errors.push(`workflow suite is missing ${command}`);
@@ -110,6 +111,69 @@ const chartValues = await readFile("deploy/chart/values.yaml", "utf8");
 const chartDigests = [...chartValues.matchAll(/^\s+digest:\s+(\S+)/gm)].map(([, digest]) => digest);
 if (!chartDigests.length || !chartDigests.every((digest) => /^sha256:[a-f0-9]{64}$/.test(digest))) {
   errors.push("deploy/chart/values.yaml: every deployment digest must be immutable");
+}
+
+const deliveryDeclarations = {
+  applicationSet: await readFile("deploy/preview/applicationset.yaml", "utf8"),
+  applicationSetCrd: await readFile("deploy/preview/applicationset-crd.yaml", "utf8"),
+  appProject: await readFile("deploy/preview/appproject.yaml", "utf8"),
+  lifecycle: await readFile("deploy/preview/lifecycle-policy.yaml", "utf8"),
+  previewValues: await readFile("deploy/preview/chart/values.yaml", "utf8"),
+  promotion: await readFile("deploy/promotion/promotion.yaml", "utf8"),
+  desiredState: await readFile("deploy/gitops/production/desired-state.yaml", "utf8"),
+  productionApplication: await readFile("deploy/gitops/production/application.yaml", "utf8"),
+  identity: await readFile("packages/identity/src/index.ts", "utf8"),
+  lifecycleController: await readFile("deploy/preview/lifecycle-controller.yaml", "utf8"),
+  previewArtifact: await readFile("scripts/preview-artifact.mjs", "utf8"),
+  previewDeployments: await readFile("deploy/preview/chart/templates/deployments.yaml", "utf8"),
+};
+for (const [name, source] of Object.entries(deliveryDeclarations)) {
+  if (source.includes("TODO")) errors.push(`${name}: delivery declaration cannot contain TODO placeholders`);
+}
+for (const path of Object.keys(deliveryDeclarations)) {
+  if (!deliveryDeclarations[path].trim()) errors.push(`${path}: delivery declaration cannot be empty`);
+}
+if (!workflowText.includes("promotion-proposal") || !workflowText.includes("environment: production") || /git push|kubectl|kubeadm/i.test(workflowText)) {
+  errors.push("promotion workflow must be protected, reviewable, and free of direct Cluster or Git pushes");
+}
+for (const required of ["preview-publish", "github.event.pull_request.draft == false", "PREVIEW_COMMIT", "preview-artifact.mjs", "preview-image-declaration.yaml", "environments/previews/digests/pr-", "preview-digests", "steps.web.outputs.digest", "steps.collector.outputs.digest", "steps.migrate.outputs.digest"]) {
+  if (!workflowText.includes(required)) errors.push(`preview publication is missing ${required}`);
+}
+const applicationSet = deliveryDeclarations.applicationSet;
+const applicationSetCrd = deliveryDeclarations.applicationSetCrd;
+const appProject = deliveryDeclarations.appProject;
+if (!applicationSetCrd.includes("name: applicationsets.argoproj.io") || !applicationSetCrd.includes("name: v1alpha1") || !applicationSetCrd.includes("openAPIV3Schema:")) {
+  errors.push("preview ApplicationSet validation must use the vendored v1alpha1 Argo CD CRD schema");
+}
+const previewReadme = await readFile("deploy/preview/README.md", "utf8");
+if (!previewReadme.includes("release `v3.4.6`") || !previewReadme.includes("https://raw.githubusercontent.com/argoproj/argo-cd/v3.4.6/manifests/crds/applicationset-crd.yaml")) {
+  errors.push("preview ApplicationSet CRD provenance must name the pinned release and official source path");
+}
+if (!appProject.includes("group: networking.k8s.io\n      kind: NetworkPolicy") || !appProject.includes("group: policy\n      kind: PodDisruptionBudget")) {
+  errors.push("preview AppProject must whitelist NetworkPolicy and PodDisruptionBudget in their API groups");
+}
+if (applicationSet.includes(".state") || applicationSet.includes(".draft") || applicationSet.includes("templatePatch")) {
+  errors.push("ApplicationSet must use supported PR parameters without state/draft template assumptions");
+}
+if (!applicationSet.includes("repoURL: https://github.com/MISAKA3389/tracegarden-gitops.git") || !applicationSet.includes("targetRevision: main") || applicationSet.includes("head_sha")) {
+  errors.push("preview chart and values must come from the protected GitOps repository main, not a PR head");
+}
+if (!applicationSet.includes("syncPolicy:\n    preserveResourcesOnDeletion: false") || applicationSet.includes("template.spec.syncPolicy.preserveResourcesOnDeletion")) {
+  errors.push("preserveResourcesOnDeletion must be on the ApplicationSet spec.syncPolicy");
+}
+if (applicationSet.includes("valuesObject") || applicationSet.includes("preview.access")) {
+  errors.push("preview workload and Cloudflare configuration must not be PR-selected Helm overrides");
+}
+if (applicationSet.includes("CreateNamespace") || !deliveryDeclarations.lifecycle.includes("provisionBeforeEligibility: true")) {
+  errors.push("preview namespaces and pull authentication must be provisioned before eligibility");
+}
+if (/preview-(?:web|collector|migrate)-digest=/.test(applicationSet) || applicationSet.includes("pull-request-digest-label")) {
+  errors.push("preview image handoff must not use GitHub labels");
+}
+for (const required of ["valueFiles", "../digests/pr-{{.number}}.yaml", "ignoreMissingValueFiles: false", "kind: CronJob", "resources: [namespaces]", "deleteNamespace", "setPreviewLabel", "imagePullSecrets", "serviceAccountName: {{ .Values.serviceAccount.name }}", "aggregateCpu", "productionCpu", "missing-trusted-digest", "remoteWrite: false"]) {
+  if (!workflowText.includes(required) && !Object.values(deliveryDeclarations).some((source) => source.includes(required))) {
+    errors.push(`delivery declaration is missing ${required}`);
+  }
 }
 
 if (errors.length) {

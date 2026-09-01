@@ -18,6 +18,7 @@ spec:
         app.kubernetes.io/component: migration
     spec:
       restartPolicy: Never
+      priorityClassName: tracegarden-production
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true

@@ -3198,7 +3198,9 @@ export function createDatabase(environment: Record<string, string | undefined>):
   if (!connectionString) {
     throw new Error("DATABASE_URL is required; use DATABASE_MODE=memory only for local smoke tests");
   }
-  const bootstrapIdentity = environment.NODE_ENV === "production" ? configuredBootstrapIdentity(environment) : DEFAULT_LOCAL_BOOTSTRAP;
+  const bootstrapIdentity = environment.NODE_ENV === "production" || environment.NODE_ENV === "preview"
+    ? configuredBootstrapIdentity(environment)
+    : DEFAULT_LOCAL_BOOTSTRAP;
   const cursorSecret = environment.TIMELINE_CURSOR_SECRET?.trim();
   if (environment.NODE_ENV === "production" && !cursorSecret) {
     throw new Error("TIMELINE_CURSOR_SECRET is required in production");

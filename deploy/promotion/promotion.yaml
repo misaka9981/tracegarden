@@ -1,0 +1,28 @@
+# Promotion input is reviewed offline. The protected-environment approval is
+# deliberately required before this proposal can update GitOps desired state.
+apiVersion: delivery.tracegarden.dev/v1alpha1
+kind: Promotion
+metadata:
+  name: tracegarden-production
+  annotations:
+    tracegarden.dev/live-behavior: unverified
+spec:
+  releaseCommit: caf64d38ac32a3be62c81cfa6d786d21fc68bd5b
+  images:
+    web:
+      repository: ghcr.io/misaka3389/tracegarden-web
+      digest: sha256:b95ddd90e6a525915d68f81df1a42a4a5d1994a1d5c136ba1955a6508f76f843
+    collector:
+      repository: ghcr.io/misaka3389/tracegarden-collector
+      digest: sha256:0823af5872c101651899f5181af1669a0ebb87e2672c2032bb3bd3a26ade02b6
+    migrate:
+      repository: ghcr.io/misaka3389/tracegarden-migrate
+      digest: sha256:0ed108dbe1b1ed6e4e20863d050e5a7f1a9ee0e19854138d9405147a8b61019d
+  protectedEnvironment:
+    name: production
+    approvalRequired: true
+  gitOps:
+    repository: https://github.com/MISAKA3389/tracegarden-gitops.git
+    desiredStatePath: environments/production/tracegarden/values.yaml
+    pullRequestRequired: true
+    directClusterMutation: false

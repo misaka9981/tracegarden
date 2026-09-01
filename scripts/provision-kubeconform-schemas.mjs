@@ -9,9 +9,12 @@ const schemaDirectory = ".ci/kubeconform-schemas/v1.31.0-standalone-strict";
 const schemaFiles = [
   "configmap-v1.json",
   "deployment-apps-v1.json",
+  "limitrange-v1.json",
   "ingress-networking-v1.json",
   "job-batch-v1.json",
   "networkpolicy-networking-v1.json",
+  "poddisruptionbudget-policy-v1.json",
+  "resourcequota-v1.json",
   "role-rbac-v1.json",
   "rolebinding-rbac-v1.json",
   "service-v1.json",

@@ -1,0 +1,28 @@
+{{- if .Values.preview.host }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+  annotations:
+    tracegarden.dev/access: cloudflare-access-jwt
+    tracegarden.dev/access-issuer: {{ .Values.preview.access.issuer | quote }}
+    tracegarden.dev/access-audience: {{ .Values.preview.access.audience | quote }}
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [{{ .Values.preview.host | quote }}]
+      secretName: {{ include "tracegarden-preview.fullname" . }}-tls
+  rules:
+    - host: {{ .Values.preview.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "tracegarden-preview.fullname" . }}-web
+                port:
+                  name: http
+{{- end }}

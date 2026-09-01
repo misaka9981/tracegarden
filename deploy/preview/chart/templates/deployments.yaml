@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}-web
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "tracegarden-preview.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        {{- include "tracegarden-preview.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: web
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      automountServiceAccountToken: false
+      priorityClassName: tracegarden-preview
+      preemptionPolicy: Never
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: {{ include "tracegarden-preview.image" (dict "root" . "component" "web") | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: preview
+            - name: HOST
+              value: 0.0.0.0
+            - name: PORT
+              value: "3000"
+            - name: DATABASE_URL
+              value: {{ printf "postgresql://tracegarden_preview:preview-only-pr-%d@%s:5432/tracegarden_preview" (int .Values.preview.number) (include "tracegarden-preview.postgresService" .) | quote }}
+            - name: CLOUDFLARE_ACCESS_JWT_ISSUER
+              value: {{ .Values.preview.access.issuer | quote }}
+            - name: CLOUDFLARE_ACCESS_JWT_AUDIENCE
+              value: {{ .Values.preview.access.audience | quote }}
+            - name: TRACEGARDEN_BOOTSTRAP_ISSUER
+              value: {{ .Values.preview.access.issuer | quote }}
+            - name: TRACEGARDEN_BOOTSTRAP_SUBJECT
+              value: {{ .Values.preview.access.bootstrapSubject | quote }}
+            - name: CLOUDFLARE_ACCESS_JWT_PUBLIC_KEY
+              value: {{ .Values.preview.access.publicKey | quote }}
+          resources:
+            {{- toYaml .Values.preview.web.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}-collector
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "tracegarden-preview.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: collector
+  template:
+    metadata:
+      labels:
+        {{- include "tracegarden-preview.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: collector
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      automountServiceAccountToken: false
+      priorityClassName: tracegarden-preview
+      preemptionPolicy: Never
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: {{ include "tracegarden-preview.image" (dict "root" . "component" "collector") | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3001
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: preview
+            - name: HOST
+              value: 0.0.0.0
+            - name: COLLECTOR_PORT
+              value: "3001"
+            - name: DATABASE_URL
+              value: {{ printf "postgresql://tracegarden_preview:preview-only-pr-%d@%s:5432/tracegarden_preview" (int .Values.preview.number) (include "tracegarden-preview.postgresService" .) | quote }}
+          resources:
+            {{- toYaml .Values.preview.collector.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

@@ -1,0 +1,64 @@
+# Preview values are deliberately independent from deploy/chart production values.
+# ApplicationSet overrides only the preview number and hostname for each eligible pull request.
+# The platform operator copies this named pull secret into each tracked preview
+# namespace; its credentials are never supplied by a pull request.
+serviceAccount:
+  name: tracegarden-preview
+imagePullSecrets:
+  - name: tracegarden-preview-ghcr
+
+images:
+  web:
+    repository: ghcr.io/misaka3389/tracegarden-web
+    # No digest fallback: protected per-PR values are required for rendering.
+    digest: ""
+  collector:
+    repository: ghcr.io/misaka3389/tracegarden-collector
+    digest: ""
+  migrate:
+    repository: ghcr.io/misaka3389/tracegarden-migrate
+    digest: ""
+  postgres:
+    repository: postgres
+    digest: ""
+
+preview:
+  # The ApplicationSet supplies only the PR number and derived hostname as
+  # lookup metadata; images always come from the protected digest file.
+  number: 1
+  host: preview-pr-1.tracegarden.example
+  access:
+    issuer: https://preview.tracegarden.cloudflareaccess.com
+    audience: replace-with-preview-access-application-audience
+    bootstrapSubject: replace-with-preview-cloudflare-subject
+    publicKey: replace-with-preview-cloudflare-access-rsa-public-key
+  web:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+  collector:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+  postgres:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  quota:
+    pods: "8"
+    requestsCpu: "1"
+    requestsMemory: 2Gi
+    limitsCpu: "2"
+    limitsMemory: 4Gi

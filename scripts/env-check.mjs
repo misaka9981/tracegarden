@@ -10,6 +10,17 @@ if (process.env.NODE_ENV === "production" && (!process.env.GOOGLE_CLIENT_ID?.tri
 if (process.env.NODE_ENV === "production" && (!process.env.TRACEGARDEN_BOOTSTRAP_ISSUER?.trim() || !process.env.TRACEGARDEN_BOOTSTRAP_SUBJECT?.trim())) {
   failures.push("TRACEGARDEN_BOOTSTRAP_ISSUER and TRACEGARDEN_BOOTSTRAP_SUBJECT are required in production");
 }
+const previewAccessFields = ["CLOUDFLARE_ACCESS_JWT_ISSUER", "CLOUDFLARE_ACCESS_JWT_AUDIENCE", "CLOUDFLARE_ACCESS_JWT_PUBLIC_KEY"];
+if (process.env.NODE_ENV === "preview" && previewAccessFields.some((field) => !process.env[field]?.trim())) {
+  failures.push("Preview requires CLOUDFLARE_ACCESS_JWT_ISSUER, CLOUDFLARE_ACCESS_JWT_AUDIENCE, and CLOUDFLARE_ACCESS_JWT_PUBLIC_KEY");
+}
+if (process.env.NODE_ENV === "preview" && process.env.CLOUDFLARE_ACCESS_JWT_ISSUER?.trim()) {
+  try {
+    if (new URL(process.env.CLOUDFLARE_ACCESS_JWT_ISSUER).protocol !== "https:") failures.push("CLOUDFLARE_ACCESS_JWT_ISSUER must be HTTPS in preview");
+  } catch {
+    failures.push("CLOUDFLARE_ACCESS_JWT_ISSUER must be HTTPS in preview");
+  }
+}
 if (process.env.NODE_ENV === "production" && process.env.BETTER_AUTH_URL?.trim()) {
   try {
     if (new URL(process.env.BETTER_AUTH_URL).protocol !== "https:") failures.push("BETTER_AUTH_URL must be HTTPS in production");

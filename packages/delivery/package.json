@@ -1,0 +1,8 @@
+{
+  "name": "@tracegarden/delivery",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js"
+  }
+}

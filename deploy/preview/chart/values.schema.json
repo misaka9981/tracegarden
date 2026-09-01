@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["serviceAccount", "imagePullSecrets", "images", "preview"],
+  "properties": {
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "const": "tracegarden-preview" }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "const": "tracegarden-preview-ghcr" }
+        }
+      }
+    },
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["web", "collector", "migrate", "postgres"],
+      "properties": {
+        "web": { "$ref": "#/definitions/image" },
+        "collector": { "$ref": "#/definitions/image" },
+        "migrate": { "$ref": "#/definitions/image" },
+        "postgres": { "$ref": "#/definitions/image" }
+      }
+    },
+    "preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "host", "access", "web", "collector", "postgres", "quota"],
+      "properties": {
+        "number": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 999999999 },
+            { "type": "string", "pattern": "^[1-9][0-9]{0,8}$" }
+          ]
+        },
+        "host": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$" },
+        "access": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["issuer", "audience", "bootstrapSubject", "publicKey"],
+          "properties": {
+            "issuer": { "type": "string", "pattern": "^https://", "minLength": 1 },
+            "audience": { "type": "string", "minLength": 1 },
+            "bootstrapSubject": { "type": "string", "minLength": 1 },
+            "publicKey": { "type": "string", "minLength": 1 }
+          }
+        },
+        "web": { "$ref": "#/definitions/application" },
+        "collector": { "$ref": "#/definitions/application" },
+        "postgres": { "$ref": "#/definitions/application" },
+        "quota": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pods", "requestsCpu", "requestsMemory", "limitsCpu", "limitsMemory"],
+          "properties": {
+            "pods": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+            "requestsCpu": { "$ref": "#/definitions/cpu" },
+            "requestsMemory": { "$ref": "#/definitions/memory" },
+            "limitsCpu": { "$ref": "#/definitions/cpu" },
+            "limitsMemory": { "$ref": "#/definitions/memory" }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "digest"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resources"],
+      "properties": { "resources": { "$ref": "#/definitions/resources" } }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": { "$ref": "#/definitions/resourceValues" },
+        "limits": { "$ref": "#/definitions/resourceValues" }
+      }
+    },
+    "resourceValues": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory"],
+      "properties": { "cpu": { "$ref": "#/definitions/cpu" }, "memory": { "$ref": "#/definitions/memory" } }
+    },
+    "cpu": { "type": "string", "pattern": "^[0-9]+m?$" },
+    "memory": { "type": "string", "pattern": "^[0-9]+(?:Ki|Mi|Gi|Ti)$" }
+  }
+}

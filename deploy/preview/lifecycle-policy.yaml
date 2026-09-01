@@ -1,0 +1,83 @@
+# Operator-installed lifecycle contract. ApplicationSet supplies open PR
+# Applications; this reconciler handles state changes and missed events.
+apiVersion: delivery.tracegarden.dev/v1alpha1
+kind: PreviewLifecyclePolicy
+metadata:
+  name: tracegarden-previews
+  annotations:
+    tracegarden.dev/live-behavior: unverified-until-argocd-and-preview-controller-are-authorized
+spec:
+  eligibility:
+    pullRequestState: open
+    draft: false
+    namespaceTemplate: preview-pr-{number}
+  resources:
+    - namespace
+    - web
+    - collector
+    - temporary-postgresql
+    - non-production-seed
+  cleanup:
+    controller:
+      kind: CronJob
+      name: tracegarden-preview-lifecycle
+      namespace: argocd
+      schedule: "* * * * *"
+      reconciliationIntervalSeconds: 60
+      deletionRequestBoundSeconds: 120
+    onPullRequestState:
+      closed: delete
+      draft: delete
+    managedNamespaceMetadata:
+      labels:
+        tracegarden.dev/lifecycle: pull-request-preview
+        tracegarden.dev/pull-request: "{number}"
+        tracegarden.dev/managed-by: tracegarden-preview-lifecycle
+    orphanReconciliation:
+      enabled: true
+      selector: tracegarden.dev/lifecycle=pull-request-preview
+      namespacePrefix: preview-pr-
+      namespacePattern: '^preview-pr-[1-9][0-9]{0,8}$'
+      action: delete
+  imagePullAuthentication:
+    provisionBeforeEligibility: true
+    serviceAccountName: tracegarden-preview
+    # The Secret is referenced only by trusted chart PodSpec imagePullSecrets;
+    # the fixed ServiceAccount has no credential mount or pull-secret binding.
+    imagePullSecrets:
+      - name: tracegarden-preview-ghcr
+    sourceSecret:
+      namespace: argocd
+      name: tracegarden-preview-ghcr
+      operatorManaged: true
+      credentialsInGit: false
+  dataBoundary:
+    productionData: false
+    productionCredentials: false
+  capacity:
+    admission: ResourceQuota
+    preemptionPolicy: Never
+    aggregateAdmissionBudget:
+      enabled: true
+      selector: tracegarden.dev/lifecycle=pull-request-preview
+      maxPreviewEnvironments: 10
+      perPreview:
+        requestsCpu: 275m
+        requestsMemory: 704Mi
+        pods: "8"
+      hard:
+        pods: "80"
+        requestsCpu: "2"
+        requestsMemory: 8Gi
+      onExhaustion: reject-preview-without-preempting-production
+    clusterCapacity:
+      pods: "100"
+      requestsCpu: "4"
+      requestsMemory: 16Gi
+    productionReservation:
+      enabled: true
+      protected: true
+      pods: "20"
+      requestsCpu: "2"
+      requestsMemory: 4Gi
+      priorityClass: tracegarden-production

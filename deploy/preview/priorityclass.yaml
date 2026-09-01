@@ -1,0 +1,12 @@
+# Platform-owned admission declaration. Install once by the Cluster operator;
+# PR-sourced Applications are not allowed to create cluster-scoped PriorityClass objects.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: tracegarden-preview
+  annotations:
+    tracegarden.dev/live-behavior: unverified-until-cluster-policy-is-authorized
+value: -100
+preemptionPolicy: Never
+globalDefault: false
+description: Preview workloads yield to protected production capacity and never preempt it.

@@ -1,0 +1,500 @@
+# Operator-installed controller. The GitHub token and source GHCR Secret are
+# created out of band and are never rendered from the PR-controlled chart; the
+# controller copies the source Secret into each pre-provisioned namespace.
+# The GitHub token needs pull-request read and label-maintenance permissions;
+# it is not available to PR workflows. Create the GHCR dockerconfigjson Secret
+# in argocd out of band.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tracegarden-preview-lifecycle-controller
+  namespace: argocd
+  labels:
+    tracegarden.dev/managed-by: platform-operator
+data:
+  controller.mjs: |
+    import { readFile } from "node:fs/promises";
+    import { request as httpsRequest } from "node:https";
+    import { pathToFileURL } from "node:url";
+    export const NAMESPACE_SELECTOR = "tracegarden.dev/lifecycle=pull-request-preview";
+    export const NAMESPACE_PATTERN = /^preview-pr-([1-9][0-9]{0,8})$/;
+    export const PREVIEW_LABEL = "tracegarden.dev/preview";
+    export const TARGET_SECRET_NAME = "tracegarden-preview-ghcr";
+    export const TARGET_SERVICE_ACCOUNT_NAME = "tracegarden-preview";
+    export const SOURCE_NAMESPACE = "argocd";
+    export const SOURCE_IMAGE_SECRET_NAME = "tracegarden-preview-ghcr";
+    export const TRUSTED_GITOPS_OWNER = "MISAKA3389";
+    export const TRUSTED_GITOPS_REPOSITORY = "tracegarden-gitops";
+    export const TRUSTED_GITOPS_REVISION = "main";
+    export const TRUSTED_GITOPS_DIGEST_PATH = "environments/previews/digests";
+    // This budget is evaluated before the GitHub preview label is added. It keeps
+    // the protected production reservation outside the preview admission total.
+    export const DEFAULT_PREVIEW_CAPACITY = Object.freeze({
+      maxPreviewEnvironments: 10,
+      aggregateCpu: "2",
+      aggregateMemory: "8Gi",
+      aggregatePods: "80",
+      clusterCpu: "4",
+      clusterMemory: "16Gi",
+      clusterPods: "100",
+      productionCpu: "2",
+      productionMemory: "4Gi",
+      productionPods: "20",
+      perPreviewCpu: "275m",
+      perPreviewMemory: "704Mi",
+      perPreviewPods: "8",
+    });
+    function quantity(value, pattern, multipliers, label) {
+      const match = String(value).trim().match(pattern);
+      if (!match) throw new Error(`invalid preview ${label} quantity: ${value}`);
+      const parsed = Number(match[1]) * (match[2] ? multipliers[match[2]] : 1);
+      if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`invalid preview ${label} quantity: ${value}`);
+      return parsed;
+    }
+    function parseCpu(value) {
+      const match = String(value).trim().match(/^(\d+)(m)?$/);
+      if (!match) throw new Error(`invalid preview CPU quantity: ${value}`);
+      const parsed = Number(match[1]) * (match[2] ? 1 : 1000);
+      if (!Number.isSafeInteger(parsed)) throw new Error(`invalid preview CPU quantity: ${value}`);
+      return parsed;
+    }
+    function parseMemory(value) {
+      return quantity(value, /^(\d+)(Ki|Mi|Gi|Ti)$/, { Ki: 1, Mi: 1024, Gi: 1024 ** 2, Ti: 1024 ** 3 }, "memory");
+    }
+    function parsePods(value) {
+      return quantity(value, /^(\d+)$/, {}, "pod");
+    }
+    export function previewAdmissionDecisions(records, configuredCapacity = DEFAULT_PREVIEW_CAPACITY) {
+      const capacity = { ...DEFAULT_PREVIEW_CAPACITY, ...configuredCapacity };
+      const availableCpu = Math.min(parseCpu(capacity.aggregateCpu), parseCpu(capacity.clusterCpu) - parseCpu(capacity.productionCpu));
+      const availableMemory = Math.min(parseMemory(capacity.aggregateMemory), parseMemory(capacity.clusterMemory) - parseMemory(capacity.productionMemory));
+      const availablePods = Math.min(parsePods(capacity.aggregatePods), parsePods(capacity.clusterPods) - parsePods(capacity.productionPods));
+      if (availableCpu < 0 || availableMemory < 0 || availablePods < 0) throw new Error("production reservation exceeds cluster capacity");
+      const perPreviewCpu = parseCpu(capacity.perPreviewCpu);
+      const perPreviewMemory = parseMemory(capacity.perPreviewMemory);
+      const perPreviewPods = parsePods(capacity.perPreviewPods);
+      const decisions = new Map();
+      let count = 0;
+      let usedCpu = 0;
+      let usedMemory = 0;
+      let usedPods = 0;
+      const ordered = [...records].sort((left, right) => left.number - right.number);
+      for (const record of ordered) {
+        if (record.state !== "open" || record.draft) {
+          decisions.set(record.number, { admitted: false, reason: "ineligible" });
+          continue;
+        }
+        if (record.trustedDigest !== true) {
+          decisions.set(record.number, { admitted: false, reason: "missing-trusted-digest" });
+          continue;
+        }
+        let reason = "admitted";
+        if (count >= capacity.maxPreviewEnvironments) reason = "max-preview-environments";
+        else if (usedCpu + perPreviewCpu > availableCpu) reason = "aggregate-cpu-budget";
+        else if (usedMemory + perPreviewMemory > availableMemory) reason = "aggregate-memory-budget";
+        else if (usedPods + perPreviewPods > availablePods) reason = "aggregate-pods-budget";
+        const admitted = reason === "admitted";
+        decisions.set(record.number, { admitted, reason });
+        if (admitted) {
+          count += 1;
+          usedCpu += perPreviewCpu;
+          usedMemory += perPreviewMemory;
+          usedPods += perPreviewPods;
+        }
+      }
+      return decisions;
+    }
+    function previewNamespace(number) {
+      if (!Number.isSafeInteger(number) || number < 1 || number > 999999999) throw new Error(`invalid preview number: ${number}`);
+      return `preview-pr-${number}`;
+    }
+    function encodePart(value) {
+      return encodeURIComponent(value);
+    }
+    export function createGitHubAdapter({ owner, repo, token, request = fetch, gitOpsOwner = TRUSTED_GITOPS_OWNER, gitOpsRepo = TRUSTED_GITOPS_REPOSITORY }) {
+      const configuredOwner = owner?.trim();
+      const configuredRepo = repo?.trim();
+      const configuredToken = token?.trim();
+      if (!configuredOwner || !configuredRepo || !configuredToken) throw new Error("operator-managed GitHub configuration is required");
+      const api = async (path, method = "GET", body) => {
+        const response = await request(`https://api.github.com${path}`, {
+          method,
+          headers: {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${configuredToken}`,
+            "X-GitHub-Api-Version": "2022-11-28",
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error(`GitHub API ${method} ${path} returned ${response.status}`);
+        return response.status === 204 ? null : response.json();
+      };
+      const repoPath = `/repos/${encodePart(configuredOwner)}/${encodePart(configuredRepo)}`;
+      const gitOpsPath = `/repos/${encodePart(gitOpsOwner)}/${encodePart(gitOpsRepo)}`;
+      return {
+        async listOpenPullRequests() {
+          const pullRequests = [];
+          for (let page = 1; ; page += 1) {
+            const result = await api(`${repoPath}/pulls?state=open&per_page=100&page=${page}`);
+            if (!Array.isArray(result)) break;
+            pullRequests.push(...result.map((pullRequest) => ({ number: Number(pullRequest.number), state: pullRequest.state, draft: pullRequest.draft === true })));
+            if (result.length < 100) break;
+          }
+          return pullRequests;
+        },
+        async getPullRequest(number) {
+          const pullRequest = await api(`${repoPath}/pulls/${encodePart(number)}`);
+          if (!pullRequest) return null;
+          return { number, state: pullRequest.state, draft: pullRequest.draft === true };
+        },
+        async hasTrustedDigest(number) {
+          const path = `${gitOpsPath}/contents/${encodePart(`${TRUSTED_GITOPS_DIGEST_PATH}/pr-${number}.yaml`)}?ref=${encodePart(TRUSTED_GITOPS_REVISION)}`;
+          const file = await api(path);
+          return file?.type === "file" && typeof file.content === "string" && file.content.trim().length > 0;
+        },
+        async setPreviewLabel(number, enabled) {
+          const path = `${repoPath}/issues/${encodePart(number)}/labels`;
+          const labels = await api(path);
+          const present = Array.isArray(labels) && labels.some(({ name }) => name === PREVIEW_LABEL);
+          if (enabled && !present) await api(path, "POST", { labels: [PREVIEW_LABEL] });
+          if (!enabled && present) await api(`${path}/${encodePart(PREVIEW_LABEL)}`, "DELETE");
+        },
+      };
+    }
+    export function createKubernetesAdapter({ host, port, ca, token }) {
+      if (!host || !Number.isInteger(port) || port < 1 || !ca || !token) throw new Error("in-cluster Kubernetes configuration is required");
+      const api = (path, method = "GET", body) => new Promise((resolve, reject) => {
+        const request = httpsRequest({
+          hostname: host,
+          port,
+          path,
+          method,
+          ca,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+            ...(body === undefined ? {} : { "Content-Type": method === "PATCH" ? "application/merge-patch+json" : "application/json" }),
+          },
+        }, (response) => {
+          let data = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => { data += chunk; });
+          response.on("end", () => {
+            const status = response.statusCode ?? 500;
+            if (status < 200 || status >= 300) {
+              const error = new Error(`Kubernetes API ${method} ${path} returned ${status}`);
+              error.status = status;
+              reject(error);
+              return;
+            }
+            try {
+              resolve(data ? JSON.parse(data) : null);
+            } catch (error) {
+              reject(error);
+            }
+          });
+        });
+        request.on("error", reject);
+        if (body !== undefined) request.write(JSON.stringify(body));
+        request.end();
+      });
+      const secretPath = (namespace, name) => `/api/v1/namespaces/${encodePart(namespace)}/secrets/${encodePart(name)}`;
+      const serviceAccountPath = (namespace) => `/api/v1/namespaces/${encodePart(namespace)}/serviceaccounts/${TARGET_SERVICE_ACCOUNT_NAME}`;
+      return {
+        async listPreviewNamespaces() {
+          const result = await api(`/api/v1/namespaces?labelSelector=${encodePart(NAMESPACE_SELECTOR)}`);
+          return result?.items ?? [];
+        },
+        async getOperatorImagePullSecret() {
+          const source = await api(secretPath(SOURCE_NAMESPACE, SOURCE_IMAGE_SECRET_NAME));
+          if (source?.type !== "kubernetes.io/dockerconfigjson" || typeof source.data?.[".dockerconfigjson"] !== "string" || !source.data[".dockerconfigjson"].trim()) {
+            throw new Error(`operator-managed ${SOURCE_NAMESPACE}/${SOURCE_IMAGE_SECRET_NAME} must be a dockerconfigjson Secret`);
+          }
+          return { type: source.type, data: { ".dockerconfigjson": source.data[".dockerconfigjson"] } };
+        },
+        async ensureNamespace(namespace, number) {
+          try {
+            await api(`/api/v1/namespaces/${encodePart(namespace)}`);
+          } catch (error) {
+            if (error?.status !== 404) throw error;
+            try {
+              await api("/api/v1/namespaces", "POST", {
+                apiVersion: "v1",
+                kind: "Namespace",
+                metadata: {
+                  name: namespace,
+                  labels: {
+                    "tracegarden.dev/lifecycle": "pull-request-preview",
+                    "tracegarden.dev/pull-request": String(number),
+                    "tracegarden.dev/managed-by": "tracegarden-preview-lifecycle",
+                  },
+                },
+              });
+            } catch (createError) {
+              if (createError?.status !== 409) throw createError;
+            }
+          }
+        },
+        async ensureImagePullAuthentication(namespace, source) {
+          const secret = {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: { name: TARGET_SECRET_NAME, namespace, labels: { "tracegarden.dev/managed-by": "tracegarden-preview-lifecycle" } },
+            type: source.type,
+            data: source.data,
+          };
+          try {
+            await api(secretPath(namespace, TARGET_SECRET_NAME), "PATCH", { metadata: { labels: secret.metadata.labels }, type: secret.type, data: secret.data });
+          } catch (error) {
+            if (error?.status !== 404) throw error;
+            await api(`/api/v1/namespaces/${encodePart(namespace)}/secrets`, "POST", secret);
+          }
+          const serviceAccount = {
+            apiVersion: "v1",
+            kind: "ServiceAccount",
+            metadata: { name: TARGET_SERVICE_ACCOUNT_NAME, namespace, labels: { "tracegarden.dev/managed-by": "tracegarden-preview-lifecycle" } },
+            automountServiceAccountToken: false,
+          };
+          try {
+            await api(serviceAccountPath(namespace), "PATCH", { metadata: { labels: serviceAccount.metadata.labels }, automountServiceAccountToken: false });
+          } catch (error) {
+            if (error?.status !== 404) throw error;
+            await api(`/api/v1/namespaces/${encodePart(namespace)}/serviceaccounts`, "POST", serviceAccount);
+          }
+        },
+        async labelNamespace(namespace, number, state, draft, admissionReason) {
+          await api(`/api/v1/namespaces/${encodePart(namespace)}`, "PATCH", {
+            metadata: { labels: {
+              "tracegarden.dev/lifecycle": "pull-request-preview",
+              "tracegarden.dev/pull-request": String(number),
+              "tracegarden.dev/pull-request-state": state,
+              "tracegarden.dev/pull-request-draft": String(draft),
+              "tracegarden.dev/admission": admissionReason,
+              "tracegarden.dev/managed-by": "tracegarden-preview-lifecycle",
+            } },
+          });
+        },
+        async deleteNamespace(namespace) {
+          try {
+            await api(`/api/v1/namespaces/${encodePart(namespace)}`, "DELETE");
+          } catch (error) {
+            if (error?.status !== 404) throw error;
+          }
+        },
+      };
+    }
+    export async function reconcilePreviewEnvironments({ github, kubernetes, capacity = DEFAULT_PREVIEW_CAPACITY }) {
+      const existingItems = await kubernetes.listPreviewNamespaces();
+      const records = new Map();
+      for (const pullRequest of await github.listOpenPullRequests()) {
+        if (Number.isSafeInteger(pullRequest.number) && pullRequest.number > 0 && pullRequest.number <= 999999999) {
+          records.set(pullRequest.number, { number: pullRequest.number, state: pullRequest.state, draft: pullRequest.draft === true });
+        }
+      }
+      const existing = new Map();
+      for (const item of existingItems) {
+        const name = item.metadata?.name;
+        const number = Number(name?.match(NAMESPACE_PATTERN)?.[1]);
+        if (!name || !Number.isSafeInteger(number)) continue;
+        existing.set(number, name);
+        if (!records.has(number)) {
+          const pullRequest = await github.getPullRequest(number);
+          records.set(number, pullRequest ?? { number, state: "closed", draft: false, orphan: true });
+        }
+      }
+      const normalizedRecords = [...records.values()].filter(Boolean);
+      for (const record of normalizedRecords) {
+        record.trustedDigest = record.state === "open" && !record.draft && await github.hasTrustedDigest(record.number);
+      }
+      const decisions = previewAdmissionDecisions(normalizedRecords, capacity);
+      const source = normalizedRecords.some((record) => decisions.get(record.number)?.admitted === true)
+        ? await kubernetes.getOperatorImagePullSecret()
+        : null;
+      for (const record of normalizedRecords.sort((left, right) => left.number - right.number)) {
+        const namespace = previewNamespace(record.number);
+        const decision = decisions.get(record.number) ?? { admitted: false, reason: "ineligible" };
+        if (!decision.admitted) {
+          await github.setPreviewLabel(record.number, false);
+          if (existing.has(record.number)) await kubernetes.deleteNamespace(existing.get(record.number));
+          continue;
+        }
+        await kubernetes.ensureNamespace(namespace, record.number);
+        if (!source) throw new Error("operator-managed GHCR pull Secret is required before preview eligibility");
+        await kubernetes.ensureImagePullAuthentication(namespace, source);
+        await kubernetes.labelNamespace(namespace, record.number, record.state, record.draft, decision.reason);
+        await github.setPreviewLabel(record.number, true);
+      }
+      return { decisions, processed: normalizedRecords.map(({ number }) => number) };
+    }
+    async function runController() {
+      const host = process.env.KUBERNETES_SERVICE_HOST;
+      const port = Number(process.env.KUBERNETES_SERVICE_PORT_HTTPS ?? "443");
+      const token = (await readFile("/var/run/secrets/kubernetes.io/serviceaccount/token", "utf8")).trim();
+      const ca = await readFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
+      const github = createGitHubAdapter({
+        owner: process.env.GITHUB_OWNER,
+        repo: process.env.GITHUB_REPO,
+        token: process.env.GITHUB_TOKEN,
+      });
+      const kubernetes = createKubernetesAdapter({ host, port, ca, token });
+      await reconcilePreviewEnvironments({ github, kubernetes });
+    }
+    if (process.env.PREVIEW_LIFECYCLE_OFFLINE === "true") {
+      console.log("offline lifecycle controller check passed");
+    } else if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+      await runController();
+    }
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tracegarden-preview-lifecycle
+  namespace: argocd
+  labels:
+    tracegarden.dev/managed-by: platform-operator
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tracegarden-preview-lifecycle-source
+  namespace: argocd
+  labels:
+    tracegarden.dev/managed-by: platform-operator
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [tracegarden-preview-ghcr]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tracegarden-preview-lifecycle-source
+  namespace: argocd
+  labels:
+    tracegarden.dev/managed-by: platform-operator
+subjects:
+  - kind: ServiceAccount
+    name: tracegarden-preview-lifecycle
+    namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tracegarden-preview-lifecycle-source
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tracegarden-preview-lifecycle
+  labels:
+    tracegarden.dev/managed-by: platform-operator
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, create, patch, delete]
+  # Kubernetes does not apply resourceNames to create requests. The
+  # reconciler hard-codes both names before using these create permissions.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [tracegarden-preview-ghcr]
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    resourceNames: [tracegarden-preview]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tracegarden-preview-lifecycle
+  labels:
+    tracegarden.dev/managed-by: platform-operator
+subjects:
+  - kind: ServiceAccount
+    name: tracegarden-preview-lifecycle
+    namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tracegarden-preview-lifecycle
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tracegarden-preview-lifecycle
+  namespace: argocd
+  labels:
+    tracegarden.dev/managed-by: platform-operator
+  annotations:
+    tracegarden.dev/reconciliation-bound: 120s
+    tracegarden.dev/live-behavior: unverified-until-operator-installs-controller
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 30
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 45
+      template:
+        metadata:
+          labels:
+            tracegarden.dev/managed-by: platform-operator
+        spec:
+          serviceAccountName: tracegarden-preview-lifecycle
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: controller
+              image: node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89
+              imagePullPolicy: IfNotPresent
+              command: [node, /controller/controller.mjs]
+              env:
+                - name: GITHUB_OWNER
+                  value: MISAKA3389
+                - name: GITHUB_REPO
+                  value: tracegarden
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: tracegarden-preview-github
+                      key: token
+              volumeMounts:
+                - name: controller
+                  mountPath: /controller
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+          volumes:
+            - name: controller
+              configMap:
+                name: tracegarden-preview-lifecycle-controller
+                defaultMode: 0555

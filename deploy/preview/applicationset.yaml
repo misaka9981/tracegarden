@@ -1,0 +1,79 @@
+# Operator-installed trust boundary: the chart and digest values come only
+# from protected main. No GitHub token or Cluster credential is stored in Git.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: tracegarden-previews
+  namespace: argocd
+  annotations:
+    tracegarden.dev/live-behavior: unverified-until-argocd-and-github-are-authorized
+spec:
+  # ApplicationSet itself is installed by the platform operator. This policy
+  # makes every generated Application read only the protected GitOps source.
+  syncPolicy:
+    preserveResourcesOnDeletion: false
+  goTemplate: true
+  goTemplateOptions:
+    - missingkey=error
+  generators:
+    - pullRequest:
+        # The GitHub PR generator selects only the operator-maintained preview
+        # label. The PR number selects a file; it cannot select its contents.
+        requeueAfterSeconds: 60
+        github:
+          owner: MISAKA3389
+          repo: tracegarden
+          # The operator lifecycle controller applies this label only to open,
+          # non-draft PRs and removes it when cleanup is required.
+          labels:
+            - tracegarden.dev/preview
+          # Operator-created; never store the private-repo token in Git.
+          tokenRef:
+            secretName: tracegarden-preview-github
+            key: token
+  template:
+    metadata:
+      name: 'tracegarden-preview-pr-{{.number}}'
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+      labels:
+        tracegarden.dev/lifecycle: pull-request-preview
+        tracegarden.dev/pull-request: '{{.number}}'
+      annotations:
+        tracegarden.dev/eligibility: 'open-and-non-draft-preview-label'
+        tracegarden.dev/cleanup: 'close-or-draft-or-orphan'
+    spec:
+      project: previews
+      source:
+        repoURL: https://github.com/MISAKA3389/tracegarden-gitops.git
+        targetRevision: main
+        path: environments/previews/chart
+        helm:
+          releaseName: 'tracegarden-preview-pr-{{.number}}'
+          # This protected revision contains the reviewed chart. The value
+          # file is also read from protected main, never from a PR head.
+          valueFiles:
+            - '../digests/pr-{{.number}}.yaml'
+          ignoreMissingValueFiles: false
+          parameters:
+            - name: preview.number
+              value: '{{.number}}'
+            - name: preview.host
+              value: 'preview-pr-{{.number}}.tracegarden.example'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: 'preview-pr-{{.number}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        managedNamespaceMetadata:
+          labels:
+            tracegarden.dev/lifecycle: pull-request-preview
+            tracegarden.dev/pull-request: '{{.number}}'
+            tracegarden.dev/managed-by: tracegarden-preview-lifecycle
+        syncOptions:
+          - PruneLast=true
+  # The operator lifecycle controller reconciles GitHub state and deletes
+  # closed, draft, and orphan namespaces. Argo still prunes Applications that
+  # disappear from its supported open-PR generator.

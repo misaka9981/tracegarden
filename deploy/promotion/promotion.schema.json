@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "delivery.tracegarden.dev/v1alpha1" },
+    "kind": { "const": "Promotion" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "annotations"],
+      "properties": {
+        "name": { "const": "tracegarden-production" },
+        "annotations": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["releaseCommit", "images", "protectedEnvironment", "gitOps"],
+      "properties": {
+        "releaseCommit": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "images": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["web", "collector", "migrate"],
+          "properties": {
+            "web": { "$ref": "#/definitions/image" },
+            "collector": { "$ref": "#/definitions/image" },
+            "migrate": { "$ref": "#/definitions/image" }
+          }
+        },
+        "protectedEnvironment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "approvalRequired"],
+          "properties": { "name": { "const": "production" }, "approvalRequired": { "const": true } }
+        },
+        "gitOps": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "desiredStatePath", "pullRequestRequired", "directClusterMutation"],
+          "properties": {
+            "repository": { "const": "https://github.com/MISAKA3389/tracegarden-gitops.git" },
+            "desiredStatePath": { "const": "environments/production/tracegarden/values.yaml" },
+            "pullRequestRequired": { "const": true },
+            "directClusterMutation": { "const": false }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "digest"],
+      "properties": {
+        "repository": { "type": "string", "pattern": "^ghcr.io/misaka3389/tracegarden-(web|collector|migrate)$" },
+        "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

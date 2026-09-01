@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}-web
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "tracegarden-preview.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}-collector
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3001
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "tracegarden-preview.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: collector

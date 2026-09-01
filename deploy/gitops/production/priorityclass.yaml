@@ -1,0 +1,12 @@
+# Platform-owned production reservation declaration. Argo CD applies this from
+# the protected production GitOps source, never from a pull-request chart.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: tracegarden-production
+  annotations:
+    tracegarden.dev/live-behavior: unverified-until-argocd-is-authorized
+value: 1000
+preemptionPolicy: PreemptLowerPriority
+globalDefault: false
+description: Protected production workloads retain priority over disposable previews.

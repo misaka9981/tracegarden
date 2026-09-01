@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "argoproj.io/v1alpha1" },
+    "kind": { "const": "AppProject" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "namespace", "annotations"],
+      "properties": {
+        "name": { "const": "previews" },
+        "namespace": { "const": "argocd" },
+        "annotations": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceRepos", "destinations", "clusterResourceWhitelist", "namespaceResourceWhitelist"],
+      "properties": {
+        "sourceRepos": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "const": "https://github.com/MISAKA3389/tracegarden-gitops.git" }
+        },
+        "destinations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["server", "namespace"],
+            "properties": {
+              "server": { "const": "https://kubernetes.default.svc" },
+              "namespace": { "const": "preview-pr-*" }
+            }
+          }
+        },
+        "clusterResourceWhitelist": {
+          "type": "array",
+          "maxItems": 0
+        },
+        "namespaceResourceWhitelist": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["group", "kind"],
+            "properties": {
+              "group": { "type": "string" },
+              "kind": { "type": "string" }
+            },
+            "oneOf": [
+              { "properties": { "group": { "const": "" }, "kind": { "enum": ["ConfigMap", "LimitRange", "ResourceQuota", "Service"] } } },
+              { "properties": { "group": { "const": "apps" }, "kind": { "enum": ["Deployment", "StatefulSet"] } } },
+              { "properties": { "group": { "const": "batch" }, "kind": { "const": "Job" } } },
+              { "properties": { "group": { "const": "networking.k8s.io" }, "kind": { "const": "Ingress" } } },
+              { "properties": { "group": { "const": "networking.k8s.io" }, "kind": { "const": "NetworkPolicy" } } },
+              { "properties": { "group": { "const": "policy" }, "kind": { "const": "PodDisruptionBudget" } } }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

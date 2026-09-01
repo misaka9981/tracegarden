@@ -178,9 +178,86 @@ jobs:
           chmod +x "$RUNNER_TEMP/tracegarden-tools/helm" "$RUNNER_TEMP/tracegarden-tools/kubeconform"
           echo "$RUNNER_TEMP/tracegarden-tools" >> "$GITHUB_PATH"
       - run: command -v helm && command -v kubeconform
+      - run: pnpm preview:validate
       - run: pnpm test:chart
       - run: pnpm chart:render
       - run: pnpm chart:validate
+
+  preview-publish:
+    name: Build immutable pull-request preview images
+    if: vars.ENABLE_PREVIEW_PUBLICATION == 'true' && github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    needs: [static, postgres, browser, manifests, container, security]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      web_digest: ${{ steps.web.outputs.digest }}
+      collector_digest: ${{ steps.collector.outputs.digest }}
+      migrate_digest: ${{ steps.migrate.outputs.digest }}
+    env:
+      GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
+      IMAGE_PREFIX: ghcr.io/${{ vars.GHCR_NAMESPACE }}/tracegarden
+      PREVIEW_NUMBER: ${{ github.event.pull_request.number }}
+      PREVIEW_COMMIT: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+      - run: npm install --global pnpm@${PNPM_VERSION}
+      - run: pnpm install --frozen-lockfile
+      - name: Verify preview publication namespace configuration
+        run: test "$GHCR_NAMESPACE" = misaka3389 && test "$GHCR_NAMESPACE" = "${GHCR_NAMESPACE,,}"
+      - name: Login to the configured private GHCR namespace
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      # Tags are only build transport; the value-file handoff below records
+      # the registry's immutable digest, never the tag.
+      - name: Publish pull-request web image
+        id: web
+        run: |
+          set -eu
+          docker buildx build --platform linux/arm64 --file deploy/docker/web.Dockerfile --tag "${IMAGE_PREFIX}-web:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-web.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/preview-web.json")" >> "$GITHUB_OUTPUT"
+      - name: Publish pull-request collector image
+        id: collector
+        run: |
+          set -eu
+          docker buildx build --platform linux/arm64 --file deploy/docker/collector.Dockerfile --tag "${IMAGE_PREFIX}-collector:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-collector.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/preview-collector.json")" >> "$GITHUB_OUTPUT"
+      - name: Publish pull-request migration image
+        id: migrate
+        run: |
+          set -eu
+          docker buildx build --platform linux/arm64 --file deploy/docker/migrate.Dockerfile --tag "${IMAGE_PREFIX}-migrate:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-migrate.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/preview-migrate.json")" >> "$GITHUB_OUTPUT"
+      - name: Write actual preview digests
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/tracegarden-preview"
+          PREVIEW_NUMBER="$PREVIEW_NUMBER" PREVIEW_COMMIT="$PREVIEW_COMMIT" \
+            WEB_REPOSITORY="${IMAGE_PREFIX}-web" WEB_DIGEST="${{ steps.web.outputs.digest }}" \
+            COLLECTOR_REPOSITORY="${IMAGE_PREFIX}-collector" COLLECTOR_DIGEST="${{ steps.collector.outputs.digest }}" \
+            MIGRATE_REPOSITORY="${IMAGE_PREFIX}-migrate" MIGRATE_DIGEST="${{ steps.migrate.outputs.digest }}" \
+            node scripts/preview-artifact.mjs \
+            "$RUNNER_TEMP/tracegarden-preview/preview-image-declaration.yaml" \
+            "$RUNNER_TEMP/tracegarden-preview/environments/previews/digests/pr-${PREVIEW_NUMBER}.yaml"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tracegarden-pr-${{ github.event.pull_request.number }}-preview-digests
+          path: ${{ runner.temp }}/tracegarden-preview
+          if-no-files-found: error
+          retention-days: 14
 
   security:
     name: Dependency, image, secret, and supply-chain checks
@@ -218,6 +295,10 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+    outputs:
+      web_digest: ${{ steps.web.outputs.digest }}
+      collector_digest: ${{ steps.collector.outputs.digest }}
+      migrate_digest: ${{ steps.migrate.outputs.digest }}
     env:
       # Set GHCR_NAMESPACE to the lower-case intended private owner before enabling publication.
       GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
@@ -353,3 +434,56 @@ jobs:
           path: ${{ runner.temp }}/tracegarden-supply-chain-evidence
           if-no-files-found: error
           retention-days: 90
+
+  promotion-proposal:
+    name: Propose protected production GitOps promotion
+    if: vars.ENABLE_GITOPS_PROMOTION == 'true' && (github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v'))
+    needs: [publish]
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+      - run: npm install --global pnpm@${PNPM_VERSION}
+      - run: pnpm install --frozen-lockfile
+      - name: Validate reviewable promotion proposal
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          WEB_DIGEST: ${{ needs.publish.outputs.web_digest }}
+          COLLECTOR_DIGEST: ${{ needs.publish.outputs.collector_digest }}
+          MIGRATE_DIGEST: ${{ needs.publish.outputs.migrate_digest }}
+          GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
+        run: |
+          set -eu
+          test "$RELEASE_COMMIT" = "$(git rev-parse HEAD)"
+          for digest in "$WEB_DIGEST" "$COLLECTOR_DIGEST" "$MIGRATE_DIGEST"; do
+            printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          done
+          grep -q 'approvalRequired: true' deploy/promotion/promotion.yaml
+          grep -q 'pullRequestRequired: true' deploy/promotion/promotion.yaml
+          grep -q 'directClusterMutation: false' deploy/promotion/promotion.yaml
+          pnpm build
+          pnpm delivery:validate
+          mkdir -p "$RUNNER_TEMP/tracegarden-promotion"
+          node scripts/promotion-artifact.mjs "$RUNNER_TEMP/tracegarden-promotion/desired-state.patch.yaml"
+          {
+            printf '%s\n' "releaseCommit=$RELEASE_COMMIT"
+            printf '%s\n' "web=$WEB_DIGEST"
+            printf '%s\n' "collector=$COLLECTOR_DIGEST"
+            printf '%s\n' "migrate=$MIGRATE_DIGEST"
+            printf '%s\n' 'desired-state-update=GitOps pull request only'
+          } > "$RUNNER_TEMP/tracegarden-promotion/proposal.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tracegarden-${{ github.sha }}-promotion-proposal
+          path: ${{ runner.temp }}/tracegarden-promotion
+          if-no-files-found: error
+          retention-days: 30

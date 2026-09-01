@@ -1,0 +1,39 @@
+# This trusted project is installed by the Argo CD administrator, not by a PR.
+# It is the admission boundary for the PR-sourced preview chart.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: previews
+  namespace: argocd
+  annotations:
+    tracegarden.dev/live-behavior: unverified-until-argocd-is-authorized
+spec:
+  sourceRepos:
+    - https://github.com/MISAKA3389/tracegarden-gitops.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: preview-pr-*
+  # No PR-sourced cluster-scoped resources are admitted. The lifecycle
+  # controller creates each destination namespace before eligibility.
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: LimitRange
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: policy
+      kind: PodDisruptionBudget
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: Service
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: StatefulSet
+    - group: batch
+      kind: Job
+    - group: networking.k8s.io
+      kind: Ingress

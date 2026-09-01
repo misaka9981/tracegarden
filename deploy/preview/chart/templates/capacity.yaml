@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}-quota
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+  annotations:
+    tracegarden.dev/admission: resource-quota
+    tracegarden.dev/production-reservations: untouched
+spec:
+  hard:
+    pods: {{ .Values.preview.quota.pods | quote }}
+    requests.cpu: {{ .Values.preview.quota.requestsCpu | quote }}
+    requests.memory: {{ .Values.preview.quota.requestsMemory | quote }}
+    limits.cpu: {{ .Values.preview.quota.limitsCpu | quote }}
+    limits.memory: {{ .Values.preview.quota.limitsMemory | quote }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}-limits
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+  annotations:
+    tracegarden.dev/admission: reject-missing-or-over-limit-resources
+spec:
+  limits:
+    - type: Container
+      min:
+        cpu: 10m
+        memory: 16Mi
+      max:
+        cpu: {{ .Values.preview.quota.limitsCpu | quote }}
+        memory: {{ .Values.preview.quota.limitsMemory | quote }}
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+      default:
+        cpu: 250m
+        memory: 256Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}-web
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "tracegarden-preview.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: web

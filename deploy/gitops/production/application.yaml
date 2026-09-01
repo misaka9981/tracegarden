@@ -1,0 +1,25 @@
+# Argo CD is the only Cluster reconciler for production. This declaration is
+# intentionally unverified until an authorized Argo instance has been supplied.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tracegarden-production
+  namespace: argocd
+  annotations:
+    tracegarden.dev/live-behavior: unverified
+    tracegarden.dev/reconciliation: argocd-pull
+spec:
+  project: production
+  source:
+    repoURL: https://github.com/MISAKA3389/tracegarden-gitops.git
+    targetRevision: main
+    path: environments/production/tracegarden
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tracegarden
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - PruneLast=true

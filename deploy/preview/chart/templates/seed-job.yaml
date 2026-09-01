@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "tracegarden-preview.fullname" . }}-seed
+  labels:
+    {{- include "tracegarden-preview.labels" . | nindent 4 }}
+    app.kubernetes.io/component: seed
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    tracegarden.dev/data-scope: non-production
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        {{- include "tracegarden-preview.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: seed
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      automountServiceAccountToken: false
+      priorityClassName: tracegarden-preview
+      preemptionPolicy: Never
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: seed
+          image: {{ include "tracegarden-preview.image" (dict "root" . "component" "postgres") | quote }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PGHOST
+              value: {{ include "tracegarden-preview.postgresService" . | quote }}
+            - name: PGPORT
+              value: "5432"
+            - name: PGDATABASE
+              value: tracegarden_preview
+            - name: PGUSER
+              value: tracegarden_preview
+            - name: PGPASSWORD
+              value: {{ printf "preview-only-pr-%d" (int .Values.preview.number) | quote }}
+          command: ["sh", "-ceu"]
+          args:
+            - |
+              until pg_isready -q; do sleep 2; done
+              psql -v ON_ERROR_STOP=1 <<'SQL'
+              CREATE TABLE IF NOT EXISTS tracegarden_preview_seed (id integer PRIMARY KEY, label text NOT NULL);
+              INSERT INTO tracegarden_preview_seed (id, label) VALUES (1, 'non-production preview seed') ON CONFLICT (id) DO NOTHING;
+              SQL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

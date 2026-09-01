@@ -29,7 +29,9 @@ import {
 } from "../../../packages/cluster/src/index.js";
 import {
   capabilities,
+  cloudflareAccessIdentity,
   configuredBootstrapIdentity,
+  configuredCloudflareAccess,
   createIdentityAdapter,
   GOOGLE_ISSUER,
   hasCapability,
@@ -1034,6 +1036,11 @@ function setResponseHeaders(response: ServerResponse, headers: Headers): void {
 export async function createWebRuntime(options: WebOptions = {}): Promise<WebRuntime> {
   const environment = options.environment ?? process.env;
   const production = environment.NODE_ENV === "production";
+  const preview = environment.NODE_ENV === "preview";
+  const cloudflareAccess = configuredCloudflareAccess(environment);
+  if (preview && !cloudflareAccess) {
+    throw new Error("Preview identity requires complete Cloudflare Access JWT configuration");
+  }
   if (production && options.telemetry) {
     throw new Error("Production web instrumentation must be application-owned");
   }
@@ -1051,6 +1058,10 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   if (environment.NODE_ENV === "production" && !environment.TIMELINE_CURSOR_SECRET?.trim()) {
     await database.close();
     throw new Error("TIMELINE_CURSOR_SECRET is required in production");
+  }
+  if (preview && options.identityAdapter) {
+    await database.close();
+    throw new Error("Preview identity cannot use a local identity adapter");
   }
   const identityAdapter = options.identityAdapter ?? createIdentityAdapter(environment);
   const logAdapter = options.logAdapter ?? createKubernetesLogAdapter(environment);
@@ -1234,6 +1245,19 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   }>;
 
   const sessionForRequest = async (request: IncomingMessage): Promise<RequestSession> => {
+    if (cloudflareAccess) {
+      const identity = cloudflareAccessIdentity(requestHeaders(request), cloudflareAccess);
+      if (identity) {
+        const admission = await admissionStore.admit(identity, {
+          token: randomUUID(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        });
+        return admission.admitted
+          ? { session: admission.session }
+          : { session: null, rejection: admission.reason };
+      }
+      return { session: null };
+    }
     if (betterAuthRuntime) {
       const authenticated = await betterAuthRuntime.session(requestHeaders(request));
       if (!authenticated) return { session: null };
@@ -1494,10 +1518,10 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         return;
       }
       if ((requestUrl.pathname === "/auth/login" || requestUrl.pathname === "/login") && method === "POST") {
-        if (identityAdapter.kind !== "local") {
+        if (cloudflareAccess || identityAdapter.kind !== "local") {
           response.statusCode = 405;
           response.setHeader("content-type", "application/json; charset=utf-8");
-          response.end(JSON.stringify({ error: "google_login_required" }));
+          response.end(JSON.stringify({ error: cloudflareAccess ? "cloudflare_access_jwt_required" : "google_login_required" }));
           return;
         }
         const form = new URLSearchParams(await requestBody(request));
@@ -1542,6 +1566,10 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         return;
       }
       if ((requestUrl.pathname === "/auth/login" || requestUrl.pathname === "/login") && method === "GET") {
+        if (cloudflareAccess) {
+          sendJson(response, 401, { error: "cloudflare_access_jwt_required" });
+          return;
+        }
         const current = await status();
         response.statusCode = current.status === "ready" ? 200 : 503;
         response.setHeader("content-type", "text/html; charset=utf-8");
@@ -2654,6 +2682,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
               ...(requestUrl.searchParams.get("retention") === "updated" ? { retentionSaved: true } : {}),
               ...(cleanupResult === undefined ? {} : { retentionResult: cleanupResult }),
             }, timelinePage.entries, timelinePage, timelineQuery, experiments, correlationSuggestions, retentionPolicy));
+          } else if (cloudflareAccess) {
+            sendJson(response, 401, { error: "cloudflare_access_jwt_required" });
           } else {
             response.end(renderLoginPage(language, current.checks.database === "ready", identityAdapter));
           }

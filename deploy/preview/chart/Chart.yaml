@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tracegarden-preview
+description: Disposable pull-request Preview Environment for Tracegarden
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
