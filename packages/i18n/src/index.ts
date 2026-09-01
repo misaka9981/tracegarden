@@ -62,6 +62,19 @@ export type Messages = Readonly<{
   resourceIdentity: string;
   observedAt: string;
   timelineUnknownState: string;
+  recentLogsTitle: string;
+  recentLogsDescription: string;
+  logCluster: string;
+  logNamespace: string;
+  logPod: string;
+  logContainer: string;
+  logTail: string;
+  requestLogs: string;
+  logsReadDenied: string;
+  recentLogsInvalid: string;
+  recentLogsUnavailable: string;
+  recentLogsEmpty: string;
+  recentLogsMetadata: string;
 }>;
 
 export const catalogs: Readonly<Record<Language, Messages>> = {
@@ -126,7 +139,20 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     podObservation: "Pod Observation",
     resourceIdentity: "资源身份",
     observedAt: "观测时间",
-    timelineUnknownState: "状态未知"
+    timelineUnknownState: "状态未知",
+    recentLogsTitle: "Recent Log Window",
+    recentLogsDescription: "Owner 可以通过独立的 Kubernetes 身份查看一个 Pod 容器的有限近期日志。日志不会被 Tracegarden 保存。",
+    logCluster: "Cluster ID",
+    logNamespace: "命名空间",
+    logPod: "Pod",
+    logContainer: "容器",
+    logTail: "行数（最多 200）",
+    requestLogs: "请求近期日志",
+    logsReadDenied: "你没有读取 Recent Log Window 的 Capability。",
+    recentLogsInvalid: "Recent Log Window 请求无效，请检查 Cluster、命名空间、Pod、容器和行数。",
+    recentLogsUnavailable: "Recent Log Window 当前不可用。",
+    recentLogsEmpty: "没有可显示的近期日志。",
+    recentLogsMetadata: "结果限制：最多 200 行或 1 MiB；此响应不会被保存。"
   },
   en: {
     appName: "Tracegarden",
@@ -189,7 +215,20 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     podObservation: "Pod Observation",
     resourceIdentity: "Resource identity",
     observedAt: "Observed at",
-    timelineUnknownState: "State unknown"
+    timelineUnknownState: "State unknown",
+    recentLogsTitle: "Recent Log Window",
+    recentLogsDescription: "The owner can view a bounded recent window for one Pod container through a separate Kubernetes identity. Tracegarden never saves log bodies.",
+    logCluster: "Cluster ID",
+    logNamespace: "Namespace",
+    logPod: "Pod",
+    logContainer: "Container",
+    logTail: "Lines (maximum 200)",
+    requestLogs: "Request recent logs",
+    logsReadDenied: "You do not have the Capability to read the Recent Log Window.",
+    recentLogsInvalid: "The Recent Log Window request is invalid. Check the Cluster, namespace, Pod, container, and tail.",
+    recentLogsUnavailable: "The Recent Log Window is currently unavailable.",
+    recentLogsEmpty: "No recent logs are available.",
+    recentLogsMetadata: "Bounded to 200 lines or 1 MiB; this response is not saved."
   },
 };
 

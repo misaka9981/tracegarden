@@ -43,6 +43,8 @@ try {
   assert.equal(await page.locator("html").getAttribute("lang"), "zh-CN");
   assert.match(await page.locator("h1").innerText(), /共享 Workspace/);
   assert.match(await page.locator("body").innerText(), /owner@example.test/);
+  assert.match(await page.locator("body").innerText(), /Recent Log Window/);
+  assert.match(await page.locator("body").innerText(), /logs:read/);
 
   await page.goto(`http://127.0.0.1:${port}/app?lang=en`, { waitUntil: "domcontentloaded" });
   assert.equal(await page.title(), "Tracegarden · Shared Workspace");
@@ -75,6 +77,7 @@ try {
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.waitForLoadState("domcontentloaded");
   assert.match(await page.locator("body").innerText(), /Shared Workspace/);
+  assert.match(await page.locator("body").innerText(), /do not have the Capability to read the Recent Log Window/);
   assert.equal(await page.locator('a[href^="/members"]').count(), 0);
   const viewerInvitationAttempt = await page.evaluate(async () => (await fetch("/api/invitations", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: "another@example.test" }) })).status);
   assert.equal(viewerInvitationAttempt, 403);

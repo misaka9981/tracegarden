@@ -15,6 +15,10 @@ An acceptable backup setup must prove both directions:
 
 Copying a dump to the same VM is not considered disaster recovery. Backup or OAuth secrets never enter Git, ordinary ConfigMaps, command output, or application telemetry.
 
+## Recent Log Window
+
+Recent Log Window requests require the owner-only `logs:read` Capability and an approved Cluster namespace. Production log access is configured with `KUBERNETES_LOG_API_SERVER` and `KUBERNETES_LOG_TOKEN`, which are separate from the collector's `KUBERNETES_API_SERVER` and `KUBERNETES_OBSERVATION_TOKEN`. Responses are ephemeral and capped at 200 lines or 1 MiB. Only Cluster, namespace, Pod, container, tail, and result-size metadata is audited; bodies never enter PostgreSQL, caches, indexes, telemetry, analytics, or exception messages.
+
 ## Observability
 
 The application emits OpenTelemetry traces, metrics, and structured logs through optional exporters. It also provides:

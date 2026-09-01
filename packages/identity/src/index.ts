@@ -9,13 +9,14 @@ export const capabilities = {
   timelineRead: "timeline:read",
   experimentWrite: "experiment:write",
   clusterConfigure: "cluster:configure",
+  logsRead: "logs:read",
 } as const;
 
 export type Capability = (typeof capabilities)[keyof typeof capabilities];
 export type Role = "owner" | "operator" | "viewer";
 
 export const roleCapabilities: Readonly<Record<Role, readonly Capability[]>> = {
-  owner: [capabilities.workspaceRead, capabilities.membershipManage, capabilities.timelineRead, capabilities.experimentWrite, capabilities.clusterConfigure],
+  owner: [capabilities.workspaceRead, capabilities.membershipManage, capabilities.timelineRead, capabilities.experimentWrite, capabilities.clusterConfigure, capabilities.logsRead],
   operator: [capabilities.workspaceRead, capabilities.timelineRead, capabilities.experimentWrite],
   viewer: [capabilities.workspaceRead, capabilities.timelineRead],
 };
@@ -67,8 +68,22 @@ export type InvitationRecord = Readonly<{
   acceptedAt: string | null;
 }>;
 
-export type AuditAction = "invitation.created" | "invitation.revoked" | "member.admitted" | "member.role_changed";
-export type AuditTargetType = "invitation" | "member";
+export type LogAccessAuditMetadata = Readonly<{
+  clusterId: string;
+  namespace: string;
+  pod: string;
+  container: string;
+  tail: string;
+  lineCount: string;
+  byteCount: string;
+}>;
+
+export interface LogAuditStore {
+  recordLogAccess(actor: Pick<MemberRecord, "id">, metadata: LogAccessAuditMetadata): Promise<void>;
+}
+
+export type AuditAction = "invitation.created" | "invitation.revoked" | "member.admitted" | "member.role_changed" | "log.accessed";
+export type AuditTargetType = "invitation" | "member" | "log_window";
 export type AuditRecord = Readonly<{
   id: string;
   workspaceId: string;

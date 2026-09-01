@@ -5,6 +5,16 @@ import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDa
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
 import {
+  boundRecentLogWindow,
+  ConfiguredKubernetesLogAdapter,
+  FakeKubernetesLogAdapter,
+  LOG_MAX_BYTES,
+  LOG_MAX_LINES,
+  productionKubernetesLogConfiguration,
+  requestRecentLogWindow,
+  validateRecentLogWindowInput,
+} from "../dist/packages/logs/src/index.js";
+import {
   collectScopedResources,
   configureClusterScope,
   ConfiguredKubernetesAdapter,
@@ -411,6 +421,48 @@ await assert.rejects(fetch("http://127.0.0.1:43213/health/readiness"));
 const viewerMember = ownerMember ? { ...ownerMember, role: "viewer", capabilities: [capabilities.workspaceRead, capabilities.timelineRead] } : null;
 if (viewerMember) await assert.rejects(configureClusterScope(viewerMember, scopeStore, scopeInput), /cluster:configure/);
 assert.equal(productionKubernetesConfiguration({ NODE_ENV: "production" }), null);
+assert.equal(productionKubernetesLogConfiguration({
+  NODE_ENV: "production",
+  KUBERNETES_API_SERVER: "https://observation.example.test",
+  KUBERNETES_OBSERVATION_TOKEN: "observation-token",
+}), null);
+assert.equal(productionKubernetesLogConfiguration({
+  NODE_ENV: "production",
+  KUBERNETES_LOG_API_SERVER: "https://logs.example.test",
+  KUBERNETES_LOG_TOKEN: "observation-token",
+  KUBERNETES_OBSERVATION_TOKEN: "observation-token",
+}), null);
+const logConfiguration = productionKubernetesLogConfiguration({
+  NODE_ENV: "production",
+  KUBERNETES_LOG_API_SERVER: "https://logs.example.test",
+  KUBERNETES_LOG_TOKEN: "logs-token",
+});
+assert.equal(logConfiguration?.identity, "logs-reader");
+assert.equal(logConfiguration?.endpoint, "https://logs.example.test");
+assert.equal(logConfiguration?.token, "logs-token");
+assert.ok(logConfiguration);
+assert.equal(new ConfiguredKubernetesLogAdapter(logConfiguration).contacted, false);
+const streamedLogText = "first\r\n🙂\r\nlast\r\n";
+const streamedLogBytes = new TextEncoder().encode(streamedLogText);
+const emojiCut = new TextEncoder().encode("first\r\n🙂").length - 1;
+const configuredLogAdapter = new ConfiguredKubernetesLogAdapter(logConfiguration, async (url, init) => {
+  assert.match(String(url), /api\/v1\/namespaces\/tracegarden\/pods\/api-0\/log/);
+  assert.match(String(url), /container=app/);
+  assert.match(String(url), /tailLines=2/);
+  assert.equal(init?.headers?.authorization, "Bearer logs-token");
+  return new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(streamedLogBytes.slice(0, emojiCut));
+      controller.enqueue(streamedLogBytes.slice(emojiCut, emojiCut + 1));
+      controller.enqueue(streamedLogBytes.slice(emojiCut + 1));
+      controller.close();
+    },
+  }), { status: 200 });
+});
+assert.equal(await configuredLogAdapter.read({ clusterId: "lab-cluster", namespace: "tracegarden", pod: "api-0", container: "app", tail: 2 }), streamedLogText);
+const utf8Bound = boundRecentLogWindow([`prefix-${"🙂".repeat(LOG_MAX_BYTES)}`], 1);
+assert.ok(utf8Bound.byteCount <= LOG_MAX_BYTES);
+assert.doesNotMatch(utf8Bound.body, /�/);
 const inertAdapter = createKubernetesAdapter({ NODE_ENV: "production" });
 assert.equal(inertAdapter.kind, "inert");
 assert.equal(inertAdapter.contacted, false);
@@ -433,6 +485,89 @@ try {
   globalThis.fetch = originalFetch;
 }
 
+const logScope = savedScope ?? {
+  workspaceId: "workspace-single",
+  clusterId: "lab-cluster",
+  name: "Personal lab",
+  endpoint: "https://cluster.example.test",
+  namespaces: ["tracegarden"],
+  resourceKinds: ["Pod"],
+};
+const logLines = Array.from({ length: LOG_MAX_LINES + 25 }, (_, index) => `protected-log-${index}`);
+const logAdapter = new FakeKubernetesLogAdapter([{
+  clusterId: logScope.clusterId,
+  namespace: "tracegarden",
+  pod: "api-0",
+  container: "app",
+  tail: LOG_MAX_LINES,
+  lines: logLines,
+}]);
+const telemetryEvents = [];
+const recentLogs = await requestRecentLogWindow({
+  member: ownerMember,
+  scope: logScope,
+  input: { clusterId: logScope.clusterId, namespace: "tracegarden", pod: "api-0", container: "app", tail: LOG_MAX_LINES },
+  adapter: logAdapter,
+  auditStore: admissionStore,
+  telemetry: {
+    structuredLog: (event) => telemetryEvents.push(event),
+    trace: (event) => telemetryEvents.push(event),
+    metric: (event) => telemetryEvents.push(event),
+    analytics: (event) => telemetryEvents.push(event),
+  },
+});
+assert.equal(recentLogs.lineCount, LOG_MAX_LINES);
+assert.equal(recentLogs.byteCount, new TextEncoder().encode(recentLogs.body).length);
+assert.match(recentLogs.body, /protected-log-124/);
+assert.doesNotMatch(JSON.stringify(await admissionStore.listAuditRecords()), /protected-log-/);
+assert.doesNotMatch(JSON.stringify(telemetryEvents), /protected-log-/);
+assert.equal(logAdapter.requests.length, 1);
+assert.equal(validateRecentLogWindowInput({ ...scopeInput, clusterId: logScope.clusterId, namespace: "tracegarden", pod: "api-0", container: "app", tail: LOG_MAX_LINES + 1 }).valid, false);
+await assert.rejects(() => requestRecentLogWindow({
+  member: viewerMember,
+  scope: logScope,
+  input: { clusterId: logScope.clusterId, namespace: "tracegarden", pod: "api-0", container: "app", tail: 1 },
+  adapter: logAdapter,
+}), /logs:read/);
+assert.equal(logAdapter.requests.length, 1);
+const byteBound = boundRecentLogWindow(["protected-log-".repeat(LOG_MAX_BYTES)], 1);
+assert.equal(byteBound.byteCount, LOG_MAX_BYTES);
+assert.ok(byteBound.lineCount <= LOG_MAX_LINES);
+const failingLogAdapter = {
+  kind: "fake",
+  contacted: false,
+  read: async () => { throw new Error("protected-log-body"); },
+};
+await assert.rejects(() => requestRecentLogWindow({
+  member: ownerMember,
+  scope: logScope,
+  input: { clusterId: logScope.clusterId, namespace: "tracegarden", pod: "api-0", container: "app", tail: 1 },
+  adapter: failingLogAdapter,
+}), (error) => error instanceof Error && error.message === "Recent Log Window is unavailable" && !error.message.includes("protected-log-body"));
+const failingAuditStore = {
+  recordLogAccess: async () => { throw new Error("protected-log-audit-body"); },
+};
+await assert.rejects(() => requestRecentLogWindow({
+  member: ownerMember,
+  scope: logScope,
+  input: { clusterId: logScope.clusterId, namespace: "tracegarden", pod: "api-0", container: "app", tail: 1 },
+  adapter: logAdapter,
+  auditStore: failingAuditStore,
+}), (error) => error instanceof Error && error.message === "Recent Log Window audit is unavailable" && !error.message.includes("protected-log-audit-body"));
+const telemetrySafeLog = await requestRecentLogWindow({
+  member: ownerMember,
+  scope: logScope,
+  input: { clusterId: logScope.clusterId, namespace: "tracegarden", pod: "api-0", container: "app", tail: 1 },
+  adapter: logAdapter,
+  telemetry: {
+    structuredLog: () => { throw new Error("protected-log-structured"); },
+    trace: () => { throw new Error("protected-log-trace"); },
+    metric: () => { throw new Error("protected-log-metric"); },
+    analytics: () => { throw new Error("protected-log-analytics"); },
+  },
+});
+assert.match(telemetrySafeLog.body, /protected-log-224/);
+
 const collector = collectorStatus();
 assert.equal(collector.status, "ready");
 assert.equal(collector.checks.clusterContacted, false);
@@ -449,8 +584,19 @@ try {
 }
 
 const scopeDatabase = new MemoryDatabase();
+let transportLogReads = 0;
+const transportLogAdapter = {
+  kind: "fake",
+  contacted: false,
+  read: async () => {
+    transportLogReads += 1;
+    if (transportLogReads > 2) throw new Error("transport-protected-log-body");
+    return ["transport-log-one", "transport-log-two"];
+  },
+};
 const scopeRuntime = await createWebRuntime({
   database: scopeDatabase,
+  logAdapter: transportLogAdapter,
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
   port: 43208,
 });
@@ -487,6 +633,51 @@ try {
   assert.equal(formSave.status, 303);
   const loaded = await fetch("http://127.0.0.1:43208/api/cluster", { headers: { cookie } });
   assert.equal((await loaded.json()).scope.name, "Updated lab");
+  const recentLogResponse = await fetch("http://127.0.0.1:43208/api/logs/recent", {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ clusterId: "lab-cluster", namespace: "tracegarden", pod: "api-0", container: "app", tail: 2 }),
+  });
+  assert.equal(recentLogResponse.status, 200);
+  assert.equal(recentLogResponse.headers.get("cache-control"), "no-store");
+  const recentLogPayload = await recentLogResponse.json();
+  assert.equal(recentLogPayload.window.body, "transport-log-one\ntransport-log-two");
+  const logAudit = await fetch("http://127.0.0.1:43208/api/audit", { headers: { cookie } });
+  const logAuditPayload = await logAudit.json();
+  assert.ok(logAuditPayload.records.some(({ action }) => action === "log.accessed"));
+  assert.doesNotMatch(JSON.stringify(logAuditPayload), /transport-log-/);
+  const recentLogForm = await fetch("http://127.0.0.1:43208/logs/recent?lang=zh-CN", {
+    method: "POST",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ clusterId: "lab-cluster", namespace: "tracegarden", pod: "api-0", container: "app", tail: "2" }),
+  });
+  assert.equal(recentLogForm.status, 200);
+  assert.equal(recentLogForm.headers.get("cache-control"), "no-store");
+  assert.match(await recentLogForm.text(), /transport-log-one/);
+  const failedRecentLog = await fetch("http://127.0.0.1:43208/api/logs/recent", {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ clusterId: "lab-cluster", namespace: "tracegarden", pod: "api-0", container: "app", tail: 2 }),
+  });
+  assert.equal(failedRecentLog.status, 503);
+  assert.equal(failedRecentLog.headers.get("cache-control"), "no-store");
+  assert.doesNotMatch(await failedRecentLog.text(), /transport-protected-log-body/);
+  const failedRecentLogForm = await fetch("http://127.0.0.1:43208/logs/recent?lang=en", {
+    method: "POST",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ clusterId: "lab-cluster", namespace: "tracegarden", pod: "api-0", container: "app", tail: "2" }),
+  });
+  assert.equal(failedRecentLogForm.status, 503);
+  assert.equal(failedRecentLogForm.headers.get("cache-control"), "no-store");
+  assert.doesNotMatch(await failedRecentLogForm.text(), /transport-protected-log-body/);
+  const invalidRecentLog = await fetch("http://127.0.0.1:43208/api/logs/recent", {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ clusterId: "lab-cluster", namespace: "not approved", pod: "bad pod", container: "app", tail: 201 }),
+  });
+  assert.equal(invalidRecentLog.status, 400);
+  assert.equal(invalidRecentLog.headers.get("cache-control"), "no-store");
+  assert.doesNotMatch(await invalidRecentLog.text(), /transport-log-/);
   const invalid = await fetch("http://127.0.0.1:43208/api/cluster", {
     method: "PUT",
     headers: { cookie, "content-type": "application/json" },
@@ -538,11 +729,31 @@ try {
     body: JSON.stringify(scopeInput),
   });
   assert.equal(denied.status, 403);
+  const deniedLogs = await fetch("http://127.0.0.1:43209/api/logs/recent", {
+    method: "POST",
+    headers: { cookie: viewerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ clusterId: "lab-cluster", namespace: "tracegarden", pod: "api-0", container: "app", tail: 1, body: "viewer-protected" }),
+  });
+  assert.equal(deniedLogs.status, 403);
+  assert.equal(deniedLogs.headers.get("cache-control"), "no-store");
+  assert.doesNotMatch(await deniedLogs.text(), /viewer-protected/);
+  const deniedLogsPage = await fetch("http://127.0.0.1:43209/logs/recent?lang=en", {
+    method: "POST",
+    headers: { cookie: viewerCookie, "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ clusterId: "lab-cluster", namespace: "tracegarden", pod: "api-0", container: "app", tail: "1" }),
+  });
+  assert.equal(deniedLogsPage.status, 403);
+  assert.equal(deniedLogsPage.headers.get("cache-control"), "no-store");
+  const deniedLogsPageBody = await deniedLogsPage.text();
+  assert.match(deniedLogsPageBody, /do not have the Capability to read/);
+  assert.doesNotMatch(deniedLogsPageBody, /viewer-protected/);
   const viewerAppZh = await fetch("http://127.0.0.1:43209/app?lang=zh-CN", { headers: { cookie: viewerCookie } });
   assert.equal(viewerAppZh.status, 200);
   assert.match(await viewerAppZh.text(), /没有配置 Cluster 观测范围的 Capability/);
   const viewerAppEn = await fetch("http://127.0.0.1:43209/app?lang=en", { headers: { cookie: viewerCookie } });
-  assert.match(await viewerAppEn.text(), /do not have the Capability to configure/);
+  const viewerAppEnBody = await viewerAppEn.text();
+  assert.match(viewerAppEnBody, /do not have the Capability to configure/);
+  assert.match(viewerAppEnBody, /do not have the Capability to read the Recent Log Window/);
   const viewerTimeline = await fetch("http://127.0.0.1:43209/api/timeline", { headers: { cookie: viewerCookie } });
   assert.equal(viewerTimeline.status, 200);
 } finally {

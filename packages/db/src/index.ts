@@ -25,6 +25,8 @@ import {
   type BootstrapIdentity,
   type ExternalIdentity,
   type InvitationRecord,
+  type LogAccessAuditMetadata,
+  type LogAuditStore,
   type MemberRecord,
   type MembershipActor,
   type MembershipStore,
@@ -57,6 +59,7 @@ export const BETTER_AUTH_MIGRATION_ID = "0003_better_auth";
 export const MEMBERSHIP_MIGRATION_ID = "0004_membership_management";
 export const CLUSTER_SCOPE_MIGRATION_ID = "0005_cluster_scope";
 export const OBSERVATION_TIMELINE_MIGRATION_ID = "0006_observation_timeline";
+export const RECENT_LOGS_MIGRATION_ID = "0007_recent_logs";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -67,6 +70,7 @@ const migrations: readonly Migration[] = [
   { id: MEMBERSHIP_MIGRATION_ID, path: "../migrations/0004_membership_management.sql" },
   { id: CLUSTER_SCOPE_MIGRATION_ID, path: "../migrations/0005_cluster_scope.sql" },
   { id: OBSERVATION_TIMELINE_MIGRATION_ID, path: "../migrations/0006_observation_timeline.sql" },
+  { id: RECENT_LOGS_MIGRATION_ID, path: "../migrations/0007_recent_logs.sql" }
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -77,7 +81,7 @@ function sessionForMember(member: MemberRecord, authSession?: AuthSession): Auth
   };
 }
 
-export class MemoryAdmissionStore implements AdmissionStore, MembershipStore {
+export class MemoryAdmissionStore implements AdmissionStore, MembershipStore, LogAuditStore {
   private readonly identities = new Map<string, { identity: ExternalIdentity; member: MemberRecord }>();
   private readonly sessions = new Map<string, AuthenticatedSession>();
   private readonly invitations = new Map<string, InvitationRecord>();
@@ -222,6 +226,18 @@ export class MemoryAdmissionStore implements AdmissionStore, MembershipStore {
       toRole: role,
     });
     return member;
+  }
+
+  async recordLogAccess(actor: Pick<MemberRecord, "id">, metadata: LogAccessAuditMetadata): Promise<void> {
+    this.audit("log.accessed", "log_window", randomUUID(), actor.id, {
+      clusterId: metadata.clusterId,
+      namespace: metadata.namespace,
+      pod: metadata.pod,
+      container: metadata.container,
+      tail: metadata.tail,
+      lineCount: metadata.lineCount,
+      byteCount: metadata.byteCount,
+    });
   }
 
   async listAuditRecords(): Promise<readonly AuditRecord[]> {
@@ -752,7 +768,7 @@ function auditFromRow(row: AuditRow): AuditRecord {
   };
 }
 
-export class PostgresAdmissionStore implements AdmissionStore, MembershipStore {
+export class PostgresAdmissionStore implements AdmissionStore, MembershipStore, LogAuditStore {
   constructor(private readonly poolProvider: PoolProvider, private readonly bootstrapIdentity: BootstrapIdentity = DEFAULT_LOCAL_BOOTSTRAP) {}
 
   private assertCanManage(actor: MembershipActor): void {
@@ -1024,6 +1040,29 @@ export class PostgresAdmissionStore implements AdmissionStore, MembershipStore {
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw new Error("Tracegarden member role update failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async recordLogAccess(actor: Pick<MemberRecord, "id">, metadata: LogAccessAuditMetadata): Promise<void> {
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.audit(client, "log.accessed", "log_window", randomUUID(), actor.id, {
+        clusterId: metadata.clusterId,
+        namespace: metadata.namespace,
+        pod: metadata.pod,
+        container: metadata.container,
+        tail: metadata.tail,
+        lineCount: metadata.lineCount,
+        byteCount: metadata.byteCount,
+      });
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw new Error("Tracegarden log access audit failed");
     } finally {
       client.release();
     }

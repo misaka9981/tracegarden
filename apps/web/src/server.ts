@@ -30,6 +30,7 @@ import {
   type AdmissionStore,
   type AuthenticatedSession,
   type InvitationRecord,
+  type LogAuditStore,
   type MemberRecord,
   type MembershipStore,
   type Role,
@@ -38,6 +39,14 @@ import {
   type IdentityAdapter,
 } from "../../../packages/identity/src/index.js";
 import { messagesFor, parseLanguage, type Language, type Messages } from "../../../packages/i18n/src/index.js";
+import {
+  createKubernetesLogAdapter,
+  hasLogReadCapability,
+  requestRecentLogWindow,
+  RecentLogWindowValidationError,
+  type KubernetesLogAdapter,
+  type RecentLogWindow,
+} from "../../../packages/logs/src/index.js";
 
 type WebOptions = Readonly<{
   database?: DatabaseBoundary;
@@ -45,6 +54,7 @@ type WebOptions = Readonly<{
   clusterScopeStore?: ClusterScopeStore;
   timelineStore?: TimelineStore;
   identityAdapter?: IdentityAdapter;
+  logAdapter?: KubernetesLogAdapter;
   environment?: Record<string, string | undefined>;
   port?: number;
   host?: string;
@@ -105,6 +115,7 @@ function pageStyles(): string {
       input { font: inherit; padding: 0.6rem 0.75rem; border: 1px solid #98a2b3; border-radius: 0.4rem; }
       .capabilities { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0; list-style: none; }
       .capabilities li { border: 1px solid #d9dee8; border-radius: 999px; padding: 0.4rem 0.7rem; }
+      pre { background: #101828; color: #f8fafc; border-radius: 0.5rem; padding: 1rem; overflow: auto; white-space: pre-wrap; }
     </style>`;
 }
 
@@ -246,7 +257,7 @@ export function renderApplicationPage(
   language: Language,
   session: AuthenticatedSession,
   scope: ClusterScope | null = null,
-  feedback?: Readonly<{ saved?: boolean; error?: string }>,
+  feedback?: Readonly<{ saved?: boolean; error?: string; logResult?: RecentLogWindow; logError?: string }>,
   timelineEntries: readonly TimelineEntry[] = [],
 ): string {
   const messages = messagesFor(language);
@@ -274,6 +285,7 @@ export function renderApplicationPage(
       ${membershipLink}
       ${renderClusterSection(language, messages, member, scope, feedback)}
       ${hasCapability(member, capabilities.timelineRead) ? renderTimelineSection(messages, timelineEntries) : ""}
+      ${renderRecentLogsSection(language, messages, member, scope, feedback)}
       <form method="post" action="/auth/logout?lang=${language}">
         <button type="submit">${escapeHtml(messages.signOut)}</button>
       </form>
@@ -285,6 +297,40 @@ export function renderApplicationPage(
 
 function invitationStatus(invitation: InvitationRecord, messages: Messages): string {
   return invitation.revokedAt ? messages.revoked : invitation.acceptedAt ? messages.accepted : messages.pending;
+}
+
+function renderRecentLogsSection(
+  language: Language,
+  messages: Messages,
+  member: AuthenticatedSession["member"],
+  scope: ClusterScope | null,
+  feedback?: Readonly<{ logResult?: RecentLogWindow; logError?: string }>,
+): string {
+  const form = hasLogReadCapability(member)
+    ? `<form method="post" action="/logs/recent?lang=${language}">
+        <label for="log-cluster">${escapeHtml(messages.logCluster)}</label>
+        <input id="log-cluster" name="clusterId" required value="${escapeHtml(scope?.clusterId ?? "")}" autocomplete="off">
+        <label for="log-namespace">${escapeHtml(messages.logNamespace)}</label>
+        <input id="log-namespace" name="namespace" required value="${escapeHtml(scope?.namespaces[0] ?? "")}" autocomplete="off">
+        <label for="log-pod">${escapeHtml(messages.logPod)}</label>
+        <input id="log-pod" name="pod" required autocomplete="off">
+        <label for="log-container">${escapeHtml(messages.logContainer)}</label>
+        <input id="log-container" name="container" required autocomplete="off">
+        <label for="log-tail">${escapeHtml(messages.logTail)}</label>
+        <input id="log-tail" name="tail" type="number" min="1" max="200" value="50" required>
+        <button type="submit">${escapeHtml(messages.requestLogs)}</button>
+      </form>`
+    : `<p class="error" role="alert">${escapeHtml(messages.logsReadDenied)}</p>`;
+  const result = feedback?.logResult
+    ? `<p class="hint">${escapeHtml(messages.recentLogsMetadata)} ${feedback.logResult.lineCount} lines · ${feedback.logResult.byteCount} bytes</p><pre aria-label="${escapeHtml(messages.recentLogsTitle)}">${escapeHtml(feedback.logResult.body || messages.recentLogsEmpty)}</pre>`
+    : "";
+  return `<section aria-labelledby="recent-logs-title">
+      <h2 id="recent-logs-title">${escapeHtml(messages.recentLogsTitle)}</h2>
+      <p>${escapeHtml(messages.recentLogsDescription)}</p>
+      ${feedback?.logError ? `<p class="error" role="alert">${escapeHtml(feedback.logError)}</p>` : ""}
+      ${form}
+      ${result}
+    </section>`;
 }
 
 export function renderMembersPage(
@@ -464,6 +510,10 @@ function hasMembershipStore(value: AdmissionStore): value is AdmissionStore & Me
     && typeof value.listAuditRecords === "function";
 }
 
+function hasLogAuditStore(value: AdmissionStore): value is AdmissionStore & LogAuditStore {
+  return typeof (value as Partial<LogAuditStore>).recordLogAccess === "function";
+}
+
 function requestHeaders(request: IncomingMessage): Headers {
   const headers = new Headers();
   for (const [name, value] of Object.entries(request.headers ?? {})) {
@@ -488,6 +538,11 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     throw new Error("Memory database is not allowed in production");
   }
   const identityAdapter = options.identityAdapter ?? createIdentityAdapter(environment);
+  const logAdapter = options.logAdapter ?? createKubernetesLogAdapter(environment);
+  if (environment.NODE_ENV === "production" && options.logAdapter) {
+    await database.close();
+    throw new Error("Production Recent Log Window must use the configured Kubernetes log adapter");
+  }
   let admissionStore: AdmissionStore;
   let clusterScopeStore: ClusterScopeStore;
   if (environment.NODE_ENV === "production") {
@@ -605,6 +660,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   };
   const membershipStore = hasMembershipStore(admissionStore) ? admissionStore : null;
   const timelineStore = options.timelineStore ?? database.timeline ?? null;
+  const logAuditStore = hasLogAuditStore(admissionStore) ? admissionStore : undefined;
 
   const scopeForSession = (session: AuthenticatedSession): Promise<ClusterScope | null> => clusterScopeStore.get(session.member.workspaceId);
 
@@ -624,6 +680,14 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       resourceKinds: form.getAll("resourceKinds"),
     };
   };
+
+  const formLogInput = (form: URLSearchParams): Record<string, unknown> => ({
+    clusterId: form.get("clusterId") ?? "",
+    namespace: form.get("namespace") ?? "",
+    pod: form.get("pod") ?? "",
+    container: form.get("container") ?? "",
+    tail: Number(form.get("tail") ?? ""),
+  });
 
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
     void (async () => {
@@ -749,6 +813,105 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
             return;
           }
           throw error;
+        }
+        return;
+      }
+      if (requestUrl.pathname === "/api/logs/recent") {
+        response.setHeader("cache-control", "no-store");
+        const lookup = await sessionForRequest(request);
+        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (!hasLogReadCapability(lookup.session.member)) {
+          sendJson(response, 403, { error: "missing_capability", capability: capabilities.logsRead });
+          return;
+        }
+        if (!logAuditStore) {
+          sendJson(response, 503, { error: "recent_log_window_unavailable" });
+          return;
+        }
+        if (method !== "POST") {
+          sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        let input: unknown;
+        try {
+          input = JSON.parse(await requestBody(request)) as unknown;
+        } catch {
+          sendJson(response, 400, { error: "invalid_json" });
+          return;
+        }
+        try {
+          const recentLogs = await requestRecentLogWindow({
+            member: lookup.session.member,
+            scope: await scopeForSession(lookup.session),
+            input,
+            adapter: logAdapter,
+            ...(logAuditStore ? { auditStore: logAuditStore } : {}),
+          });
+          sendJson(response, 200, { window: recentLogs });
+        } catch (error: unknown) {
+          if (error instanceof RecentLogWindowValidationError) {
+            sendJson(response, 400, { error: "invalid_recent_log_window", issues: error.issues });
+            return;
+          }
+          sendJson(response, 503, { error: "recent_log_window_unavailable" });
+        }
+        return;
+      }
+      if (requestUrl.pathname === "/logs/recent" && method === "POST") {
+        response.setHeader("cache-control", "no-store");
+        const lookup = await sessionForRequest(request);
+        const messages = messagesFor(language);
+        if (!lookup.session) {
+          response.statusCode = lookup.rejection ? 403 : 302;
+          if (lookup.rejection) {
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderRejectionPage(language, lookup.rejection));
+          } else {
+            response.setHeader("location", `/?lang=${language}`);
+            response.end();
+          }
+          return;
+        }
+        const scope = await scopeForSession(lookup.session);
+        if (!hasLogReadCapability(lookup.session.member)) {
+          response.statusCode = 403;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { logError: messages.logsReadDenied }));
+          return;
+        }
+        if (!logAuditStore) {
+          response.statusCode = 503;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { logError: messages.recentLogsUnavailable }));
+          return;
+        }
+        const fields = requestFields(await requestBody(request), request.headers?.["content-type"]);
+        if (!fields) {
+          response.statusCode = 400;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { logError: messages.recentLogsInvalid }));
+          return;
+        }
+        try {
+          const recentLogs = await requestRecentLogWindow({
+            member: lookup.session.member,
+            scope,
+            input: formLogInput(new URLSearchParams(Object.entries(fields))),
+            adapter: logAdapter,
+            ...(logAuditStore ? { auditStore: logAuditStore } : {}),
+          });
+          response.statusCode = 200;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, { logResult: recentLogs }));
+        } catch (error: unknown) {
+          response.statusCode = error instanceof RecentLogWindowValidationError ? 400 : 503;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, scope, {
+            logError: error instanceof RecentLogWindowValidationError ? messages.recentLogsInvalid : messages.recentLogsUnavailable,
+          }));
         }
         return;
       }

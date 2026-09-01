@@ -3,6 +3,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { DeterministicKubernetesAdapter } from "../dist/packages/cluster/src/index.js";
 import { PostgresDatabase } from "../dist/packages/db/src/index.js";
+import { FakeKubernetesLogAdapter, requestRecentLogWindow } from "../dist/packages/logs/src/index.js";
 
 const name = `tracegarden-foundation-pg-${process.pid}`;
 const databasePort = 45433;
@@ -10,6 +11,7 @@ const webPort = 43200;
 const productionWebPort = 43201;
 let web;
 let productionWeb;
+let logDatabase;
 const databaseUrl = `postgresql://tracegarden:local-only@127.0.0.1:${databasePort}/tracegarden`;
 let collector;
 let collectorDatabase;
@@ -57,8 +59,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline');");
-  assert.equal(migrationCount, "6");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs');");
+  assert.equal(migrationCount, "7");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -128,6 +130,32 @@ try {
   });
   assert.equal(clusterScope.status, 200);
   assert.equal((await clusterScope.json()).scope.clusterId, "local-postgres-smoke");
+  logDatabase = new PostgresDatabase(databaseUrl);
+  const postgresLogBody = "postgres-protected-log-body";
+  const postgresLog = await requestRecentLogWindow({
+    member: { id: sessionBody.member.id, workspaceId: sessionBody.member.workspaceId, capabilities: sessionBody.member.capabilities },
+    scope: {
+      workspaceId: "workspace-single",
+      clusterId: "local-postgres-smoke",
+      name: "Local deterministic Cluster",
+      endpoint: "https://cluster.example.test",
+      namespaces: ["tracegarden"],
+      resourceKinds: ["Pod"],
+    },
+    input: { clusterId: "local-postgres-smoke", namespace: "tracegarden", pod: "api-0", container: "app", tail: 1 },
+    adapter: new FakeKubernetesLogAdapter([{
+      clusterId: "local-postgres-smoke",
+      namespace: "tracegarden",
+      pod: "api-0",
+      container: "app",
+      tail: 1,
+      lines: [postgresLogBody],
+    }]),
+    auditStore: logDatabase.admission,
+  });
+  assert.equal(postgresLog.body, postgresLogBody);
+  const postgresAuditMetadata = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT coalesce(string_agg(metadata::text, ' '), '') FROM tracegarden_audit_records;");
+  assert.doesNotMatch(postgresAuditMetadata, /postgres-protected-log-body/);
   const clusterCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_clusters;");
   assert.equal(clusterCount, "1");
 
@@ -236,7 +264,7 @@ try {
   const memberCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_members;");
   assert.equal(memberCount, raceAdmission.status === 303 ? "3" : "2");
   const auditCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_audit_records;");
-  assert.equal(auditCount, "8");
+  assert.equal(auditCount, "9");
   const auditMetadata = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT coalesce(string_agg(metadata::text, ' '), '') FROM tracegarden_audit_records;");
   assert.doesNotMatch(auditMetadata, /token/i);
   let auditMutationRejected = false;
@@ -302,5 +330,6 @@ try {
   await collectorDatabase?.close();
   web?.kill("SIGTERM");
   productionWeb?.kill("SIGTERM");
+  await logDatabase?.close();
   removeDatabase();
 }
