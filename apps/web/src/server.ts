@@ -1200,10 +1200,16 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     } catch {
       migrationReady = false;
     }
-    await verifyTimelineNotifications();
-    await refreshLiveSignals();
+    if (stopping) {
+      databaseReady = false;
+      migrationReady = false;
+      timelineReady = false;
+    } else {
+      await verifyTimelineNotifications();
+      await refreshLiveSignals();
+    }
     syncWebMetrics();
-    const readiness = state(databaseReady && migrationReady && timelineReady && startupState === "ready");
+    const readiness = state(!stopping && databaseReady && migrationReady && timelineReady && startupState === "ready");
     return {
       service: "tracegarden-web",
       status: readiness,
@@ -1341,6 +1347,10 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     }
   };
   const verifyTimelineNotifications = async (): Promise<void> => {
+    if (stopping) {
+      timelineReady = false;
+      return;
+    }
     if (!timelineNotifications) {
       timelineReady = false;
       return;
@@ -2664,6 +2674,13 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   const server = createServer(requestHandler);
   const port = options.port ?? Number(environment.PORT ?? "3000");
   const host = options.host ?? environment.HOST ?? "127.0.0.1";
+  const drainServer = (): Promise<void> => new Promise((resolve, reject) => {
+    try {
+      server.close((error?: Error) => error ? reject(error) : resolve());
+    } catch (error) {
+      reject(error);
+    }
+  });
   try {
     await listenForStartup(server, port, host);
   } catch (error) {
@@ -2698,13 +2715,22 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     telemetry,
     close: async () => {
       stopping = true;
+      databaseReady = false;
+      migrationReady = false;
+      timelineReady = false;
       telemetry.log("info", "web.stopping", startupCorrelation);
-      removeTimelineErrorListener?.();
-      for (const client of [...liveSseClients.values()]) client.close();
-      releaseTimelineReadiness?.();
-      releaseTimelineReadiness = undefined;
-      await database.close();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      try {
+        try {
+          removeTimelineErrorListener?.();
+          for (const client of [...liveSseClients.values()]) client.close();
+          releaseTimelineReadiness?.();
+          releaseTimelineReadiness = undefined;
+        } finally {
+          await drainServer();
+        }
+      } finally {
+        await database.close();
+      }
     },
   };
 }

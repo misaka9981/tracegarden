@@ -16,7 +16,7 @@ import {
   type NormalizedObservation,
 } from "../../../packages/cluster/src/index.js";
 import {
-  createDatabase,
+  PostgresDatabase,
   type DatabaseBoundary,
   type IngestionCheckpoint,
   type IngestionCheckpointInput,
@@ -284,9 +284,15 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   if (production && (options.database || options.observationStore || options.retentionStore)) {
     throw new Error("Production collector stores must be database-owned");
   }
+  if (production && !environment.TIMELINE_CURSOR_SECRET?.trim()) {
+    throw new Error("TIMELINE_CURSOR_SECRET is required in production");
+  }
+  const cursorSecret = environment.TIMELINE_CURSOR_SECRET?.trim();
   const adapter = options.adapter ?? createKubernetesAdapter(environment);
   const ownsDatabase = !options.database && !options.observationStore && !options.retentionStore && Boolean(environment.DATABASE_URL);
-  const database = options.database ?? (ownsDatabase ? createDatabase(environment) : undefined);
+  const database = options.database ?? (ownsDatabase && environment.DATABASE_URL
+    ? cursorSecret ? new PostgresDatabase(environment.DATABASE_URL, undefined, cursorSecret) : new PostgresDatabase(environment.DATABASE_URL)
+    : undefined);
   const observationStore = options.observationStore ?? database?.timeline;
   const retentionStore = options.retentionStore ?? database?.retention ?? (hasRetentionStore(observationStore) ? observationStore : undefined);
   let databaseReady = database === undefined;
@@ -874,6 +880,7 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     runWatch,
     close: async () => {
       stopping = true;
+      telemetry.log("info", "collector.stopping", startupCorrelation);
       cancelRetentionCleanup?.();
       cancelRetentionCleanup = undefined;
       shutdownController.abort();
@@ -886,14 +893,31 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
 }
 
 if (process.argv[1]?.endsWith("/collector/src/main.js") || process.argv[1]?.endsWith("/collector/src/main.ts")) {
-  try {
-    const runtime = await createCollectorRuntime({ collectOnStart: true });
-    void runtime.runWatch().catch((error: unknown) => {
-      console.error(error instanceof Error ? error.message : "Tracegarden collector watch failed");
+  let runtime: CollectorRuntime | undefined;
+  let shutdownRequested = false;
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (): void => {
+    shutdownRequested = true;
+    if (!runtime || shutdownPromise) return;
+    shutdownPromise = runtime.close().catch((error: unknown) => {
+      console.error(error instanceof Error ? error.message : "Tracegarden collector failed to stop");
       process.exitCode = 1;
     });
-    console.log("Tracegarden collector initial collection completed");
-    console.log(`Tracegarden collector listening on ${process.env.HOST ?? "127.0.0.1"}:${process.env.COLLECTOR_PORT ?? "3001"}`);
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+  try {
+    runtime = await createCollectorRuntime({ collectOnStart: true });
+    if (shutdownRequested) shutdown();
+    else {
+      void runtime.runWatch().catch((error: unknown) => {
+        console.error(error instanceof Error ? error.message : "Tracegarden collector watch failed");
+        process.exitCode = 1;
+      });
+      console.log("Tracegarden collector initial collection completed");
+      console.log(`Tracegarden collector listening on ${process.env.HOST ?? "127.0.0.1"}:${process.env.COLLECTOR_PORT ?? "3001"}`);
+    }
+    await shutdownPromise;
   } catch (error: unknown) {
     console.error(error instanceof Error ? error.message : "Tracegarden collector failed to start");
     process.exitCode = 1;

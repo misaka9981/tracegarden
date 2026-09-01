@@ -1,6 +1,7 @@
 services:
   postgres:
-    image: postgres:18.3-alpine
+    image: postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7
+    platform: linux/arm64
     environment:
       POSTGRES_DB: tracegarden
       POSTGRES_USER: tracegarden
@@ -14,10 +15,30 @@ services:
       retries: 15
     volumes:
       - tracegarden-postgres:/var/lib/postgresql
+  migrate:
+    build:
+      context: .
+      dockerfile: deploy/docker/migrate.Dockerfile
+    platform: linux/arm64
+    environment:
+      DATABASE_URL: postgresql://tracegarden:local-only@postgres:5432/tracegarden
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: node
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
   web:
     build:
       context: .
       dockerfile: deploy/docker/web.Dockerfile
+    platform: linux/arm64
     environment:
       DATABASE_URL: postgresql://tracegarden:local-only@postgres:5432/tracegarden
       BETTER_AUTH_SECRET: local-container-only
@@ -33,24 +54,47 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "3000:3000"
+    user: node
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
   collector:
     build:
       context: .
       dockerfile: deploy/docker/collector.Dockerfile
+    platform: linux/arm64
     environment:
       DATABASE_URL: postgresql://tracegarden:local-only@postgres:5432/tracegarden
       TIMELINE_CURSOR_SECRET: local-container-timeline-cursor-only
-      TRACEGARDEN_BOOTSTRAP_ISSUER: https://accounts.google.com
-      TRACEGARDEN_BOOTSTRAP_SUBJECT: local-container-bootstrap
       COLLECTOR_PORT: "3001"
       HOST: 0.0.0.0
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "3001:3001"
+    user: node
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
 
 volumes:
   tracegarden-postgres:

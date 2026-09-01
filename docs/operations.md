@@ -34,6 +34,12 @@ The signals mean: collector lag is the age of the newest observed Kubernetes eve
 
 No complete monitoring stack is installed by this project. Operators choose and configure external OpenTelemetry and Prometheus collectors separately. Container log bodies obtained through Recent Log Window are excluded from logs, traces, metrics, exception messages, and analytics, including failure paths.
 
+## Production containers
+
+The web and collector Dockerfiles use the frozen pnpm lockfile and ARM64-pinned Node.js 26.8 base image. Runtime stages contain only compiled application JavaScript, migration SQL, and production dependencies; source files, development dependencies, and configuration are omitted. Compose runs each application as the non-root `node` user with a read-only root filesystem, `no-new-privileges`, all Linux capabilities dropped, and an explicitly sized `/tmp` tmpfs.
+
+The `migrate` service is a one-shot, credential-free (apart from its database connection) gate. Web and collector depend on its successful completion and also fail closed on their own migration/database startup checks. The collector receives no Google or Kubernetes credentials; with no explicit Kubernetes settings it reports `clusterContacted: false` and remains not ready.
+
 ## Failure handling
 
 - Kubernetes watch disconnects use finite, bounded backoff and resume from the last persisted cursor.

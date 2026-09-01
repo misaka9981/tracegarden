@@ -1066,6 +1066,10 @@ await assert.rejects(
   createCollectorRuntime({ environment: { NODE_ENV: "production" }, adapter: deterministic, retentionStore: injectedRetentionStore }),
   /Production collector stores must be database-owned/,
 );
+await assert.rejects(
+  createCollectorRuntime({ environment: { NODE_ENV: "production", DATABASE_URL: "postgresql://tracegarden:local-only@127.0.0.1:5432/tracegarden" } }),
+  /TIMELINE_CURSOR_SECRET is required in production/,
+);
 class FailingObservationStore extends MemoryObservationStore {
   async recordObservation() {
     throw new Error("database write failed");
