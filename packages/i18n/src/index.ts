@@ -243,7 +243,7 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     attentionUnread: "未读",
     reviewAttention: "标记为已查看",
     attentionReviewed: "已标记为已查看。",
-    unreadAttentionCount: "未读待关注项",
+    unreadAttentionCount: "未读 Attention Item",
     nextTimelinePage: "下一页",
     timelineInvalid: "Timeline 筛选或游标无效。",
     attentionReviewUnavailable: "待关注项 review 当前不可用。",

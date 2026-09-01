@@ -1171,7 +1171,7 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
             const endpoint = new URL(`${apiEndpoint.pathname}/namespaces/${encodeURIComponent(namespace)}/${plural}`, apiEndpoint.origin);
             const response = await fetch(endpoint, {
               headers: { authorization: `Bearer ${this.configuration.token}`, accept: "application/json" },
-              signal,
+              ...(signal ? { signal } : {}),
             });
             if (!response.ok) {
               if (response.status === 410) throw new KubernetesWatchGoneError(`Kubernetes ${kind} list resource version is gone`);

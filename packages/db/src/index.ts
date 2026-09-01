@@ -93,7 +93,7 @@ const migrations: readonly Migration[] = [
   { id: NORMALIZED_OBSERVATION_MIGRATION_ID, path: "../migrations/0008_normalized_observations.sql" },
   { id: OBSERVATION_CHECKPOINTS_MIGRATION_ID, path: "../migrations/0009_observation_checkpoints.sql" },
   { id: TIMELINE_ATTENTION_MIGRATION_ID, path: "../migrations/0010_timeline_attention.sql" },
-  { id: STRUCTURED_EXPERIMENTS_MIGRATION_ID, path: "../migrations/0011_structured_experiments.sql" };
+  { id: STRUCTURED_EXPERIMENTS_MIGRATION_ID, path: "../migrations/0011_structured_experiments.sql" },
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -630,7 +630,7 @@ export class MemoryObservationStore implements TimelineStore {
   private readonly attentionReviews = new Set<string>();
 
   private readonly cursorSecret: string;
-  private readonly clusterScopeStore?: ClusterScopeStore;
+  private readonly clusterScopeStore: ClusterScopeStore | undefined;
 
   constructor(cursorSecretOrClusterScopeStore: string | ClusterScopeStore = DEFAULT_TIMELINE_CURSOR_SECRET, clusterScopeStore?: ClusterScopeStore) {
     if (typeof cursorSecretOrClusterScopeStore === "string") {
@@ -798,7 +798,6 @@ export class MemoryObservationStore implements TimelineStore {
     const page = pageFromEntries(entries, query, this.cursorSecret, memberId);
     return memberId ? { ...page, unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) } : page;
   }
-  }
 
   async getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null> {
     const entry = this.entries.get(id);
@@ -806,12 +805,12 @@ export class MemoryObservationStore implements TimelineStore {
   }
 
   async unreadAttentionCount(workspaceId: string, memberId: string): Promise<number> {
-    return [...this.entries.values()].filter((entry) => entry.workspaceId === workspaceId && entry.attentionItem && !this.attentionReviews.has(`${entry.id}\u0000${memberId}`)).length;
+    return [...this.entries.values()].filter((entry) => entry.entryType === "observation" && entry.workspaceId === workspaceId && entry.attentionItem && !this.attentionReviews.has(`${entry.id}\u0000${memberId}`)).length;
   }
 
   async reviewAttentionItem(workspaceId: string, memberId: string, entryId: string): Promise<AttentionReviewResult | null> {
     const entry = this.entries.get(entryId);
-    if (!entry || entry.workspaceId !== workspaceId || !entry.attentionItem) return null;
+    if (!entry || entry.entryType !== "observation" || entry.workspaceId !== workspaceId || !entry.attentionItem) return null;
     const key = `${entryId}\u0000${memberId}`;
     const reviewed = !this.attentionReviews.has(key);
     this.attentionReviews.add(key);

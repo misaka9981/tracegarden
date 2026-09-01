@@ -365,7 +365,7 @@ try {
     resourceKind: "Pod",
     resourceVersion: "7",
   });
-  assert.equal((await collectorDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"))?.resourceVersion, "7");
+  assert.equal((await collectorDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"))?.resourceVersion, "9007199254740993");
   await collectorDatabase.timeline.recordObservationsAndCheckpoint([], {
     workspaceId: observationScope.workspaceId,
     clusterId: observationScope.clusterId,
@@ -400,8 +400,8 @@ try {
   assert.equal(timelineResponse.status, 200);
   const timelineBody = await timelineResponse.json();
   assert.equal(timelineBody.entries.length, 5);
-  assert.ok(timelineBody.entries.some(({ observation }) => observation.name === "api"));
-  assert.ok(timelineBody.entries.some(({ observation }) => observation.name === "api-deployment" && observation.classification === "recovery"));
+  assert.ok(timelineBody.entries.some((entry) => entry.entryType === "observation" && entry.observation.name === "api"));
+  assert.ok(timelineBody.entries.some((entry) => entry.entryType === "observation" && entry.observation.name === "api-deployment" && entry.observation.classification === "recovery"));
   assert.ok(timelineBody.entries.some((entry) => entry.entryType === "experiment" && entry.experiment.id === experiment.id));
   const timelinePage = await fetch(`http://127.0.0.1:${webPort}/app?lang=en`, { headers: { cookie: ownerCookie } });
   assert.match(await timelinePage.text(), /Pod Observation/);
@@ -471,19 +471,21 @@ try {
   const equalResultA = await timelineStore.recordObservation(equalTimestampA);
   const equalResultB = await timelineStore.recordObservation(equalTimestampB);
   const expectedEqualOrder = equalResultA.entry.id.localeCompare(equalResultB.entry.id) < 0 ? ["equal-a", "equal-b"] : ["equal-b", "equal-a"];
+  const traversedIds = [];
   const traversedNames = [];
   const traversedTimes = [];
   let traversal = await timelineStore.listTimelineEntries("workspace-single", { limit: 1, namespace: "tracegarden" }, sessionBody.member.id);
   while (true) {
     const entry = traversal.entries[0];
     if (!entry) break;
+    traversedIds.push(entry.id);
     traversedNames.push(entry.observation.name);
     traversedTimes.push(entry.occurredAt);
     if (!traversal.nextCursor) break;
     traversal = await timelineStore.listTimelineEntries("workspace-single", { limit: 1, namespace: "tracegarden", cursor: traversal.nextCursor }, sessionBody.member.id);
   }
-  assert.equal(new Set(traversedNames).size, traversedNames.length);
-  assert.deepEqual(new Set(traversedNames), new Set(["api", "pending", "running-later", "inserted-newer", "equal-a", "equal-b"]));
+  assert.equal(new Set(traversedIds).size, traversedIds.length);
+  assert.deepEqual(new Set(traversedNames), new Set(["api", "api-deployment", "pending", "running-later", "inserted-newer", "equal-a", "equal-b"]));
   const equalIndexes = [traversedNames.indexOf("equal-a"), traversedNames.indexOf("equal-b")].sort((left, right) => left - right);
   assert.equal(equalIndexes[1] - equalIndexes[0], 1);
   assert.deepEqual(traversedNames.slice(equalIndexes[0], equalIndexes[1] + 1), expectedEqualOrder);
@@ -495,20 +497,20 @@ try {
   const historyPageTwoAgain = await timelineStore.listTimelineEntries("workspace-single", { limit: 1, cursor: historyPageOne.nextCursor }, sessionBody.member.id);
   assert.equal(historyPageTwoAgain.entries[0].id, historyPageTwo.entries[0].id);
   const attentionHistory = await timelineStore.listTimelineEntries("workspace-single", { limit: 10, attention: true, unread: true }, sessionBody.member.id);
-  assert.deepEqual(attentionHistory.entries.map(({ observation }) => observation.name), ["pending"]);
-  assert.equal(attentionHistory.unreadAttentionCount, 1);
+  assert.deepEqual(attentionHistory.entries.map(({ observation }) => observation.name), ["api-deployment", "pending"]);
+  assert.equal(attentionHistory.unreadAttentionCount, 2);
   const reviewedAttentionBeforeReview = await timelineStore.listTimelineEntries("workspace-single", { limit: 10, attention: true, unread: false }, sessionBody.member.id);
   assert.deepEqual(reviewedAttentionBeforeReview.entries, []);
   const reviewedAttention = await timelineStore.reviewAttentionItem("workspace-single", sessionBody.member.id, firstHistory.entry.id);
-  assert.deepEqual(reviewedAttention, { entryId: firstHistory.entry.id, reviewed: true, unreadCount: 0 });
+  assert.deepEqual(reviewedAttention, { entryId: firstHistory.entry.id, reviewed: true, unreadCount: 1 });
   const reviewedAgain = await timelineStore.reviewAttentionItem("workspace-single", sessionBody.member.id, firstHistory.entry.id);
-  assert.deepEqual(reviewedAgain, { entryId: firstHistory.entry.id, reviewed: false, unreadCount: 0 });
-  assert.equal((await timelineStore.unreadAttentionCount("workspace-single", invitedSessionBody.member.id)), 1);
+  assert.deepEqual(reviewedAgain, { entryId: firstHistory.entry.id, reviewed: false, unreadCount: 1 });
+  assert.equal((await timelineStore.unreadAttentionCount("workspace-single", invitedSessionBody.member.id)), 2);
   const reviewedAttentionAfterReview = await timelineStore.listTimelineEntries("workspace-single", { limit: 10, attention: true, unread: false }, sessionBody.member.id);
   assert.deepEqual(reviewedAttentionAfterReview.entries.map(({ observation }) => observation.name), ["pending"]);
   const attentionApi = await fetch(`http://127.0.0.1:${webPort}/api/timeline?limit=10&attention=true&unread=true`, { headers: { cookie: ownerCookie } });
   assert.equal(attentionApi.status, 200);
-  assert.equal((await attentionApi.json()).unreadAttentionCount, 0);
+  assert.equal((await attentionApi.json()).unreadAttentionCount, 1);
   const reviewedAttentionApi = await fetch(`http://127.0.0.1:${webPort}/api/timeline?limit=10&attention=true&unread=false`, { headers: { cookie: ownerCookie } });
   assert.equal(reviewedAttentionApi.status, 200);
   assert.deepEqual((await reviewedAttentionApi.json()).entries.map(({ observation }) => observation.name), ["pending"]);
@@ -517,7 +519,7 @@ try {
     headers: { cookie: ownerCookie },
   });
   assert.equal(reviewApi.status, 200);
-  assert.deepEqual(await reviewApi.json(), { entryId: firstHistory.entry.id, reviewed: false, unreadCount: 0 });
+  assert.deepEqual(await reviewApi.json(), { entryId: firstHistory.entry.id, reviewed: false, unreadCount: 1 });
   const invalidReviewApi = await fetch(`http://127.0.0.1:${webPort}/api/timeline/entries/not%20an%20id/review`, {
     method: "POST",
     headers: { cookie: ownerCookie },

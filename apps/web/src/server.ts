@@ -8,6 +8,7 @@ import {
   TimelineQueryValidationError,
   type DatabaseBoundary,
   type ExperimentStore,
+  type ObservationTimelineEntry,
   type TimelineEntry,
   type TimelinePage,
   type TimelineQuery,
@@ -242,9 +243,9 @@ function renderClusterSection(
     </section>`;
 }
 
-function resourceKindLabel(kind: TimelineEntry["observation"]["kind"], messages: Messages): string {
+function resourceKindLabel(kind: ObservationTimelineEntry["observation"]["kind"], messages: Messages): string {
   if (kind === "Pod") return messages.podObservation;
-  const labels: Record<TimelineEntry["observation"]["kind"], string> = {
+  const labels: Record<ObservationTimelineEntry["observation"]["kind"], string> = {
     Deployment: messages.resourceKindDeployment,
     StatefulSet: messages.resourceKindStatefulSet,
     DaemonSet: messages.resourceKindDaemonSet,
@@ -257,13 +258,13 @@ function resourceKindLabel(kind: TimelineEntry["observation"]["kind"], messages:
   return labels[kind];
 }
 
-function observationStateLabel(entry: TimelineEntry, messages: Messages): string {
+function observationStateLabel(entry: ObservationTimelineEntry, messages: Messages): string {
   if (entry.recoveryOf || entry.observation.classification === "recovery") return messages.recovery;
   if (entry.attentionItem || entry.observation.classification === "attention") return messages.attentionItem;
   return messages.observationChange;
 }
 
-function observationDetail(entry: TimelineEntry, messages: Messages): string {
+function observationDetail(entry: ObservationTimelineEntry, messages: Messages): string {
   const observation = entry.observation;
   const recovery = observation.classification === "recovery" || entry.recoveryOf !== null;
   if (observation.kind === "Pod") return observation.phase ?? messages.timelineUnknownState;
@@ -277,7 +278,7 @@ function observationDetail(entry: TimelineEntry, messages: Messages): string {
   return observation.revision ?? messages.timelineUnknownState;
 }
 
-function attentionReasonLabel(entry: TimelineEntry, messages: Messages): string {
+function attentionReasonLabel(entry: ObservationTimelineEntry, messages: Messages): string {
   return entry.attentionReason ? messages.attentionReasonLabels[entry.attentionReason] ?? messages.timelineUnknownState : messages.timelineUnknownState;
 }
 
@@ -397,7 +398,7 @@ function renderTimelineSection(language: Language, messages: Messages, page: Tim
     const observation = entry.observation;
     const owners = (observation.ownerReferences ?? []).map((owner) => `${owner.kind}/${owner.name}`).join(", ");
     const attention = entry.attentionItem
-      ? `<p><strong>${escapeHtml(messages.attentionItem)}</strong> ${entry.attentionUnread ? escapeHtml(messages.attentionUnread) : escapeHtml(messages.attentionReviewed)}</p>${entry.attentionUnread ? `<form method="post" action="/timeline/entries/${encodeURIComponent(entry.id)}/review?lang=${language}"><button type="submit">${escapeHtml(messages.reviewAttention)}</button></form>` : ""}`
+      ? `<p><strong>${escapeHtml(messages.attentionItem)}</strong> ${escapeHtml(attentionReasonLabel(entry, messages))} · ${entry.attentionUnread ? escapeHtml(messages.attentionUnread) : escapeHtml(messages.attentionReviewed)}</p>${entry.attentionUnread ? `<form method="post" action="/timeline/entries/${encodeURIComponent(entry.id)}/review?lang=${language}"><button type="submit">${escapeHtml(messages.reviewAttention)}</button></form>` : ""}`
       : "";
     return `<article data-entry-id="${escapeHtml(entry.id)}">
         <h3>${escapeHtml(resourceKindLabel(observation.kind, messages))} · ${escapeHtml(observationStateLabel(entry, messages))}</h3>
@@ -415,6 +416,15 @@ function renderTimelineSection(language: Language, messages: Messages, page: Tim
   }).join("");
   const next = page.nextCursor ? `<p><a href="${escapeHtml(timelineNextPageUrl(language, query, page.nextCursor))}">${escapeHtml(messages.nextTimelinePage)}</a></p>` : "";
   const attentionFilter = query.unread ? "unread" : query.attention ? "attention" : "";
+  const attentionLabel = page.entries.some((entry) => entry.entryType === "observation" && entry.attentionItem)
+    ? messages.timelineAttention
+    : messages.timelineAttention.replace(/ Item$/, "");
+  const attentionOnlyLabel = page.entries.some((entry) => entry.entryType === "observation" && entry.attentionItem)
+    ? messages.timelineAttentionOnly
+    : messages.timelineAttentionOnly.replace(/ Items? only$/, " only");
+  const unreadAttentionOnlyLabel = page.entries.some((entry) => entry.entryType === "observation" && entry.attentionItem)
+    ? messages.timelineUnreadOnly
+    : messages.timelineUnreadOnly.replace(/ Items? only$/, " only");
   return `<section aria-labelledby="timeline-title">
       <h2 id="timeline-title">${escapeHtml(messages.timelineTitle)}</h2>
       <p>${escapeHtml(messages.timelineDescription)}</p>
@@ -428,8 +438,8 @@ function renderTimelineSection(language: Language, messages: Messages, page: Tim
         <input id="timeline-name" name="name" value="${escapeHtml(timelineQueryValue(query, "name"))}" maxlength="253">
         <label for="timeline-state">${escapeHtml(messages.timelineState)}</label>
         <select id="timeline-state" name="state"><option value="">${escapeHtml(messages.timelineAllStates)}</option>${["Pending", "Running", "Succeeded", "Failed", "Unknown"].map((stateValue) => `<option value="${stateValue}"${query.state === stateValue ? " selected" : ""}>${escapeHtml(timelineStateLabel(messages, stateValue))}</option>`).join("")}</select>
-        <label for="timeline-attention">${escapeHtml(messages.timelineAttention)}</label>
-        <select id="timeline-attention" name="attention"><option value="">${escapeHtml(messages.timelineAllAttention)}</option><option value="true"${attentionFilter === "attention" ? " selected" : ""}>${escapeHtml(messages.timelineAttentionOnly)}</option><option value="unread"${attentionFilter === "unread" ? " selected" : ""}>${escapeHtml(messages.timelineUnreadOnly)}</option></select>
+        <label for="timeline-attention">${escapeHtml(attentionLabel)}</label>
+        <select id="timeline-attention" name="attention"><option value="">${escapeHtml(messages.timelineAllAttention)}</option><option value="true"${attentionFilter === "attention" ? " selected" : ""}>${escapeHtml(attentionOnlyLabel)}</option><option value="unread"${attentionFilter === "unread" ? " selected" : ""}>${escapeHtml(unreadAttentionOnlyLabel)}</option></select>
         <button type="submit">${escapeHtml(messages.filterTimeline)}</button>
       </form>
       ${rows || `<p>${escapeHtml(messages.noTimelineEntries)}</p>`}
@@ -449,6 +459,12 @@ export function renderApplicationPage(
 ): string {
   const messages = messagesFor(language);
   const member = session.member;
+  const timelinePage: TimelinePage = Array.isArray(timelinePageOrExperiments)
+    ? { entries: timelineEntries, nextCursor: null }
+    : timelinePageOrExperiments as TimelinePage;
+  const listedExperiments: readonly ExperimentRecord[] = Array.isArray(timelinePageOrExperiments)
+    ? timelinePageOrExperiments as readonly ExperimentRecord[]
+    : experiments;
   const capabilityList = member.capabilities.map((capability) => `<li>${escapeHtml(capability)}</li>`).join("");
   const membershipLink = hasCapability(member, capabilities.membershipManage)
     ? `<p><a href="/members?lang=${language}">${escapeHtml(messages.membershipTitle)}</a></p>`
@@ -471,8 +487,8 @@ export function renderApplicationPage(
       <ul class="capabilities">${capabilityList}</ul>
       ${membershipLink}
       ${renderClusterSection(language, messages, member, scope, feedback)}
-      ${hasCapability(member, capabilities.timelineRead) ? renderTimelineSection(language, messages, Array.isArray(timelinePageOrExperiments) ? { entries: timelineEntries, nextCursor: null } : timelinePageOrExperiments, timelineQuery ?? { limit: 100 }, feedback?.attentionReviewed) : ""}
-      ${hasCapability(member, capabilities.timelineRead) ? renderExperimentsSection(language, messages, member, Array.isArray(timelinePageOrExperiments) ? timelinePageOrExperiments : experiments, {
+      ${hasCapability(member, capabilities.timelineRead) ? renderTimelineSection(language, messages, timelinePage, timelineQuery ?? { limit: 100 }, feedback?.attentionReviewed) : ""}
+      ${hasCapability(member, capabilities.timelineRead) ? renderExperimentsSection(language, messages, member, listedExperiments, {
         ...(feedback?.experimentSaved ? { saved: feedback.experimentSaved } : {}),
         ...(feedback?.experimentError ? { error: feedback.experimentError } : {}),
       }) : ""}
@@ -911,6 +927,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       ...(attention === null || attention === "" || (allowInternalFlash && attention === "reviewed") ? {} : { attention: attention === "unread" ? "true" : attention, ...(attention === "unread" ? { unread: "true" } : {}) }),
       ...(url.searchParams.get("unread") === null ? {} : { unread: url.searchParams.get("unread") }),
     };
+  };
+
   const formExperimentInput = (form: URLSearchParams): Record<string, unknown> => ({
     hypothesis: form.get("hypothesis") ?? "",
     change: form.get("change") ?? "",
@@ -937,6 +955,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       }
     }
     return formExperimentInput(new URLSearchParams(body));
+  };
 
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
     void (async () => {
