@@ -51,8 +51,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth');");
-  assert.equal(migrationCount, "3");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management');");
+  assert.equal(migrationCount, "4");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -67,6 +67,47 @@ try {
   const sessionBody = await session.json();
   assert.equal(sessionBody.member.identity.issuer, "https://local.tracegarden.test");
   assert.equal(sessionBody.member.identity.subject, "owner");
+  const ownerCookie = login.headers.get("set-cookie") ?? "";
+  const invitationResponse = await fetch(`http://127.0.0.1:${webPort}/api/invitations`, {
+    method: "POST",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ email: " INVITED@EXAMPLE.TEST " }),
+  });
+  assert.equal(invitationResponse.status, 201);
+  const invitationBody = await invitationResponse.json();
+  assert.equal(invitationBody.invitation.email, "invited@example.test");
+  const revokedInvitationResponse = await fetch(`http://127.0.0.1:${webPort}/api/invitations`, {
+    method: "POST",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ email: "rejected@example.test" }),
+  });
+  const revokedInvitation = (await revokedInvitationResponse.json()).invitation;
+  const revokeResponse = await fetch(`http://127.0.0.1:${webPort}/api/invitations/${revokedInvitation.id}/revoke`, {
+    method: "POST",
+    headers: { cookie: ownerCookie },
+  });
+  assert.equal(revokeResponse.status, 200);
+  const invitedLogin = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: "identity=invited&lang=en",
+  });
+  assert.equal(invitedLogin.status, 303);
+  const invitedSession = await fetch(`http://127.0.0.1:${webPort}/api/session`, { headers: { cookie: invitedLogin.headers.get("set-cookie") ?? "" } });
+  const invitedSessionBody = await invitedSession.json();
+  assert.equal(invitedSessionBody.member.role, "viewer");
+  const roleResponse = await fetch(`http://127.0.0.1:${webPort}/api/members/${invitedSessionBody.member.id}/role`, {
+    method: "PATCH",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ role: "operator" }),
+  });
+  assert.equal(roleResponse.status, 200);
+  const refreshedInvitedSession = await fetch(`http://127.0.0.1:${webPort}/api/session`, { headers: { cookie: invitedLogin.headers.get("set-cookie") ?? "" } });
+  const refreshedInvitedSessionBody = await refreshedInvitedSession.json();
+  assert.equal(refreshedInvitedSessionBody.member.role, "operator");
+  assert.ok(refreshedInvitedSessionBody.member.capabilities.includes("experiment:write"));
+  assert.ok(!refreshedInvitedSessionBody.member.capabilities.includes("membership:manage"));
   const rejected = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -74,8 +115,50 @@ try {
   });
   assert.equal(rejected.status, 403);
   assert.match(await rejected.text(), /no valid Workspace admission/);
+  const raceInvitationResponse = await fetch(`http://127.0.0.1:${webPort}/api/invitations`, {
+    method: "POST",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ email: "rejected@example.test" }),
+  });
+  const raceInvitation = (await raceInvitationResponse.json()).invitation;
+  const [raceAdmission, raceRevocation] = await Promise.all([
+    fetch(`http://127.0.0.1:${webPort}/auth/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "identity=rejected&lang=en",
+    }),
+    fetch(`http://127.0.0.1:${webPort}/api/invitations/${raceInvitation.id}/revoke`, {
+      method: "POST",
+      headers: { cookie: ownerCookie },
+    }),
+  ]);
+  assert.ok(raceAdmission.status === 303 || raceAdmission.status === 403);
+  assert.equal(raceAdmission.status === 303, raceRevocation.status === 404);
+  const listedInvitations = await fetch(`http://127.0.0.1:${webPort}/api/invitations`, { headers: { cookie: ownerCookie } });
+  const listedRaceInvitation = (await listedInvitations.json()).invitations.find(({ id }) => id === raceInvitation.id);
+  assert.equal(listedRaceInvitation.acceptedAt !== null, raceAdmission.status === 303);
+  assert.equal(listedRaceInvitation.revokedAt !== null, raceRevocation.status === 200);
   const memberCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_members;");
-  assert.equal(memberCount, "1");
+  assert.equal(memberCount, raceAdmission.status === 303 ? "3" : "2");
+  const auditCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_audit_records;");
+  assert.equal(auditCount, "8");
+  const auditMetadata = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT coalesce(string_agg(metadata::text, ' '), '') FROM tracegarden_audit_records;");
+  assert.doesNotMatch(auditMetadata, /token/i);
+  let auditMutationRejected = false;
+  try {
+    docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "UPDATE tracegarden_audit_records SET metadata = metadata;");
+  } catch {
+    auditMutationRejected = true;
+  }
+  assert.equal(auditMutationRejected, true);
+  let auditTruncateRejected = false;
+  try {
+    docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "TRUNCATE tracegarden_audit_records;");
+  } catch {
+    auditTruncateRejected = true;
+  }
+  assert.equal(auditTruncateRejected, true);
 
   productionWeb = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
     env: {

@@ -4,20 +4,30 @@ import type { Pool } from "pg";
 import {
   DEFAULT_LOCAL_BOOTSTRAP,
   WORKSPACE_ID,
+  capabilities,
   capabilitiesForRole,
   configuredBootstrapIdentity,
   createBetterAuthRuntime,
   googleOAuthConfig,
   identityKey,
+  isRole,
   normalizeEmail,
+  normalizeInvitationEmail,
+  requireCapability,
   type AdmissionResult,
   type AdmissionStore,
+  type AuditAction,
+  type AuditRecord,
+  type AuditTargetType,
   type AuthSession,
   type AuthenticatedSession,
   type BetterAuthRuntime,
   type BootstrapIdentity,
   type ExternalIdentity,
+  type InvitationRecord,
   type MemberRecord,
+  type MembershipActor,
+  type MembershipStore,
   type Role,
   validateExternalIdentity,
 } from "../../identity/src/index.js";
@@ -36,6 +46,7 @@ export interface DatabaseBoundary {
 export const FOUNDATION_MIGRATION_ID = "0001_foundation";
 export const ADMISSION_MIGRATION_ID = "0002_workspace_admission";
 export const BETTER_AUTH_MIGRATION_ID = "0003_better_auth";
+export const MEMBERSHIP_MIGRATION_ID = "0004_membership_management";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -43,6 +54,7 @@ const migrations: readonly Migration[] = [
   { id: FOUNDATION_MIGRATION_ID, path: "../migrations/0001_foundation.sql" },
   { id: ADMISSION_MIGRATION_ID, path: "../migrations/0002_workspace_admission.sql" },
   { id: BETTER_AUTH_MIGRATION_ID, path: "../migrations/0003_better_auth.sql" },
+  { id: MEMBERSHIP_MIGRATION_ID, path: "../migrations/0004_membership_management.sql" },
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -53,12 +65,37 @@ function sessionForMember(member: MemberRecord, authSession?: AuthSession): Auth
   };
 }
 
-export class MemoryAdmissionStore implements AdmissionStore {
+export class MemoryAdmissionStore implements AdmissionStore, MembershipStore {
   private readonly identities = new Map<string, { identity: ExternalIdentity; member: MemberRecord }>();
   private readonly sessions = new Map<string, AuthenticatedSession>();
-  private readonly invitations = new Set<string>();
+  private readonly invitations = new Map<string, InvitationRecord>();
+  private readonly audits: AuditRecord[] = [];
 
   constructor(private readonly bootstrapIdentity: BootstrapIdentity = DEFAULT_LOCAL_BOOTSTRAP) {}
+
+  private assertCanManage(actor: MembershipActor): void {
+    if (!actor || !actor.id.trim()) throw new Error("Membership actor is required");
+    requireCapability(actor, capabilities.membershipManage);
+  }
+
+  private audit(
+    action: AuditAction,
+    targetType: AuditTargetType,
+    targetId: string,
+    actorMemberId: string | null,
+    metadata: Record<string, string>,
+  ): void {
+    this.audits.push(Object.freeze({
+      id: randomUUID(),
+      workspaceId: WORKSPACE_ID,
+      actorMemberId,
+      action,
+      targetType,
+      targetId,
+      metadata: Object.freeze({ ...metadata }),
+      createdAt: new Date().toISOString(),
+    }));
+  }
 
   async admit(identity: ExternalIdentity, authSession?: AuthSession): Promise<AdmissionResult> {
     if (!validateExternalIdentity(identity)) return { admitted: false, reason: "invalid_identity" };
@@ -76,10 +113,21 @@ export class MemoryAdmissionStore implements AdmissionStore {
     }
 
     let role: Role | undefined;
-    if (this.identities.size === 0 && identityKey(identity) === identityKey(this.bootstrapIdentity)) role = "owner";
-    else if (this.invitations.delete(normalizeEmail(identity.email))) role = "viewer";
+    let invitation: InvitationRecord | undefined;
+    if (this.identities.size === 0 && identityKey(identity) === identityKey(this.bootstrapIdentity)) {
+      role = "owner";
+    } else {
+      const email = normalizeEmail(identity.email);
+      invitation = [...this.invitations.values()].find((candidate) => candidate.email === email && !candidate.revokedAt && !candidate.acceptedAt);
+      if (invitation) role = "viewer";
+    }
     if (!role) return { admitted: false, reason: "admission_required" };
 
+    const now = new Date().toISOString();
+    if (invitation) {
+      const accepted: InvitationRecord = { ...invitation, acceptedAt: now };
+      this.invitations.set(invitation.id, accepted);
+    }
     const member: MemberRecord = {
       id: randomUUID(),
       workspaceId: WORKSPACE_ID,
@@ -88,6 +136,11 @@ export class MemoryAdmissionStore implements AdmissionStore {
       capabilities: capabilitiesForRole(role),
     };
     this.identities.set(key, { identity, member });
+    this.audit("member.admitted", "member", member.id, null, {
+      email: normalizeEmail(identity.email),
+      role,
+      ...(invitation ? { invitationId: invitation.id } : {}),
+    });
     const session = sessionForMember(member, authSession);
     this.sessions.set(session.token, session);
     return { admitted: true, session };
@@ -102,8 +155,65 @@ export class MemoryAdmissionStore implements AdmissionStore {
     return session;
   }
 
-  async createInvitation(email: string): Promise<void> {
-    this.invitations.add(normalizeEmail(email));
+  async createInvitation(email: string, actor: MembershipActor): Promise<InvitationRecord> {
+    this.assertCanManage(actor);
+    const normalizedEmail = normalizeInvitationEmail(email);
+    const invitation: InvitationRecord = {
+      id: randomUUID(),
+      workspaceId: WORKSPACE_ID,
+      email: normalizedEmail,
+      createdAt: new Date().toISOString(),
+      revokedAt: null,
+      acceptedAt: null,
+    };
+    this.invitations.set(invitation.id, invitation);
+    this.audit("invitation.created", "invitation", invitation.id, actor.id, { email: normalizedEmail });
+    return invitation;
+  }
+
+  async revokeInvitation(id: string, actor: MembershipActor): Promise<InvitationRecord | null> {
+    this.assertCanManage(actor);
+    const invitation = this.invitations.get(id);
+    if (!invitation || invitation.revokedAt || invitation.acceptedAt) return null;
+    const revoked: InvitationRecord = { ...invitation, revokedAt: new Date().toISOString() };
+    this.invitations.set(id, revoked);
+    this.audit("invitation.revoked", "invitation", id, actor.id, { email: invitation.email });
+    return revoked;
+  }
+
+  async listInvitations(): Promise<readonly InvitationRecord[]> {
+    return Object.freeze([...this.invitations.values()].map((invitation) => ({ ...invitation })));
+  }
+
+  async listMembers(): Promise<readonly MemberRecord[]> {
+    return Object.freeze([...this.identities.values()].map(({ member }) => ({
+      ...member,
+      identity: { ...member.identity },
+      capabilities: [...member.capabilities],
+    })));
+  }
+
+  async assignMemberRole(memberId: string, role: Role, actor: MembershipActor): Promise<MemberRecord | null> {
+    this.assertCanManage(actor);
+    if (!isRole(role)) throw new Error("Unknown member role");
+    const entry = [...this.identities.entries()].find(([, value]) => value.member.id === memberId);
+    if (!entry) return null;
+    const [key, current] = entry;
+    if (current.member.role === role) return current.member;
+    const member: MemberRecord = { ...current.member, role, capabilities: capabilitiesForRole(role) };
+    this.identities.set(key, { identity: current.identity, member });
+    for (const [token, session] of this.sessions) {
+      if (session.member.id === memberId) this.sessions.set(token, { ...session, member });
+    }
+    this.audit("member.role_changed", "member", memberId, actor.id, {
+      fromRole: current.member.role,
+      toRole: role,
+    });
+    return member;
+  }
+
+  async listAuditRecords(): Promise<readonly AuditRecord[]> {
+    return Object.freeze(this.audits.map((audit) => ({ ...audit, metadata: { ...audit.metadata } })));
   }
 
   memberCount(): number {
@@ -142,8 +252,82 @@ function memberFromRow(row: MemberRow): MemberRecord {
   };
 }
 
-export class PostgresAdmissionStore implements AdmissionStore {
+type InvitationRow = Readonly<{
+  id: string;
+  workspace_id: string;
+  email: string;
+  created_at: string | Date;
+  revoked_at?: string | Date | null;
+  accepted_at?: string | Date | null;
+}>;
+
+type AuditRow = Readonly<{
+  id: string;
+  workspace_id: string;
+  actor_member_id?: string | null;
+  action: AuditAction;
+  target_type: AuditTargetType;
+  target_id: string;
+  metadata: Record<string, unknown>;
+  created_at: string | Date;
+}>;
+
+function timestamp(value: string | Date | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
+function invitationFromRow(row: InvitationRow): InvitationRecord {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    email: normalizeEmail(row.email),
+    createdAt: timestamp(row.created_at) ?? new Date(0).toISOString(),
+    revokedAt: timestamp(row.revoked_at),
+    acceptedAt: timestamp(row.accepted_at),
+  };
+}
+
+function auditFromRow(row: AuditRow): AuditRecord {
+  const metadata: Record<string, string> = {};
+  for (const [key, value] of Object.entries(row.metadata)) {
+    if (typeof value === "string") metadata[key] = value;
+  }
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    actorMemberId: row.actor_member_id ?? null,
+    action: row.action,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    metadata,
+    createdAt: timestamp(row.created_at) ?? new Date(0).toISOString(),
+  };
+}
+
+export class PostgresAdmissionStore implements AdmissionStore, MembershipStore {
   constructor(private readonly poolProvider: PoolProvider, private readonly bootstrapIdentity: BootstrapIdentity = DEFAULT_LOCAL_BOOTSTRAP) {}
+
+  private assertCanManage(actor: MembershipActor): void {
+    if (!actor || !actor.id.trim()) throw new Error("Membership actor is required");
+    requireCapability(actor, capabilities.membershipManage);
+  }
+
+  private async audit(
+    client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
+    action: AuditAction,
+    targetType: AuditTargetType,
+    targetId: string,
+    actorMemberId: string | null,
+    metadata: Record<string, string>,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO tracegarden_audit_records
+         (id, workspace_id, actor_member_id, action, target_type, target_id, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [randomUUID(), WORKSPACE_ID, actorMemberId, action, targetType, targetId, JSON.stringify(metadata)],
+    );
+  }
 
   async admit(identity: ExternalIdentity, authSession?: AuthSession): Promise<AdmissionResult> {
     if (!validateExternalIdentity(identity)) return { admitted: false, reason: "invalid_identity" };
@@ -165,6 +349,7 @@ export class PostgresAdmissionStore implements AdmissionStore {
         [identity.issuer, identity.subject],
       );
       let member: MemberRecord;
+      let admissionInvitationId: string | undefined;
       if (existing.rows[0]) {
         await client.query(
           "UPDATE tracegarden_external_identities SET email = $1, display_name = $2, updated_at = now() WHERE id = $3",
@@ -193,7 +378,12 @@ export class PostgresAdmissionStore implements AdmissionStore {
             return { admitted: false, reason: "admission_required" };
           }
           role = "viewer";
-          await client.query("UPDATE tracegarden_invitations SET accepted_at = now() WHERE id = $1", [invitation.rows[0].id]);
+          admissionInvitationId = invitation.rows[0].id;
+          const accepted = await client.query("UPDATE tracegarden_invitations SET accepted_at = now() WHERE id = $1 AND accepted_at IS NULL AND revoked_at IS NULL", [invitation.rows[0].id]);
+          if (accepted.rowCount !== 1) {
+            await client.query("ROLLBACK");
+            return { admitted: false, reason: "admission_required" };
+          }
         }
         const identityId = randomUUID();
         await client.query(
@@ -214,6 +404,11 @@ export class PostgresAdmissionStore implements AdmissionStore {
           role,
           capabilities: capabilitiesForRole(role),
         };
+        await this.audit(client, "member.admitted", "member", member.id, null, {
+          email: normalizeEmail(identity.email),
+          role,
+          ...(admissionInvitationId ? { invitationId: admissionInvitationId } : {}),
+        });
       }
       const session = sessionForMember(member, authSession);
       if (!authSession) {
@@ -256,13 +451,147 @@ export class PostgresAdmissionStore implements AdmissionStore {
     };
   }
 
-  async createInvitation(email: string): Promise<void> {
+  async createInvitation(email: string, actor: MembershipActor): Promise<InvitationRecord> {
+    this.assertCanManage(actor);
+    const normalizedEmail = normalizeInvitationEmail(email);
     const pool = await this.poolProvider();
-    await pool.query(
-      `INSERT INTO tracegarden_invitations (id, workspace_id, email, email_key)
-       VALUES ($1, $2, $3, $4)`,
-      [randomUUID(), WORKSPACE_ID, email.trim(), normalizeEmail(email)],
+    const client = await pool.connect();
+    const id = randomUUID();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<InvitationRow>(
+        `INSERT INTO tracegarden_invitations (id, workspace_id, email, email_key)
+         VALUES ($1, $2, $3, $3)
+         RETURNING id, workspace_id, email, created_at, revoked_at, accepted_at`,
+        [id, WORKSPACE_ID, normalizedEmail],
+      );
+      const invitation = invitationFromRow(result.rows[0] ?? {
+        id,
+        workspace_id: WORKSPACE_ID,
+        email: normalizedEmail,
+        created_at: new Date().toISOString(),
+        revoked_at: null,
+        accepted_at: null,
+      });
+      await this.audit(client, "invitation.created", "invitation", invitation.id, actor.id, { email: normalizedEmail });
+      await client.query("COMMIT");
+      return invitation;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw new Error("Tracegarden invitation creation failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async revokeInvitation(id: string, actor: MembershipActor): Promise<InvitationRecord | null> {
+    this.assertCanManage(actor);
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<InvitationRow>(
+        `UPDATE tracegarden_invitations
+            SET revoked_at = now()
+          WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL AND accepted_at IS NULL
+        RETURNING id, workspace_id, email, created_at, revoked_at, accepted_at`,
+        [id, WORKSPACE_ID],
+      );
+      if (!result.rows[0]) {
+        await client.query("COMMIT");
+        return null;
+      }
+      const invitation = invitationFromRow(result.rows[0]);
+      await this.audit(client, "invitation.revoked", "invitation", id, actor.id, { email: invitation.email });
+      await client.query("COMMIT");
+      return invitation;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw new Error("Tracegarden invitation revocation failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async listInvitations(): Promise<readonly InvitationRecord[]> {
+    const pool = await this.poolProvider();
+    const result = await pool.query<InvitationRow>(
+      `SELECT id, workspace_id, email, created_at, revoked_at, accepted_at
+         FROM tracegarden_invitations
+        WHERE workspace_id = $1
+        ORDER BY created_at, id`,
+      [WORKSPACE_ID],
     );
+    return Object.freeze(result.rows.map(invitationFromRow));
+  }
+
+  async listMembers(): Promise<readonly MemberRecord[]> {
+    const pool = await this.poolProvider();
+    const result = await pool.query<MemberRow>(
+      `SELECT m.id AS member_id, m.workspace_id, m.role,
+              ei.id AS identity_id, ei.issuer, ei.subject, ei.email, ei.display_name,
+              COALESCE(array_agg(rc.capability) FILTER (WHERE rc.capability IS NOT NULL), '{}') AS capabilities
+         FROM tracegarden_members m
+         JOIN tracegarden_external_identities ei ON ei.id = m.external_identity_id
+         LEFT JOIN tracegarden_role_capabilities rc ON rc.role = m.role
+        WHERE m.workspace_id = $1
+        GROUP BY m.id, ei.id
+        ORDER BY m.created_at, m.id`,
+      [WORKSPACE_ID],
+    );
+    return Object.freeze(result.rows.map(memberFromRow));
+  }
+
+  async assignMemberRole(memberId: string, role: Role, actor: MembershipActor): Promise<MemberRecord | null> {
+    this.assertCanManage(actor);
+    if (!isRole(role)) throw new Error("Unknown member role");
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const currentResult = await client.query<MemberRow>(
+        `SELECT m.id AS member_id, m.workspace_id, m.role,
+                ei.id AS identity_id, ei.issuer, ei.subject, ei.email, ei.display_name
+           FROM tracegarden_members m
+           JOIN tracegarden_external_identities ei ON ei.id = m.external_identity_id
+          WHERE m.id = $1 AND m.workspace_id = $2
+          FOR UPDATE`,
+        [memberId, WORKSPACE_ID],
+      );
+      const currentRow = currentResult.rows[0];
+      if (!currentRow) {
+        await client.query("COMMIT");
+        return null;
+      }
+      if (currentRow.role === role) {
+        await client.query("COMMIT");
+        return memberFromRow(currentRow);
+      }
+      await client.query("UPDATE tracegarden_members SET role = $1 WHERE id = $2", [role, memberId]);
+      await this.audit(client, "member.role_changed", "member", memberId, actor.id, {
+        fromRole: currentRow.role,
+        toRole: role,
+      });
+      await client.query("COMMIT");
+      return memberFromRow({ ...currentRow, role });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw new Error("Tracegarden member role update failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async listAuditRecords(): Promise<readonly AuditRecord[]> {
+    const pool = await this.poolProvider();
+    const result = await pool.query<AuditRow>(
+      `SELECT id, workspace_id, actor_member_id, action, target_type, target_id, metadata, created_at
+         FROM tracegarden_audit_records
+        WHERE workspace_id = $1
+        ORDER BY created_at, id`,
+      [WORKSPACE_ID],
+    );
+    return Object.freeze(result.rows.map(auditFromRow));
   }
 }
 

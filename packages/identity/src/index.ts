@@ -55,6 +55,39 @@ export type MemberRecord = Readonly<{
   capabilities: readonly Capability[];
 }>;
 
+export type MembershipActor = Pick<MemberRecord, "id" | "capabilities">;
+
+export type InvitationRecord = Readonly<{
+  id: string;
+  workspaceId: string;
+  email: string;
+  createdAt: string;
+  revokedAt: string | null;
+  acceptedAt: string | null;
+}>;
+
+export type AuditAction = "invitation.created" | "invitation.revoked" | "member.admitted" | "member.role_changed";
+export type AuditTargetType = "invitation" | "member";
+export type AuditRecord = Readonly<{
+  id: string;
+  workspaceId: string;
+  actorMemberId: string | null;
+  action: AuditAction;
+  targetType: AuditTargetType;
+  targetId: string;
+  metadata: Readonly<Record<string, string>>;
+  createdAt: string;
+}>;
+
+export interface MembershipStore {
+  createInvitation(email: string, actor: MembershipActor): Promise<InvitationRecord>;
+  revokeInvitation(id: string, actor: MembershipActor): Promise<InvitationRecord | null>;
+  listInvitations(): Promise<readonly InvitationRecord[]>;
+  listMembers(): Promise<readonly MemberRecord[]>;
+  assignMemberRole(memberId: string, role: Role, actor: MembershipActor): Promise<MemberRecord | null>;
+  listAuditRecords(): Promise<readonly AuditRecord[]>;
+}
+
 export type AuthenticatedSession = Readonly<{
   token: string;
   expiresAt: string;
@@ -68,7 +101,12 @@ export type AdmissionResult =
 export interface AdmissionStore {
   admit(identity: ExternalIdentity, authSession?: AuthSession): Promise<AdmissionResult>;
   getSession(token: string): Promise<AuthenticatedSession | null>;
-  createInvitation?(email: string): Promise<void>;
+  createInvitation?(email: string, actor: MembershipActor): Promise<InvitationRecord | void>;
+  revokeInvitation?(id: string, actor: MembershipActor): Promise<InvitationRecord | null>;
+  listInvitations?(): Promise<readonly InvitationRecord[]>;
+  listMembers?(): Promise<readonly MemberRecord[]>;
+  assignMemberRole?(memberId: string, role: Role, actor: MembershipActor): Promise<MemberRecord | null>;
+  listAuditRecords?(): Promise<readonly AuditRecord[]>;
 }
 
 export type LocalIdentityOption = Readonly<{
@@ -251,8 +289,20 @@ export function normalizeEmail(email: string): string {
   return email.trim().toLocaleLowerCase("en-US");
 }
 
+export function normalizeInvitationEmail(email: string): string {
+  const normalized = normalizeEmail(email);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
+    throw new Error("Invitation email must be a valid email address");
+  }
+  return normalized;
+}
+
 export function identityKey(identity: Pick<ExternalIdentity, "issuer" | "subject">): string {
   return `${identity.issuer}\u0000${identity.subject}`;
+}
+
+export function isRole(value: string): value is Role {
+  return value === "owner" || value === "operator" || value === "viewer";
 }
 
 export function capabilitiesForRole(role: Role): readonly Capability[] {

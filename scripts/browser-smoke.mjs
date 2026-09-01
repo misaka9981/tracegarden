@@ -50,6 +50,67 @@ try {
   assert.match(await page.locator("h1").innerText(), /Shared Workspace/);
   assert.match(await page.locator("body").innerText(), /workspace:read/);
 
+  await page.goto(`http://127.0.0.1:${port}/members?lang=zh-CN`, { waitUntil: "domcontentloaded" });
+  assert.equal(await page.locator("html").getAttribute("lang"), "zh-CN");
+  assert.match(await page.locator("h1").innerText(), /成员管理/);
+  await page.locator("#invite-email").fill(" INVITED@EXAMPLE.TEST ");
+  await page.getByRole("button", { name: "创建 Invitation" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Invitation 已创建/);
+  await page.locator("#invite-email").fill("rejected@example.test");
+  await page.getByRole("button", { name: "创建 Invitation" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  const rejectedInvitationRow = page.locator("tr").filter({ hasText: "rejected@example.test" });
+  await rejectedInvitationRow.getByRole("button", { name: "撤销 Invitation" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Invitation 已撤销/);
+  await page.goto(`http://127.0.0.1:${port}/members?lang=en`, { waitUntil: "domcontentloaded" });
+  assert.equal(await page.locator("html").getAttribute("lang"), "en");
+  assert.match(await page.locator("h1").innerText(), /Membership management/);
+  assert.match(await page.locator("body").innerText(), /invited@example.test/);
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  await page.locator("#identity").selectOption("invited");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Shared Workspace/);
+  assert.equal(await page.locator('a[href^="/members"]').count(), 0);
+  const viewerInvitationAttempt = await page.evaluate(async () => (await fetch("/api/invitations", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: "another@example.test" }) })).status);
+  assert.equal(viewerInvitationAttempt, 403);
+  const viewerRoleAttempt = await page.evaluate(async () => (await fetch("/api/members/not-authorized/role", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ role: "owner" }) })).status);
+  assert.equal(viewerRoleAttempt, 403);
+  const viewerCookie = await page.context().cookies().then((cookies) => cookies.map(({ name, value }) => `${name}=${value}`).join("; "));
+  const viewerMembersPage = await fetch(`http://127.0.0.1:${port}/members?lang=en`, { headers: { cookie: viewerCookie } });
+  assert.equal(viewerMembersPage.status, 403);
+  assert.match(await viewerMembersPage.text(), /do not have permission/);
+  const viewerMembersPageChinese = await fetch(`http://127.0.0.1:${port}/members?lang=zh-CN`, { headers: { cookie: viewerCookie } });
+  assert.equal(viewerMembersPageChinese.status, 403);
+  assert.match(await viewerMembersPageChinese.text(), /你没有管理成员/);
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  await page.locator("#identity").selectOption("owner");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  await page.goto(`http://127.0.0.1:${port}/members?lang=en`, { waitUntil: "domcontentloaded" });
+  const invitedRole = page.locator('select[aria-label="Role: invited@example.test"]');
+  await invitedRole.selectOption("operator");
+  await invitedRole.locator("xpath=ancestor::form").getByRole("button", { name: "Save role" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Role updated/);
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  await page.locator("#identity").selectOption("invited");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  const operatorSession = await page.evaluate(async () => (await fetch("/api/session")).json());
+  assert.equal(operatorSession.member.role, "operator");
+  assert.ok(operatorSession.member.capabilities.includes("experiment:write"));
+  assert.ok(!operatorSession.member.capabilities.includes("membership:manage"));
+  assert.equal((await page.goto(`http://127.0.0.1:${port}/members?lang=en`))?.status(), 403);
+
   await page.getByRole("button", { name: "Sign out" }).click();
   await page.waitForLoadState("domcontentloaded");
   await page.locator("#identity").selectOption("rejected");

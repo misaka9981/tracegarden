@@ -38,21 +38,57 @@ assert.equal(rejectedFirstAdmission.admitted, false);
 assert.equal(rejectedFirstStore.memberCount(), 0);
 const ownerAdmission = await admissionStore.admit(ownerIdentity);
 assert.equal(ownerAdmission.admitted, true);
-if (ownerAdmission.admitted) {
-  assert.equal(ownerAdmission.session.member.role, "owner");
-  assert.ok(hasCapability(ownerAdmission.session.member, capabilities.membershipManage));
-  assert.equal((await admissionStore.getSession(ownerAdmission.session.token))?.member.identity.subject, "owner");
-}
+const ownerActor = ownerAdmission.session.member;
+assert.equal(ownerActor.role, "owner");
+assert.ok(hasCapability(ownerActor, capabilities.membershipManage));
+assert.equal((await admissionStore.getSession(ownerAdmission.session.token))?.member.identity.subject, "owner");
+await assert.rejects(() => admissionStore.createInvitation("missing-actor@example.test"), /Membership actor is required/);
 const rejectedAdmission = await admissionStore.admit(rejectedIdentity);
 assert.equal(rejectedAdmission.admitted, false);
 assert.equal(admissionStore.memberCount(), 1);
 const invitedIdentity = identityAdapter.resolve("invited");
 assert.ok(invitedIdentity);
-await admissionStore.createInvitation(invitedIdentity.email.toUpperCase());
+const invitedInvitation = await admissionStore.createInvitation(` ${invitedIdentity.email.toUpperCase()} `, ownerActor);
+assert.equal(invitedInvitation.email, invitedIdentity.email);
+const revokedInvitation = await admissionStore.createInvitation(rejectedIdentity.email, ownerActor);
+assert.ok(await admissionStore.revokeInvitation(revokedInvitation.id, ownerActor));
+assert.equal((await admissionStore.admit(rejectedIdentity)).admitted, false);
 const invitedAdmission = await admissionStore.admit(invitedIdentity);
 assert.equal(invitedAdmission.admitted, true);
-if (invitedAdmission.admitted) assert.equal(invitedAdmission.session.member.role, "viewer");
+if (invitedAdmission.admitted) {
+  assert.equal(invitedAdmission.session.member.role, "viewer");
+  assert.equal((await admissionStore.admit(invitedIdentity)).session.member.id, invitedAdmission.session.member.id);
+  await assert.rejects(() => admissionStore.createInvitation("other@example.test", invitedAdmission.session.member), /Missing capability/);
+}
+const sameEmailDifferentIdentity = new LocalIdentityAdapter([{
+  key: "same-email",
+  issuer: "https://local.tracegarden.test",
+  subject: "same-email",
+  email: invitedIdentity.email,
+  displayName: "Same Email Identity",
+}]).resolve("same-email");
+assert.ok(sameEmailDifferentIdentity);
+assert.equal((await admissionStore.admit(sameEmailDifferentIdentity)).admitted, false);
 assert.equal(admissionStore.memberCount(), 2);
+if (invitedAdmission.admitted) {
+  const operator = await admissionStore.assignMemberRole(invitedAdmission.session.member.id, "operator", ownerActor);
+  assert.ok(operator);
+  assert.ok(hasCapability(operator, capabilities.experimentWrite));
+  assert.ok(!hasCapability(operator, capabilities.membershipManage));
+  assert.equal((await admissionStore.getSession(invitedAdmission.session.token))?.member.role, "operator");
+  await assert.rejects(() => admissionStore.assignMemberRole(ownerActor.id, "viewer", operator), /Missing capability/);
+}
+const auditRecords = await admissionStore.listAuditRecords();
+assert.deepEqual(auditRecords.map(({ action }) => action), [
+  "member.admitted",
+  "invitation.created",
+  "invitation.created",
+  "invitation.revoked",
+  "member.admitted",
+  "member.role_changed",
+]);
+assert.ok(auditRecords.every((record) => !JSON.stringify(record).includes("token")));
+assert.equal((await admissionStore.listInvitations()).find(({ id }) => id === invitedInvitation.id)?.acceptedAt !== null, true);
 const renamedOwner = { ...ownerIdentity, email: "renamed@example.test", displayName: "Renamed Owner" };
 const renamedAdmission = await admissionStore.admit(renamedOwner);
 assert.equal(renamedAdmission.admitted, true);

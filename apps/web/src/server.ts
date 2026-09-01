@@ -7,9 +7,15 @@ import {
   configuredBootstrapIdentity,
   createIdentityAdapter,
   GOOGLE_ISSUER,
+  hasCapability,
+  isRole,
   requireCapability,
   type AdmissionStore,
   type AuthenticatedSession,
+  type InvitationRecord,
+  type MemberRecord,
+  type MembershipStore,
+  type Role,
   type BetterAuthRuntime,
   type ExternalIdentity,
   type IdentityAdapter,
@@ -74,6 +80,10 @@ function pageStyles(): string {
       select, button { font: inherit; padding: 0.6rem 0.75rem; border: 1px solid #98a2b3; border-radius: 0.4rem; }
       button { background: #175cd3; border-color: #175cd3; color: white; cursor: pointer; }
       .error { color: #b42318; font-weight: 600; }
+      .notice { color: #087f5b; font-weight: 600; }
+      table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; }
+      th, td { text-align: left; border-bottom: 1px solid #edf0f5; padding: 0.75rem 0.5rem; vertical-align: top; }
+      input { font: inherit; padding: 0.6rem 0.75rem; border: 1px solid #98a2b3; border-radius: 0.4rem; }
       .capabilities { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0; list-style: none; }
       .capabilities li { border: 1px solid #d9dee8; border-radius: 999px; padding: 0.4rem 0.7rem; }
     </style>`;
@@ -151,6 +161,9 @@ export function renderApplicationPage(language: Language, session: Authenticated
   const messages = messagesFor(language);
   const member = session.member;
   const capabilityList = member.capabilities.map((capability) => `<li>${escapeHtml(capability)}</li>`).join("");
+  const membershipLink = hasCapability(member, capabilities.membershipManage)
+    ? `<p><a href="/members?lang=${language}">${escapeHtml(messages.membershipTitle)}</a></p>`
+    : "";
   return `<!doctype html>
 <html lang="${language}">
   <head>
@@ -163,10 +176,11 @@ export function renderApplicationPage(language: Language, session: Authenticated
     <main>
       <p class="hint">${escapeHtml(messages.appName)}</p>
       <h1>${escapeHtml(messages.workspaceTitle)}</h1>
-      <p>${escapeHtml(messages.welcome)}，${escapeHtml(member.identity.displayName)}。</p>
+      <p>${escapeHtml(messages.welcome)}, ${escapeHtml(member.identity.displayName)}.</p>
       <p><strong>${escapeHtml(messages.signedInAs)}:</strong> ${escapeHtml(member.identity.email)}</p>
       <h2>${escapeHtml(messages.capabilities)}</h2>
       <ul class="capabilities">${capabilityList}</ul>
+      ${membershipLink}
       <form method="post" action="/auth/logout?lang=${language}">
         <button type="submit">${escapeHtml(messages.signOut)}</button>
       </form>
@@ -174,6 +188,73 @@ export function renderApplicationPage(language: Language, session: Authenticated
     </main>
   </body>
 </html>`;
+}
+
+function invitationStatus(invitation: InvitationRecord, messages: Messages): string {
+  return invitation.revokedAt ? messages.revoked : invitation.acceptedAt ? messages.accepted : messages.pending;
+}
+
+export function renderMembersPage(
+  language: Language,
+  session: AuthenticatedSession,
+  members: readonly MemberRecord[],
+  invitations: readonly InvitationRecord[],
+  notice?: string,
+): string {
+  const messages = messagesFor(language);
+  const memberRows = members.map((member) => `<tr>
+      <td>${escapeHtml(member.identity.displayName)}<br><span class="hint">${escapeHtml(member.identity.email)}</span></td>
+      <td><form method="post" action="/members/role">
+        <input type="hidden" name="lang" value="${language}">
+        <input type="hidden" name="memberId" value="${escapeHtml(member.id)}">
+        <label><span class="hint">${escapeHtml(messages.role)}</span>
+          <select name="role" aria-label="${escapeHtml(messages.role)}: ${escapeHtml(member.identity.email)}">
+            ${["owner", "operator", "viewer"].map((role) => `<option value="${role}"${member.role === role ? " selected" : ""}>${role}</option>`).join("")}
+          </select>
+        </label>
+        <button type="submit">${escapeHtml(messages.saveRole)}</button>
+      </form></td>
+    </tr>`).join("");
+  const invitationRows = invitations.map((invitation) => `<tr>
+      <td>${escapeHtml(invitation.email)}</td>
+      <td>${escapeHtml(invitationStatus(invitation, messages))}</td>
+      <td>${invitation.revokedAt || invitation.acceptedAt ? "" : `<form method="post" action="/members/revoke"><input type="hidden" name="lang" value="${language}"><input type="hidden" name="invitationId" value="${escapeHtml(invitation.id)}"><button type="submit">${escapeHtml(messages.revokeInvitation)}</button></form>`}</td>
+    </tr>`).join("");
+  return `<!doctype html>
+<html lang="${language}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapeHtml(messages.appName)} · ${escapeHtml(messages.membershipTitle)}</title>
+    ${pageStyles()}
+  </head>
+  <body>
+    <main>
+      <p class="hint">${escapeHtml(messages.appName)}</p>
+      <h1>${escapeHtml(messages.membershipTitle)}</h1>
+      <p><strong>${escapeHtml(messages.signedInAs)}:</strong> ${escapeHtml(session.member.identity.email)}</p>
+      ${notice ? `<p class="notice" role="status">${escapeHtml(notice)}</p>` : ""}
+      <h2>${escapeHtml(messages.members)}</h2>
+      <table><thead><tr><th>${escapeHtml(messages.members)}</th><th>${escapeHtml(messages.role)}</th></tr></thead><tbody>${memberRows || `<tr><td colspan="2">—</td></tr>`}</tbody></table>
+      <h2>${escapeHtml(messages.invitations)}</h2>
+      <form method="post" action="/members/invite">
+        <input type="hidden" name="lang" value="${language}">
+        <label for="invite-email">${escapeHtml(messages.inviteEmail)}</label>
+        <input id="invite-email" name="email" type="email" required autocomplete="email">
+        <button type="submit">${escapeHtml(messages.createInvitation)}</button>
+      </form>
+      <table><thead><tr><th>${escapeHtml(messages.inviteEmail)}</th><th>${escapeHtml(messages.role)}</th><th></th></tr></thead><tbody>${invitationRows || `<tr><td colspan="3">—</td></tr>`}</tbody></table>
+      <p><a href="/app?lang=${language}">${escapeHtml(messages.workspaceTitle)}</a></p>
+      <form method="post" action="/auth/logout?lang=${language}"><button type="submit">${escapeHtml(messages.signOut)}</button></form>
+      ${renderLanguageLinks(language, messages, "/members")}
+    </main>
+  </body>
+</html>`;
+}
+
+export function renderMembershipDeniedPage(language: Language): string {
+  const messages = messagesFor(language);
+  return `<!doctype html><html lang="${language}"><head><meta charset="utf-8"><title>${escapeHtml(messages.appName)} · ${escapeHtml(messages.membershipTitle)}</title>${pageStyles()}</head><body><main><h1>${escapeHtml(messages.membershipTitle)}</h1><p role="alert">${escapeHtml(messages.membershipDenied)}</p><p><a href="/app?lang=${language}">${escapeHtml(messages.workspaceTitle)}</a></p><form method="post" action="/auth/logout?lang=${language}"><button type="submit">${escapeHtml(messages.signOut)}</button></form>${renderLanguageLinks(language, messages, "/members")}</main></body></html>`;
 }
 
 export function renderRejectionPage(language: Language, reason: "admission_required" | "invalid_identity"): string {
@@ -242,6 +323,33 @@ async function requestBody(request: IncomingMessage): Promise<string> {
   });
 }
 
+type RequestFields = Readonly<Record<string, string>>;
+
+function requestFields(body: string, contentType: string | undefined): RequestFields | null {
+  if (contentType?.split(";", 1)[0]?.trim().toLowerCase() === "application/json") {
+    try {
+      const value: unknown = JSON.parse(body);
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+      const fields: Record<string, string> = {};
+      for (const [key, field] of Object.entries(value)) {
+        if (typeof field !== "string") return null;
+        fields[key] = field;
+      }
+      return fields;
+    } catch {
+      return null;
+    }
+  }
+  const form = new URLSearchParams(body);
+  return Object.fromEntries(form.entries());
+}
+
+function jsonResponse(response: ServerResponse, statusCode: number, value: unknown): void {
+  response.statusCode = statusCode;
+  response.setHeader("content-type", "application/json; charset=utf-8");
+  response.end(JSON.stringify(value));
+}
+
 function cookieHeader(token: string, production: boolean): string {
   return `tracegarden_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax${production ? "; Secure" : ""}`;
 }
@@ -252,6 +360,15 @@ type BetterAuthDatabase = DatabaseBoundary & {
 
 function hasBetterAuth(value: DatabaseBoundary): value is BetterAuthDatabase {
   return "betterAuth" in value && typeof value.betterAuth === "function";
+}
+
+function hasMembershipStore(value: AdmissionStore): value is AdmissionStore & MembershipStore {
+  return typeof value.createInvitation === "function"
+    && typeof value.revokeInvitation === "function"
+    && typeof value.listInvitations === "function"
+    && typeof value.listMembers === "function"
+    && typeof value.assignMemberRole === "function"
+    && typeof value.listAuditRecords === "function";
 }
 
 function requestHeaders(request: IncomingMessage): Headers {
@@ -377,6 +494,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       return false;
     }
   };
+  const membershipStore = hasMembershipStore(admissionStore) ? admissionStore : null;
 
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
     void (async () => {
@@ -470,6 +588,146 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         response.setHeader("location", payload.url);
         setResponseHeaders(response, authResponse.headers);
         response.end();
+        return;
+      }
+
+      const isMembershipPage = requestUrl.pathname === "/members"
+        || requestUrl.pathname === "/members/invite"
+        || requestUrl.pathname === "/members/revoke"
+        || requestUrl.pathname === "/members/role";
+      const invitationMatch = requestUrl.pathname.match(/^\/api\/invitations\/([^/]+)(?:\/revoke)?$/);
+      const memberRoleMatch = requestUrl.pathname.match(/^\/api\/members\/([^/]+)\/role$/);
+      const isMembershipApi = requestUrl.pathname === "/api/members"
+        || requestUrl.pathname === "/api/invitations"
+        || requestUrl.pathname === "/api/audit"
+        || Boolean(invitationMatch)
+        || Boolean(memberRoleMatch);
+      if (isMembershipPage || isMembershipApi) {
+        const lookup = await sessionForRequest(request);
+        const isApi = isMembershipApi;
+        if (!lookup.session) {
+          if (isApi) jsonResponse(response, lookup.rejection ? 403 : 401, { error: lookup.rejection ?? "unauthorized" });
+          else {
+            response.statusCode = 302;
+            response.setHeader("location", `/?lang=${language}`);
+            response.end();
+          }
+          return;
+        }
+        if (!hasWorkspaceAccess(lookup.session) || !hasCapability(lookup.session.member, capabilities.membershipManage)) {
+          if (isApi) jsonResponse(response, 403, { error: "forbidden", capability: capabilities.membershipManage });
+          else {
+            response.statusCode = 403;
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderMembershipDeniedPage(language));
+          }
+          return;
+        }
+        if (!membershipStore) {
+          jsonResponse(response, 503, { error: "membership_store_unavailable" });
+          return;
+        }
+        if (isApi && method === "GET") {
+          if (requestUrl.pathname === "/api/members") jsonResponse(response, 200, { members: await membershipStore.listMembers() });
+          else if (requestUrl.pathname === "/api/invitations") jsonResponse(response, 200, { invitations: await membershipStore.listInvitations() });
+          else if (requestUrl.pathname === "/api/audit") jsonResponse(response, 200, { records: await membershipStore.listAuditRecords() });
+          else jsonResponse(response, 404, { error: "not_found" });
+          return;
+        }
+        if (isApi && method !== "POST" && method !== "PATCH" && method !== "DELETE") {
+          jsonResponse(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        const body = method === "GET" || method === "HEAD" ? "" : await requestBody(request);
+        const fields = requestFields(body, request.headers?.["content-type"]);
+        const responseLanguage = !isApi && fields?.lang ? parseLanguage(fields.lang) : language;
+        const actor = lookup.session.member;
+        try {
+          if (requestUrl.pathname === "/api/invitations" && method === "POST") {
+            if (!fields?.email) {
+              jsonResponse(response, 400, { error: "invalid_request" });
+              return;
+            }
+            const invitation = await membershipStore.createInvitation(fields.email, actor);
+            jsonResponse(response, 201, { invitation });
+            return;
+          }
+          if (invitationMatch && (method === "DELETE" || (method === "POST" && requestUrl.pathname.endsWith("/revoke")))) {
+            const invitation = await membershipStore.revokeInvitation(invitationMatch[1] ?? "", actor);
+            if (!invitation) {
+              jsonResponse(response, 404, { error: "invitation_not_found_or_unusable" });
+              return;
+            }
+            jsonResponse(response, 200, { invitation });
+            return;
+          }
+          if (memberRoleMatch && (method === "PATCH" || method === "POST")) {
+            const role = fields?.role;
+            if (!role || !isRole(role)) {
+              jsonResponse(response, 400, { error: "invalid_role" });
+              return;
+            }
+            const member = await membershipStore.assignMemberRole(memberRoleMatch[1] ?? "", role, actor);
+            if (!member) {
+              jsonResponse(response, 404, { error: "member_not_found" });
+              return;
+            }
+            jsonResponse(response, 200, { member });
+            return;
+          }
+          if (isApi) {
+            jsonResponse(response, 404, { error: "not_found" });
+            return;
+          }
+          if (requestUrl.pathname === "/members" && method === "GET") {
+            response.statusCode = 200;
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            const notice = requestUrl.searchParams.get("notice");
+            const messages = messagesFor(language);
+            const noticeText = notice === "created" ? messages.invitationCreated : notice === "revoked" ? messages.invitationRevoked : notice === "role" ? messages.roleChanged : undefined;
+            response.end(renderMembersPage(language, lookup.session, await membershipStore.listMembers(), await membershipStore.listInvitations(), noticeText));
+            return;
+          }
+          if (!fields) {
+            response.statusCode = 400;
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderMembershipDeniedPage(responseLanguage));
+            return;
+          }
+          if (requestUrl.pathname === "/members/invite" && method === "POST") {
+            if (!fields.email) throw new Error("invalid request");
+            await membershipStore.createInvitation(fields.email, actor);
+            response.statusCode = 303;
+            response.setHeader("location", `/members?lang=${responseLanguage}&notice=created`);
+            response.end();
+            return;
+          }
+          if (requestUrl.pathname === "/members/revoke" && method === "POST") {
+            if (!fields.invitationId || !await membershipStore.revokeInvitation(fields.invitationId, actor)) throw new Error("invitation unavailable");
+            response.statusCode = 303;
+            response.setHeader("location", `/members?lang=${responseLanguage}&notice=revoked`);
+            response.end();
+            return;
+          }
+          if (requestUrl.pathname === "/members/role" && method === "POST") {
+            if (!fields.memberId || !fields.role || !isRole(fields.role) || !await membershipStore.assignMemberRole(fields.memberId, fields.role as Role, actor)) throw new Error("member unavailable");
+            response.statusCode = 303;
+            response.setHeader("location", `/members?lang=${responseLanguage}&notice=role`);
+            response.end();
+            return;
+          }
+          response.statusCode = 404;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderMembershipDeniedPage(responseLanguage));
+        } catch (error) {
+          const message = error instanceof Error && /valid email|invalid request|unavailable/.test(error.message) ? error.message : "membership operation failed";
+          if (isApi) jsonResponse(response, 400, { error: message });
+          else {
+            response.statusCode = 400;
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderMembershipDeniedPage(responseLanguage));
+          }
+        }
         return;
       }
       if (method !== "GET") {

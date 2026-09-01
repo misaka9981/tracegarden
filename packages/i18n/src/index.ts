@@ -26,6 +26,22 @@ export type Messages = Readonly<{
   rejectionTitle: string;
   rejectionDescription: string;
   admissionRequired: string;
+  membershipTitle: string;
+  members: string;
+  invitations: string;
+  inviteEmail: string;
+  createInvitation: string;
+  revokeInvitation: string;
+  revoked: string;
+  accepted: string;
+  pending: string;
+  role: string;
+  saveRole: string;
+  membershipDenied: string;
+  invitationCreated: string;
+  invitationRevoked: string;
+  roleChanged: string;
+  invalidRequest: string;
 }>;
 
 export const catalogs: Readonly<Record<Language, Messages>> = {
@@ -55,6 +71,22 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     rejectionTitle: "无法进入 Workspace",
     rejectionDescription: "此身份已完成身份验证，但没有有效的 Workspace admission。请联系 owner 获取 Invitation。",
     admissionRequired: "需要有效的 Invitation 才能加入。",
+    membershipTitle: "成员管理",
+    members: "成员",
+    invitations: "Invitations",
+    inviteEmail: "邮箱地址",
+    createInvitation: "创建 Invitation",
+    revokeInvitation: "撤销 Invitation",
+    revoked: "已撤销",
+    accepted: "已接受",
+    pending: "待使用",
+    role: "角色",
+    saveRole: "保存角色",
+    membershipDenied: "你没有管理成员和 Invitation 的权限。",
+    invitationCreated: "Invitation 已创建。",
+    invitationRevoked: "Invitation 已撤销。",
+    roleChanged: "角色已更新。",
+    invalidRequest: "请求无效。",
   },
   en: {
     appName: "Tracegarden",
@@ -82,6 +114,22 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     rejectionTitle: "Workspace access denied",
     rejectionDescription: "This identity was authenticated but has no valid Workspace admission. Ask the owner for an Invitation.",
     admissionRequired: "A valid Invitation is required to join.",
+    membershipTitle: "Membership management",
+    members: "Members",
+    invitations: "Invitations",
+    inviteEmail: "Email address",
+    createInvitation: "Create Invitation",
+    revokeInvitation: "Revoke Invitation",
+    revoked: "Revoked",
+    accepted: "Accepted",
+    pending: "Pending",
+    role: "Role",
+    saveRole: "Save role",
+    membershipDenied: "You do not have permission to manage Members and Invitations.",
+    invitationCreated: "Invitation created.",
+    invitationRevoked: "Invitation revoked.",
+    roleChanged: "Role updated.",
+    invalidRequest: "Invalid request.",
   },
 };
 
