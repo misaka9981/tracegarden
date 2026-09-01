@@ -55,6 +55,8 @@ importers:
 
   packages/logs: {}
 
+  packages/telemetry: {}
+
 packages:
 
   '@better-auth/core@1.3.24':

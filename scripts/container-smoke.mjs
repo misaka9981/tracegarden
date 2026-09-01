@@ -23,11 +23,11 @@ if (!imageAvailable("node:26.8-bookworm") || !imageAvailable("postgres:18.3-alpi
 function compose(args) {
   return docker(["compose", "-p", project, ...args]);
 }
-async function waitFor(url) {
+async function waitFor(url, ready = (response) => response.ok) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
       const response = await fetch(url);
-      if (response.ok) return response;
+      if (ready(response)) return response;
     } catch {
       // The service is still starting.
     }
@@ -39,9 +39,9 @@ async function waitFor(url) {
 try {
   compose(["up", "-d", "--build"]);
   const webResponse = await waitFor("http://127.0.0.1:3000/health/readiness");
-  const collectorResponse = await waitFor("http://127.0.0.1:3001/health/readiness");
+  const collectorResponse = await waitFor("http://127.0.0.1:3001/health/readiness", (response) => response.status === 503);
   assert.equal((await webResponse.json()).status, "ready");
-  assert.equal((await collectorResponse.json()).status, "ready");
+  assert.equal((await collectorResponse.json()).checks.collector, "not-ready");
   for (const service of ["web", "collector"]) {
     const container = compose(["ps", "-q", service]);
     assert.equal(docker(["inspect", "-f", "{{.Config.User}}", container]), "node");

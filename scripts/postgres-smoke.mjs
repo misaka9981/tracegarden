@@ -521,7 +521,8 @@ try {
     }
   }
   assert.ok(collectorReadiness);
-  assert.equal(collectorReadiness.status, 200);
+  assert.equal(collectorReadiness.status, 503);
+  assert.equal((await collectorReadiness.json()).checks.collector, "not-ready");
   assert.match(collectorOutput, /initial collection completed/);
 
   collectorDatabase = new PostgresDatabase(databaseUrl);

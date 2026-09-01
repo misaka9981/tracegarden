@@ -71,8 +71,10 @@ import {
   requestRecentLogWindow,
   RecentLogWindowValidationError,
   type KubernetesLogAdapter,
+  type RecentLogTelemetryEvent,
   type RecentLogWindow,
 } from "../../../packages/logs/src/index.js";
+import { createTelemetry, type CorrelationMetadata, type TelemetryRuntime } from "../../../packages/telemetry/src/index.js";
 
 type WebOptions = Readonly<{
   database?: DatabaseBoundary;
@@ -86,11 +88,13 @@ type WebOptions = Readonly<{
   environment?: Record<string, string | undefined>;
   port?: number;
   host?: string;
+  telemetry?: TelemetryRuntime;
 }>;
 
 export type WebRuntime = Readonly<{
   server: Server;
   status: () => Promise<StatusResponse>;
+  telemetry: TelemetryRuntime;
   close: () => Promise<void>;
 }>;
 
@@ -985,15 +989,42 @@ function retentionCleanupQueryResult(url: URL, policy: RetentionPolicy | null): 
 function requestHeaders(request: IncomingMessage): Headers {
   const headers = new Headers();
   for (const [name, value] of Object.entries(request.headers ?? {})) {
+    if (["x-request-id", "x-trace-id", "traceparent"].includes(name.toLowerCase())) continue;
     if (typeof value === "string") headers.set(name, value);
     else if (Array.isArray(value)) headers.set(name, value.join(", "));
   }
   return headers;
 }
 
+function listenForStartup(server: Server, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onListening = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const onError = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      server.removeListener("listening", onListening);
+      reject(error);
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    try {
+      server.listen(port, host);
+    } catch (error) {
+      server.removeListener("error", onError);
+      server.removeListener("listening", onListening);
+      onError(error);
+    }
+  });
+}
+
 function setResponseHeaders(response: ServerResponse, headers: Headers): void {
   for (const [name, value] of headers) {
-    if (name !== "set-cookie") response.setHeader(name, value);
+    if (name !== "set-cookie" && name !== "x-request-id" && name !== "x-trace-id" && name !== "traceparent") response.setHeader(name, value);
   }
   const headersWithCookies = headers as Headers & { getSetCookie?: () => string[] };
   const cookies = headersWithCookies.getSetCookie?.() ?? (headers.get("set-cookie") ? [headers.get("set-cookie") as string] : []);
@@ -1002,6 +1033,17 @@ function setResponseHeaders(response: ServerResponse, headers: Headers): void {
 
 export async function createWebRuntime(options: WebOptions = {}): Promise<WebRuntime> {
   const environment = options.environment ?? process.env;
+  const production = environment.NODE_ENV === "production";
+  if (production && options.telemetry) {
+    throw new Error("Production web instrumentation must be application-owned");
+  }
+  const telemetry = options.telemetry ?? createTelemetry({
+    serviceName: "tracegarden-web",
+    logExporter: (signal) => console.log(JSON.stringify(signal)),
+    traceExporter: (signal) => console.log(JSON.stringify(signal)),
+  });
+  const startupCorrelation = telemetry.correlation("web-startup");
+  telemetry.log("info", "web.starting", startupCorrelation);
   const database = options.database ?? createDatabase(environment);
   if (environment.NODE_ENV === "production" && database.kind === "memory") {
     throw new Error("Memory database is not allowed in production");
@@ -1067,10 +1109,19 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       throw new Error("BETTER_AUTH_URL must be HTTPS in production");
     }
   }
-  await database.migrate();
-  if (!(await database.ping())) {
+  let migrationReady = false;
+  let databaseReady = false;
+  let startupState: "starting" | "ready" | "failed" = "starting";
+  try {
+    await database.migrate();
+    migrationReady = true;
+    databaseReady = await database.ping();
+    if (!databaseReady) throw new Error("Tracegarden database readiness check failed");
+  } catch (error) {
+    startupState = "failed";
+    telemetry.log("error", "web.startup.failure", startupCorrelation, { error_type: error instanceof Error ? error.name : "unknown" });
     await database.close();
-    throw new Error("Tracegarden database readiness check failed");
+    throw error;
   }
   let betterAuthRuntime: BetterAuthRuntime | undefined;
   if (environment.NODE_ENV === "production") {
@@ -1085,6 +1136,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     try {
       betterAuthRuntime = await database.betterAuth(environment);
     } catch (error) {
+      startupState = "failed";
+      telemetry.log("error", "web.startup.failure", startupCorrelation, { error_type: error instanceof Error ? error.name : "unknown" });
       await database.close();
       throw error;
     }
@@ -1104,7 +1157,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     close: () => void;
   };
   const liveSseClients = new Map<string, LiveSseClient>();
-  let timelineReady = true;
+  let timelineReady = false;
+  let stopping = false;
   const refreshLiveClientLag = async (client: LiveSseClient): Promise<void> => {
     if (!client.query || !timelineStore?.countTimelineEntriesAfterCursor) return;
     try {
@@ -1134,16 +1188,32 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   };
 
   const status = async (): Promise<StatusResponse> => {
-    const databaseReady = await database.ping();
+    try {
+      databaseReady = await database.ping();
+    } catch {
+      databaseReady = false;
+    }
+    try {
+      const migrationStatus = database.migrationStatus?.();
+      if (migrationStatus === "failed" || migrationStatus === "pending") migrationReady = false;
+      if (migrationStatus === "ready") migrationReady = true;
+    } catch {
+      migrationReady = false;
+    }
+    await verifyTimelineNotifications();
     await refreshLiveSignals();
-    const timelineState = state(timelineReady);
+    syncWebMetrics();
+    const readiness = state(databaseReady && migrationReady && timelineReady && startupState === "ready");
     return {
       service: "tracegarden-web",
-      status: state(databaseReady && timelineReady),
+      status: readiness,
+      startup: startupState,
+      readiness,
+      liveness: stopping ? "stopping" : "alive",
       checks: {
         database: state(databaseReady),
-        migrations: "ready",
-        timeline: timelineState,
+        migrations: state(migrationReady),
+        timeline: state(timelineReady),
       },
       signals: liveSignalSnapshot(),
     };
@@ -1208,11 +1278,94 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   const timelineNotifications = timelineStore && "subscribeTimeline" in timelineStore && typeof timelineStore.subscribeTimeline === "function"
     ? timelineStore as TimelineNotificationSource
     : null;
-  if (timelineNotifications?.timelineNotificationsHealthy) timelineReady = timelineNotifications.timelineNotificationsHealthy();
   const removeTimelineErrorListener = timelineNotifications?.onTimelineError?.(() => {
     timelineReady = false;
+    telemetry.log("warn", "timeline.notifications.unhealthy", telemetry.correlation("timeline-notifications"));
     for (const client of [...liveSseClients.values()]) client.close();
   });
+  const defineWebMetrics = (): void => {
+    telemetry.defineGauge("tracegarden_sse_clients");
+    telemetry.defineGauge("tracegarden_timeline_cursor_lag_entries");
+    telemetry.defineGauge("tracegarden_timeline_cursor_lag_seconds");
+    telemetry.defineGauge("tracegarden_database_pool_total");
+    telemetry.defineGauge("tracegarden_database_pool_idle");
+    telemetry.defineGauge("tracegarden_database_pool_waiting");
+    telemetry.defineGauge("tracegarden_database_ready");
+    telemetry.defineGauge("tracegarden_migrations_ready");
+    telemetry.defineGauge("tracegarden_migration_status");
+    telemetry.defineCounter("tracegarden_recent_log_access_total", { result: "success" });
+  };
+  defineWebMetrics();
+  const syncWebMetrics = (): void => {
+    const signals = liveSignalSnapshot();
+    const correlation = telemetry.correlation("web-signals");
+    let pool = { total: 0, idle: 0, waiting: 0 };
+    try {
+      pool = database.poolState?.() ?? pool;
+    } catch {
+      // Pool gauges are diagnostic and cannot affect request or probe behavior.
+    }
+    telemetry.setGauge("tracegarden_sse_clients", signals.sseClients, {}, correlation);
+    telemetry.setGauge("tracegarden_timeline_cursor_lag_entries", signals.cursorLagEntries, {}, correlation);
+    telemetry.setGauge("tracegarden_timeline_cursor_lag_seconds", signals.cursorLagSeconds, {}, correlation);
+    telemetry.setGauge("tracegarden_database_pool_total", pool.total, {}, correlation);
+    telemetry.setGauge("tracegarden_database_pool_idle", pool.idle, {}, correlation);
+    telemetry.setGauge("tracegarden_database_pool_waiting", pool.waiting, {}, correlation);
+    telemetry.setGauge("tracegarden_database_ready", databaseReady ? 1 : 0, {}, correlation);
+    telemetry.setGauge("tracegarden_migrations_ready", migrationReady ? 1 : 0, {}, correlation);
+    let migrationValue = migrationReady ? 1 : 0;
+    try {
+      if (database.migrationStatus?.() === "failed") migrationValue = -1;
+    } catch {
+      migrationValue = -1;
+    }
+    telemetry.setGauge("tracegarden_migration_status", migrationValue, {}, correlation);
+  };
+
+  const recentLogTelemetry = (correlation: CorrelationMetadata) => ({
+    structuredLog: (event: RecentLogTelemetryEvent) => telemetry.log("info", event.action, correlation, event),
+    trace: (event: RecentLogTelemetryEvent) => {
+      const span = telemetry.startSpan(event.action, correlation, event);
+      span.end();
+    },
+    metric: (_event: RecentLogTelemetryEvent) => telemetry.increment("tracegarden_recent_log_access_total", 1, { result: "success" }, correlation),
+    analytics: (event: RecentLogTelemetryEvent) => telemetry.log("debug", "recent_log.analytics", correlation, { clusterId: event.clusterId, namespace: event.namespace, pod: event.pod, container: event.container, tail: event.tail, lineCount: event.lineCount, byteCount: event.byteCount }),
+  });
+
+  let releaseTimelineReadiness: (() => void) | undefined;
+  const timelineNotificationsAreHealthy = (): boolean => {
+    try {
+      return timelineNotifications?.timelineNotificationsHealthy?.() !== false;
+    } catch {
+      return false;
+    }
+  };
+  const verifyTimelineNotifications = async (): Promise<void> => {
+    if (!timelineNotifications) {
+      timelineReady = false;
+      return;
+    }
+    if (releaseTimelineReadiness && timelineNotificationsAreHealthy()) {
+      timelineReady = true;
+      return;
+    }
+    releaseTimelineReadiness?.();
+    releaseTimelineReadiness = undefined;
+    try {
+      const unsubscribe = await timelineNotifications.subscribeTimeline(() => {});
+      if (!timelineNotificationsAreHealthy()) {
+        unsubscribe();
+        timelineReady = false;
+        return;
+      }
+      releaseTimelineReadiness = unsubscribe;
+      timelineReady = true;
+    } catch {
+      timelineReady = false;
+      telemetry.log("warn", "timeline.notifications.unavailable", telemetry.correlation("timeline-notifications"));
+    }
+  };
+  await verifyTimelineNotifications();
 
   const scopeForSession = (session: AuthenticatedSession): Promise<ClusterScope | null> => clusterScopeStore.get(session.member.workspaceId);
   const correlationSuggestionsForSession = async (session: AuthenticatedSession): Promise<readonly CorrelationSuggestionRecord[]> =>
@@ -1301,6 +1454,14 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   };
 
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
+    const correlation = telemetry.correlation();
+    const requestSpan = telemetry.startSpan("http.request", correlation, {
+      method: request.method ?? "GET",
+      path: (request.url ?? "/").split("?", 1)[0],
+    });
+    response.setHeader("x-request-id", requestSpan.correlation.requestId);
+    response.setHeader("x-trace-id", requestSpan.correlation.traceId);
+    response.setHeader("traceparent", `00-${requestSpan.correlation.traceId}-${requestSpan.correlation.spanId}-01`);
     void (async () => {
       const requestUrl = new URL(request.url ?? "/", "http://localhost");
       const method = request.method ?? "GET";
@@ -1414,6 +1575,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         }
         const clientId = randomUUID();
         let closed = false;
+        let responseStarted = false;
         let unsubscribe: (() => void) | undefined;
         const client: LiveSseClient = {
           workspaceId: lookup.session.member.workspaceId,
@@ -1429,16 +1591,10 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
             closed = true;
             liveSseClients.delete(clientId);
             unsubscribe?.();
-            response.end();
+            if (responseStarted) response.end();
           },
         };
         liveSseClients.set(clientId, client);
-        response.writeHead(200, {
-          "cache-control": "no-store",
-          "connection": "keep-alive",
-          "content-type": "text/event-stream; charset=utf-8",
-          "x-accel-buffering": "no",
-        });
         request.on("close", client.close);
         response.on("close", client.close);
         response.on("error", client.close);
@@ -1490,7 +1646,15 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
             unsubscribe();
             return;
           }
+          if (timelineNotifications.timelineNotificationsHealthy?.() === false) throw new Error("Timeline notifications are not healthy");
           timelineReady = true;
+          responseStarted = true;
+          response.writeHead(200, {
+            "cache-control": "no-store",
+            "connection": "keep-alive",
+            "content-type": "text/event-stream; charset=utf-8",
+            "x-accel-buffering": "no",
+          });
           if (!writeEvent("ready", { clientId })) return;
           client.readySent = true;
           void sendAuthorizedHint();
@@ -1498,6 +1662,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         } catch {
           timelineReady = false;
           client.close();
+          if (!responseStarted) sendJson(response, 503, { error: "timeline_notifications_unavailable" });
         }
         return;
       }
@@ -1782,6 +1947,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
             input,
             adapter: logAdapter,
             ...(logAuditStore ? { auditStore: logAuditStore } : {}),
+            telemetry: recentLogTelemetry(requestSpan.correlation),
           });
           sendJson(response, 200, { window: recentLogs });
         } catch (error: unknown) {
@@ -1835,6 +2001,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
             input: formLogInput(new URLSearchParams(Object.entries(fields))),
             adapter: logAdapter,
             ...(logAuditStore ? { auditStore: logAuditStore } : {}),
+            telemetry: recentLogTelemetry(requestSpan.correlation),
           });
           response.statusCode = 200;
           response.setHeader("content-type", "text/html; charset=utf-8");
@@ -2324,17 +2491,28 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         response.end(JSON.stringify({ error: "method_not_allowed" }));
         return;
       }
+      if (requestUrl.pathname === "/metrics") {
+        await status();
+        syncWebMetrics();
+        response.statusCode = 200;
+        response.setHeader("content-type", "text/plain; version=0.0.4; charset=utf-8");
+        response.end(telemetry.metricsText());
+        return;
+      }
       if (requestUrl.pathname === "/health/live") {
         response.statusCode = 200;
         response.setHeader("content-type", "application/json; charset=utf-8");
-        response.end(JSON.stringify({ service: "tracegarden-web", status: "alive" }));
+        response.end(JSON.stringify({ service: "tracegarden-web", status: stopping ? "stopping" : "alive", liveness: stopping ? "stopping" : "alive" }));
         return;
       }
       if (requestUrl.pathname === "/health/startup" || requestUrl.pathname === "/health/readiness" || requestUrl.pathname === "/api/status") {
         const current = await status();
-        response.statusCode = current.status === "ready" ? 200 : 503;
+        const healthy = requestUrl.pathname === "/health/startup"
+          ? current.startup === "ready"
+          : current.readiness === "ready";
+        response.statusCode = healthy ? 200 : 503;
         response.setHeader("content-type", "application/json; charset=utf-8");
-        response.end(JSON.stringify(current));
+        response.end(JSON.stringify(requestUrl.pathname === "/health/startup" ? { ...current, status: healthy ? "ready" : "not-ready" } : current));
         return;
       }
       if (requestUrl.pathname === "/api/session") {
@@ -2476,20 +2654,55 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       response.statusCode = 503;
       response.setHeader("content-type", "application/json; charset=utf-8");
       response.end(JSON.stringify({ error: "service_unavailable" }));
-      console.error(error instanceof Error ? error.message : "web request failed");
+      telemetry.log("error", "web.request.failure", correlation, { error_type: error instanceof Error ? error.name : "unknown", status_code: response.statusCode });
+      requestSpan.fail(error);
+    }).finally(() => {
+      requestSpan.end({ status_code: response.statusCode });
     });
   };
 
   const server = createServer(requestHandler);
   const port = options.port ?? Number(environment.PORT ?? "3000");
   const host = options.host ?? environment.HOST ?? "127.0.0.1";
-  await new Promise<void>((resolve) => server.listen(port, host, resolve));
+  try {
+    await listenForStartup(server, port, host);
+  } catch (error) {
+    startupState = "failed";
+    telemetry.log("error", "web.startup.failure", startupCorrelation, {
+      error_type: error instanceof Error ? error.name : "unknown",
+    });
+    try {
+      removeTimelineErrorListener?.();
+    } catch {
+      // Cleanup cannot mask the bind failure.
+    }
+    try {
+      releaseTimelineReadiness?.();
+    } catch {
+      // Cleanup cannot mask the bind failure.
+    }
+    releaseTimelineReadiness = undefined;
+    try {
+      await database.close();
+    } catch {
+      // Cleanup cannot mask the bind failure.
+    }
+    throw error;
+  }
+  startupState = "ready";
+  telemetry.log("info", "web.started", startupCorrelation, { host, port });
+  syncWebMetrics();
   return {
     server,
     status,
+    telemetry,
     close: async () => {
+      stopping = true;
+      telemetry.log("info", "web.stopping", startupCorrelation);
       removeTimelineErrorListener?.();
       for (const client of [...liveSseClients.values()]) client.close();
+      releaseTimelineReadiness?.();
+      releaseTimelineReadiness = undefined;
       await database.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },

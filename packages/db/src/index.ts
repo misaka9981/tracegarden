@@ -68,6 +68,12 @@ import {
 } from "../../domain/src/index.js";
 
 export type DatabaseStatus = "ready" | "not-ready";
+export type DatabaseMigrationStatus = "pending" | "ready" | "failed";
+export type DatabasePoolState = Readonly<{
+  total: number;
+  idle: number;
+  waiting: number;
+}>;
 
 export interface DatabaseBoundary {
   readonly kind: "postgres" | "memory";
@@ -78,6 +84,8 @@ export interface DatabaseBoundary {
   readonly retention?: RetentionStore;
   migrate(): Promise<void>;
   ping(): Promise<boolean>;
+  migrationStatus?(): DatabaseMigrationStatus;
+  poolState?(): DatabasePoolState;
   close(): Promise<void>;
 }
 
@@ -2848,6 +2856,7 @@ export class PostgresDatabase implements DatabaseBoundary {
   readonly timeline: PostgresObservationStore;
   readonly experiments: ExperimentStore;
   readonly retention: RetentionStore;
+  private migrationState: DatabaseMigrationStatus = "pending";
 
   constructor(
     private readonly connectionString: string,
@@ -2884,6 +2893,19 @@ export class PostgresDatabase implements DatabaseBoundary {
       throw new Error("BETTER_AUTH_URL must be HTTPS in production");
     }
     return createBetterAuthRuntime(config, await this.getPool(), baseURL, environment.BETTER_AUTH_SECRET?.trim() ?? "");
+  }
+
+  migrationStatus(): DatabaseMigrationStatus {
+    return this.migrationState;
+  }
+
+  poolState(): DatabasePoolState {
+    const pool = this.pool as (Pool & { totalCount?: number; idleCount?: number; waitingCount?: number }) | undefined;
+    return {
+      total: pool?.totalCount ?? 0,
+      idle: pool?.idleCount ?? 0,
+      waiting: pool?.waitingCount ?? 0,
+    };
   }
 
   async migrate(): Promise<void> {
@@ -2923,9 +2945,11 @@ export class PostgresDatabase implements DatabaseBoundary {
       client.release();
     }
     if (failed) {
+      this.migrationState = "failed";
       await this.close();
       throw new Error("Tracegarden database migration failed", { cause: failure });
     }
+    this.migrationState = "ready";
   }
 
   async ping(): Promise<boolean> {
@@ -2964,6 +2988,14 @@ export class MemoryDatabase implements DatabaseBoundary {
 
   async migrate(): Promise<void> {
     this.migrationReady = true;
+  }
+
+  migrationStatus(): DatabaseMigrationStatus {
+    return this.migrationReady ? "ready" : "pending";
+  }
+
+  poolState(): DatabasePoolState {
+    return { total: 0, idle: 0, waiting: 0 };
   }
 
   async ping(): Promise<boolean> {

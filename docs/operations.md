@@ -21,15 +21,18 @@ Recent Log Window requests require the owner-only `logs:read` Capability and an 
 
 ## Observability
 
-The application emits OpenTelemetry traces, metrics, and structured logs through optional exporters. It also provides:
+Web and collector expose separate probes:
 
-- startup, readiness, and conservative liveness endpoints
-- Prometheus-compatible operational metrics
-- collector lag, reconnect, relist, normalization failure, and persistence failure metrics
-- SSE client count and cursor lag
-- database pool and migration status
+- `/health/startup` is `200` only after migrations, the initial database check, and the HTTP listener complete. A failed migration or initial database check fails startup rather than serving partial data.
+- `/health/readiness` and `/api/status` report dependency readiness (database, migrations, and web Timeline notification transport). They return `503` while a dependency is unavailable.
+- `/health/live` reports the process liveness only. It remains `200` during transient PostgreSQL, Kubernetes, or exporter failures, avoiding an unsafe restart loop. It reports `stopping` while shutdown is in progress.
+- `/metrics` is an unauthenticated Prometheus text endpoint containing operational values only.
 
-No complete monitoring stack is installed by this project. Missing exporters do not prevent startup. Container log bodies obtained through Recent Log Window are excluded from logs, traces, metrics, exception messages, and analytics.
+The application emits OpenTelemetry-compatible spans, structured JSON logs, and Prometheus-compatible metric samples through optional best-effort exporters. Every signal carries server-generated request, trace, and span correlation metadata; incoming `x-request-id` values are not trusted or forwarded. Exporter absence, connection failure, thrown errors, or rejected promises are ignored and never block web requests, ingestion, SSE, or Recent Log Window responses.
+
+The signals mean: collector lag is the age of the newest observed Kubernetes event; reconnects count bounded watch reconnects; relists count recovery from an expired resource version; normalization and persistence failures count rejected or uncommitted observations; SSE clients is the active stream count; cursor lag is the number and age of committed Timeline entries not yet delivered to a stream; database pool gauges show total, idle, and waiting connections; migration status is a gauge with `-1` for failed, `0` for pending, and `1` for ready; and Recent Log Window access count records successful metadata-only requests. Metrics include `tracegarden_collector_lag_seconds`, collector reconnect/relist/normalization/persistence counters, failed namespaces, `tracegarden_sse_clients`, Timeline cursor lag in entries and seconds, `tracegarden_database_pool_total`/`idle`/`waiting`, migration and database readiness, and Recent Log Window access count. Values are counts, states, sizes, or approved resource metadata; protected content is not an attribute.
+
+No complete monitoring stack is installed by this project. Operators choose and configure external OpenTelemetry and Prometheus collectors separately. Container log bodies obtained through Recent Log Window are excluded from logs, traces, metrics, exception messages, and analytics, including failure paths.
 
 ## Failure handling
 

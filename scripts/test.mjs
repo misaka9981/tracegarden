@@ -29,6 +29,28 @@ import {
   productionKubernetesConfiguration,
   validateClusterScopeInput,
 } from "../dist/packages/cluster/src/index.js";
+import { createTelemetry } from "../dist/packages/telemetry/src/index.js";
+
+const exporterFailureTelemetry = createTelemetry({
+  serviceName: "tracegarden-test",
+  structuredLog: () => { throw new Error("exporter unavailable"); },
+  trace: () => { throw new Error("exporter unavailable"); },
+  metric: () => { throw new Error("exporter unavailable"); },
+});
+const exporterCorrelation = exporterFailureTelemetry.correlation("request-test");
+exporterFailureTelemetry.log("info", "test.signal", exporterCorrelation, { body: "must-not-appear", operation: "health" });
+const exporterSpan = exporterFailureTelemetry.startSpan("test.span", exporterCorrelation, { operation: "health" });
+exporterSpan.end({ outcome: "ok" });
+exporterFailureTelemetry.increment("tracegarden_test_total", 1, { result: "ok" }, exporterCorrelation);
+assert.match(exporterFailureTelemetry.metricsText(), /tracegarden_test_total\{result="ok"\} 1/);
+assert.equal(JSON.stringify(exporterFailureTelemetry.signals()).includes("must-not-appear"), false);
+const boundedTelemetry = createTelemetry({ serviceName: "tracegarden-cardinality" });
+for (let index = 0; index < 1_100; index += 1) {
+  boundedTelemetry.increment("tracegarden_cardinality_total", 1, { series: `value-${index}`, extra: "bounded", ignored: "bounded" });
+}
+const cardinalitySamples = boundedTelemetry.metricsText().split("\n").filter((line) => line.startsWith("tracegarden_cardinality_total{"));
+assert.equal(cardinalitySamples.length, 1_000);
+assert.ok(cardinalitySamples.every((line) => (line.match(/=/g) ?? []).length <= 8));
 
 assert.equal(parseLanguage(undefined), "zh-CN");
 assert.equal(parseLanguage("en"), "en");
@@ -422,6 +444,112 @@ const database = new MemoryDatabase();
 assert.equal(await database.ping(), false);
 await database.migrate();
 assert.equal(await database.ping(), true);
+const exporterWebRuntime = await createWebRuntime({
+  database: new MemoryDatabase(),
+  identityAdapter: new LocalIdentityAdapter(),
+  telemetry: exporterFailureTelemetry,
+  environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
+  port: 43215,
+});
+try {
+  const liveHealth = await fetch("http://127.0.0.1:43215/health/live");
+  assert.equal(liveHealth.status, 200);
+  const readyHealth = await fetch("http://127.0.0.1:43215/health/readiness");
+  assert.equal(readyHealth.status, 200);
+  const readyHealthBody = await readyHealth.json();
+  assert.deepEqual({ startup: readyHealthBody.startup, readiness: readyHealthBody.readiness, liveness: readyHealthBody.liveness }, { startup: "ready", readiness: "ready", liveness: "alive" });
+  const exporterMetrics = await fetch("http://127.0.0.1:43215/metrics");
+  assert.equal(exporterMetrics.status, 200);
+  const exporterMetricsBody = await exporterMetrics.text();
+  assert.match(exporterMetricsBody, /tracegarden_sse_clients/);
+  assert.match(exporterMetricsBody, /tracegarden_timeline_cursor_lag_entries/);
+  assert.match(exporterMetricsBody, /tracegarden_database_pool_idle/);
+  assert.match(exporterMetricsBody, /tracegarden_migration_status/);
+  const untrustedRequestId = "protected-request-correlation";
+  const tracedHealth = await fetch("http://127.0.0.1:43215/health/live", { headers: { "x-request-id": untrustedRequestId } });
+  const serverRequestId = tracedHealth.headers.get("x-request-id") ?? "";
+  assert.notEqual(serverRequestId, untrustedRequestId);
+  const traceparent = tracedHealth.headers.get("traceparent") ?? "";
+  const requestStart = exporterFailureTelemetry.signals().find((signal) => signal.kind === "trace" && signal.event === "span.start" && signal.correlation.requestId === serverRequestId);
+  assert.ok(requestStart);
+  assert.equal(traceparent, `00-${requestStart.correlation.traceId}-${requestStart.correlation.spanId}-01`);
+  assert.doesNotMatch(JSON.stringify(exporterFailureTelemetry.signals()), /protected-request-correlation/);
+} finally {
+  await exporterWebRuntime.close();
+}
+const dependencyDatabase = new MemoryDatabase();
+let dependencyReady = true;
+dependencyDatabase.ping = async () => dependencyReady;
+const dependencyRuntime = await createWebRuntime({
+  database: dependencyDatabase,
+  identityAdapter: new LocalIdentityAdapter(),
+  environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
+  port: 43217,
+});
+try {
+  dependencyReady = false;
+  const dependencyReadiness = await fetch("http://127.0.0.1:43217/health/readiness");
+  assert.equal(dependencyReadiness.status, 503);
+  const completedStartup = await fetch("http://127.0.0.1:43217/health/startup");
+  assert.equal(completedStartup.status, 200);
+  assert.equal((await completedStartup.json()).startup, "ready");
+  const conservativeLiveness = await fetch("http://127.0.0.1:43217/health/live");
+  assert.equal(conservativeLiveness.status, 200);
+  const degradedMetrics = await fetch("http://127.0.0.1:43217/metrics");
+  assert.equal(degradedMetrics.status, 200);
+} finally {
+  await dependencyRuntime.close();
+}
+const listenFailureDatabase = new MemoryDatabase();
+listenFailureDatabase.timeline.subscribeTimeline = async () => { throw new Error("LISTEN unavailable"); };
+const listenFailureRuntime = await createWebRuntime({
+  database: listenFailureDatabase,
+  identityAdapter: new LocalIdentityAdapter(),
+  environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
+  port: 43218,
+});
+try {
+  const listenFailureReadiness = await fetch("http://127.0.0.1:43218/health/readiness");
+  assert.equal(listenFailureReadiness.status, 503);
+  assert.equal((await listenFailureReadiness.json()).checks.timeline, "not-ready");
+  const listenFailureLogin = await fetch("http://127.0.0.1:43218/auth/login", {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: "identity=owner&lang=en",
+  });
+  const listenFailureStream = await fetch("http://127.0.0.1:43218/api/timeline/stream", {
+    headers: { cookie: listenFailureLogin.headers.get("set-cookie") ?? "" },
+  });
+  assert.equal(listenFailureStream.status, 503);
+} finally {
+  await listenFailureRuntime.close();
+}
+const bindFailureWebTelemetry = createTelemetry({ serviceName: "tracegarden-web-bind-test" });
+const occupiedWebPort = 43221;
+const occupiedWebRuntime = await createWebRuntime({
+  database: new MemoryDatabase(),
+  identityAdapter: new LocalIdentityAdapter(),
+  environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
+  port: occupiedWebPort,
+});
+try {
+  await assert.rejects(
+    createWebRuntime({
+      database: new MemoryDatabase(),
+      identityAdapter: new LocalIdentityAdapter(),
+      telemetry: bindFailureWebTelemetry,
+      environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
+      port: occupiedWebPort,
+    }),
+    /EADDRINUSE/,
+  );
+  const webBindSignals = bindFailureWebTelemetry.signals();
+  assert.ok(webBindSignals.some((signal) => signal.kind === "log" && signal.event === "web.startup.failure"));
+  assert.equal(webBindSignals.some((signal) => signal.kind === "log" && signal.event === "web.started"), false);
+} finally {
+  await occupiedWebRuntime.close();
+}
 
 const scopeInput = {
   clusterId: "lab-cluster",
@@ -866,6 +994,31 @@ try {
 } finally {
   await collectorWithPersistence.close();
 }
+const exporterCollectorRuntime = await createCollectorRuntime({
+  port: 43216,
+  host: "127.0.0.1",
+  scope: savedScope ?? undefined,
+  adapter: deterministic,
+  observationStore: new MemoryObservationStore(),
+  telemetry: exporterFailureTelemetry,
+});
+try {
+  await exporterCollectorRuntime.collectObservations();
+  const collectorReadyHealth = await fetch("http://127.0.0.1:43216/health/readiness");
+  assert.equal(collectorReadyHealth.status, 200);
+  const collectorReadyBody = await collectorReadyHealth.json();
+  assert.deepEqual({ startup: collectorReadyBody.startup, readiness: collectorReadyBody.readiness, liveness: collectorReadyBody.liveness }, { startup: "ready", readiness: "ready", liveness: "alive" });
+  const collectorLiveHealth = await fetch("http://127.0.0.1:43216/health/live");
+  assert.equal(collectorLiveHealth.status, 200);
+  const collectorMetrics = await fetch("http://127.0.0.1:43216/metrics");
+  const collectorMetricsBody = await collectorMetrics.text();
+  assert.match(collectorMetricsBody, /tracegarden_collector_lag_seconds/);
+  assert.match(collectorMetricsBody, /tracegarden_collector_reconnects_total/);
+  assert.match(collectorMetricsBody, /tracegarden_database_pool_waiting/);
+  assert.match(collectorMetricsBody, /tracegarden_migration_status/);
+} finally {
+  await exporterCollectorRuntime.close();
+}
 let scheduledRetentionCleanup;
 let retentionCleanupCalls = 0;
 let retentionCleanupCancelled = false;
@@ -925,6 +1078,13 @@ class FailingObservationStore extends MemoryObservationStore {
 const failedCollection = await createCollectorRuntime({ port: 43207, host: "127.0.0.1", scope: savedScope ?? undefined, adapter: deterministic, observationStore: new FailingObservationStore() });
 try {
   await assert.rejects(failedCollection.collectObservations(), (error) => error instanceof CollectorRecoveryError && /persistence failed/.test(error.message));
+  const failedCollectorReadiness = await fetch("http://127.0.0.1:43207/health/readiness");
+  assert.equal(failedCollectorReadiness.status, 503);
+  const completedCollectorStartup = await fetch("http://127.0.0.1:43207/health/startup");
+  assert.equal(completedCollectorStartup.status, 200);
+  assert.equal((await completedCollectorStartup.json()).startup, "ready");
+  const failedCollectorLiveness = await fetch("http://127.0.0.1:43207/health/live");
+  assert.equal(failedCollectorLiveness.status, 200);
 } finally {
   await failedCollection.close();
 }
@@ -1096,9 +1256,25 @@ const telemetrySafeLog = await requestRecentLogWindow({
   },
 });
 assert.match(telemetrySafeLog.body, /protected-log-224/);
+const asyncTelemetryLog = await requestRecentLogWindow({
+  member: ownerMember,
+  scope: logScope,
+  input: { clusterId: logScope.clusterId, namespace: "tracegarden", pod: "api-0", container: "app", tail: 1 },
+  adapter: logAdapter,
+  telemetry: {
+    structuredLog: async () => { throw new Error("async structured exporter rejected"); },
+    trace: async () => { throw new Error("async trace exporter rejected"); },
+    metric: async () => { throw new Error("async metric exporter rejected"); },
+    analytics: async () => { throw new Error("async analytics exporter rejected"); },
+  },
+});
+assert.match(asyncTelemetryLog.body, /protected-log-224/);
+await new Promise((resolve) => setImmediate(resolve));
 
 const collector = collectorStatus();
-assert.equal(collector.status, "ready");
+assert.equal(collector.status, "not-ready");
+assert.equal(collector.readiness, "not-ready");
+assert.equal(collector.checks.collector, "not-ready");
 assert.equal(collector.checks.clusterContacted, false);
 const collectorRuntime = await createCollectorRuntime({ port: 43202, host: "127.0.0.1", scope: savedScope ?? undefined, adapter: deterministic });
 try {
@@ -1110,6 +1286,68 @@ try {
   assert.equal(collectorReadiness.checks.clusterContacted, false);
 } finally {
   await collectorRuntime.close();
+}
+const lostCollectorDatabase = new MemoryDatabase();
+let lostCollectorDatabaseReady = true;
+lostCollectorDatabase.ping = async () => lostCollectorDatabaseReady;
+const lostCollectorRuntime = await createCollectorRuntime({
+  port: 43219,
+  host: "127.0.0.1",
+  scope: savedScope ?? undefined,
+  adapter: deterministic,
+  database: lostCollectorDatabase,
+});
+try {
+  lostCollectorDatabaseReady = false;
+  const lostReadiness = await fetch("http://127.0.0.1:43219/health/readiness");
+  assert.equal(lostReadiness.status, 503);
+  const lostMetrics = await fetch("http://127.0.0.1:43219/metrics");
+  assert.match(await lostMetrics.text(), /tracegarden_collector_database_ready 0/);
+  lostCollectorDatabaseReady = true;
+  assert.equal((await fetch("http://127.0.0.1:43219/health/readiness")).status, 200);
+} finally {
+  await lostCollectorRuntime.close();
+}
+const inertCollectorRuntime = await createCollectorRuntime({
+  port: 43220,
+  host: "127.0.0.1",
+  scope: savedScope ?? undefined,
+  adapter: createKubernetesAdapter({ NODE_ENV: "production" }),
+  observationStore: new MemoryObservationStore(),
+});
+try {
+  const inertReadiness = await fetch("http://127.0.0.1:43220/health/readiness");
+  assert.equal(inertReadiness.status, 503);
+  assert.equal((await inertReadiness.json()).checks.collector, "not-ready");
+} finally {
+  await inertCollectorRuntime.close();
+}
+const bindFailureCollectorTelemetry = createTelemetry({ serviceName: "tracegarden-collector-bind-test" });
+const occupiedCollectorPort = 43222;
+const occupiedCollectorRuntime = await createCollectorRuntime({
+  port: occupiedCollectorPort,
+  host: "127.0.0.1",
+  scope: savedScope ?? undefined,
+  adapter: deterministic,
+  observationStore: new MemoryObservationStore(),
+});
+try {
+  await assert.rejects(
+    createCollectorRuntime({
+      port: occupiedCollectorPort,
+      host: "127.0.0.1",
+      scope: savedScope ?? undefined,
+      adapter: deterministic,
+      observationStore: new MemoryObservationStore(),
+      telemetry: bindFailureCollectorTelemetry,
+    }),
+    /EADDRINUSE/,
+  );
+  const collectorBindSignals = bindFailureCollectorTelemetry.signals();
+  assert.ok(collectorBindSignals.some((signal) => signal.kind === "log" && signal.event === "collector.startup.failure"));
+  assert.equal(collectorBindSignals.some((signal) => signal.kind === "log" && signal.event === "collector.started"), false);
+} finally {
+  await occupiedCollectorRuntime.close();
 }
 
 const scopeDatabase = new MemoryDatabase();
@@ -1126,6 +1364,7 @@ const transportLogAdapter = {
 const scopeRuntime = await createWebRuntime({
   database: scopeDatabase,
   logAdapter: transportLogAdapter,
+  telemetry: exporterFailureTelemetry,
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
   port: 43208,
 });
@@ -1199,6 +1438,16 @@ try {
   assert.equal(failedRecentLogForm.status, 503);
   assert.equal(failedRecentLogForm.headers.get("cache-control"), "no-store");
   assert.doesNotMatch(await failedRecentLogForm.text(), /transport-protected-log-body/);
+  const protectedRequestBody = "protected-http-body";
+  const protectedRequest = await fetch("http://127.0.0.1:43208/api/logs/recent", {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json", "x-request-id": "protected-request-correlation" },
+    body: JSON.stringify({ clusterId: "lab-cluster", namespace: "tracegarden", pod: "api-0", container: "app", tail: 2, body: protectedRequestBody }),
+  });
+  assert.equal(protectedRequest.status, 503);
+  assert.notEqual(protectedRequest.headers.get("x-request-id"), "protected-request-correlation");
+  assert.doesNotMatch(JSON.stringify(exporterFailureTelemetry.signals()), /protected-http-body|protected-request-correlation/);
+  assert.doesNotMatch(JSON.stringify(exporterFailureTelemetry.signals()), /transport-log-/);
   const invalidRecentLog = await fetch("http://127.0.0.1:43208/api/logs/recent", {
     method: "POST",
     headers: { cookie, "content-type": "application/json" },

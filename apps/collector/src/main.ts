@@ -25,6 +25,7 @@ import {
 } from "../../../packages/db/src/index.js";
 import { WORKSPACE_ID } from "../../../packages/identity/src/index.js";
 import type { RetentionStore } from "../../../packages/domain/src/index.js";
+import { createTelemetry, type TelemetryRuntime } from "../../../packages/telemetry/src/index.js";
 
 export type CollectorBackoffPolicy = Readonly<{
   initialDelayMs: number;
@@ -69,6 +70,7 @@ export type CollectorOptions = Readonly<{
   now?: () => Date;
   retentionCleanupIntervalMs?: number;
   retentionCleanupScheduler?: CollectorRetentionScheduler;
+  telemetry?: TelemetryRuntime;
 }>;
 
 export type CollectorWatchOptions = Readonly<{
@@ -94,16 +96,20 @@ export type CollectorRuntime = Readonly<{
   collectObservations: () => Promise<readonly ObservationPersistenceResult[]>;
   runWatch: (options?: CollectorWatchOptions) => Promise<void>;
   close: () => Promise<void>;
+  telemetry: TelemetryRuntime;
 }>;
 
 export function collectorStatus(): StatusResponse {
   return {
     service: "tracegarden-collector",
-    status: state(true),
+    status: state(false),
+    startup: "ready",
+    readiness: "not-ready",
+    liveness: "alive",
     checks: {
       database: "not-ready",
       migrations: "not-ready",
-      collector: "ready",
+      collector: "not-ready",
       clusterContacted: false,
     },
   };
@@ -122,6 +128,32 @@ function listResourceVersion(result: KubernetesListResult): string | null {
     if (version && (!latest || compareResourceVersions(version, latest) > 0)) latest = version;
   }
   return latest;
+}
+
+function listenForStartup(server: Server, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onListening = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const onError = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      server.removeListener("listening", onListening);
+      reject(error);
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    try {
+      server.listen(port, host);
+    } catch (error) {
+      server.removeListener("error", onError);
+      server.removeListener("listening", onListening);
+      onError(error);
+    }
+  });
 }
 
 function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -201,6 +233,10 @@ function hasRetentionStore(value: unknown): value is RetentionStore {
     && typeof candidate.cleanupRetention === "function";
 }
 
+function hasCollectionPreconditions(scope: ClusterScope | null, adapter: KubernetesObservationAdapter): scope is ClusterScope {
+  return Boolean(scope && adapter.kind !== "inert" && scope.namespaces.length > 0 && scope.resourceKinds.includes("Pod"));
+}
+
 function isGone(error: unknown): boolean {
   return error instanceof KubernetesWatchGoneError
     || (typeof error === "object" && error !== null
@@ -235,6 +271,16 @@ function shouldAdvanceResourceVersion(candidate: string, current: string | null)
 export async function createCollectorRuntime(options: CollectorOptions = {}): Promise<CollectorRuntime> {
   const environment = options.environment ?? process.env;
   const production = environment.NODE_ENV === "production";
+  if (production && options.telemetry) {
+    throw new Error("Production collector instrumentation must be application-owned");
+  }
+  const telemetry = options.telemetry ?? createTelemetry({
+    serviceName: "tracegarden-collector",
+    logExporter: (signal) => console.log(JSON.stringify(signal)),
+    traceExporter: (signal) => console.log(JSON.stringify(signal)),
+  });
+  const startupCorrelation = telemetry.correlation("collector-startup");
+  telemetry.log("info", "collector.starting", startupCorrelation);
   if (production && (options.database || options.observationStore || options.retentionStore)) {
     throw new Error("Production collector stores must be database-owned");
   }
@@ -243,6 +289,9 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   const database = options.database ?? (ownsDatabase ? createDatabase(environment) : undefined);
   const observationStore = options.observationStore ?? database?.timeline;
   const retentionStore = options.retentionStore ?? database?.retention ?? (hasRetentionStore(observationStore) ? observationStore : undefined);
+  let databaseReady = database === undefined;
+  let migrationReady = database === undefined;
+  let startupState: "starting" | "ready" | "failed" = "starting";
   if (production && (!ownsDatabase || database?.kind !== "postgres" || !database.timeline || !database.retention || observationStore !== database.timeline || retentionStore !== database.retention || !hasRetentionStore(retentionStore))) {
     if (ownsDatabase) await database?.close();
     throw new Error("Production collector requires database-owned observation and retention stores");
@@ -250,8 +299,12 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   if (database) {
     try {
       await database.migrate();
-      if (!(await database.ping())) throw new Error("Tracegarden collector database readiness check failed");
+      migrationReady = true;
+      databaseReady = await database.ping();
+      if (!databaseReady) throw new Error("Tracegarden collector database readiness check failed");
     } catch (error) {
+      startupState = "failed";
+      telemetry.log("error", "collector.startup.failure", startupCorrelation, { error_type: error instanceof Error ? error.name : "unknown" });
       if (ownsDatabase) await database.close();
       throw error;
     }
@@ -290,12 +343,69 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     backoffDelaysMs: [...signalState.backoffDelaysMs],
     failedNamespaces: [...signalState.failedNamespaces],
   });
+  const defineCollectorMetrics = (): void => {
+    telemetry.defineGauge("tracegarden_collector_lag_seconds");
+    telemetry.defineCounter("tracegarden_collector_reconnects_total");
+    telemetry.defineCounter("tracegarden_collector_relists_total");
+    telemetry.defineCounter("tracegarden_collector_normalization_failures_total");
+    telemetry.defineCounter("tracegarden_collector_persistence_failures_total");
+    telemetry.defineGauge("tracegarden_collector_failed_namespaces");
+    telemetry.defineGauge("tracegarden_collector_last_resource_version");
+    telemetry.defineGauge("tracegarden_collector_database_ready");
+    telemetry.defineGauge("tracegarden_collector_migrations_ready");
+    telemetry.defineGauge("tracegarden_database_pool_total");
+    telemetry.defineGauge("tracegarden_database_pool_idle");
+    telemetry.defineGauge("tracegarden_database_pool_waiting");
+    telemetry.defineGauge("tracegarden_migration_status");
+  };
+  defineCollectorMetrics();
+  const syncCollectorMetrics = (): void => {
+    const signals = signalSnapshot();
+    const correlation = telemetry.correlation("collector-signals");
+    telemetry.setGauge("tracegarden_collector_lag_seconds", signals.lagSeconds, {}, correlation);
+    telemetry.setCounter("tracegarden_collector_reconnects_total", signals.reconnects, {}, correlation);
+    telemetry.setCounter("tracegarden_collector_relists_total", signals.relists, {}, correlation);
+    telemetry.setCounter("tracegarden_collector_normalization_failures_total", signals.normalizationFailures, {}, correlation);
+    telemetry.setCounter("tracegarden_collector_persistence_failures_total", signals.persistenceFailures, {}, correlation);
+    telemetry.setGauge("tracegarden_collector_failed_namespaces", signals.failedNamespaces.length, {}, correlation);
+    telemetry.setGauge("tracegarden_collector_last_resource_version", signals.lastResourceVersion && /^\d+$/.test(signals.lastResourceVersion) ? Number(signals.lastResourceVersion) : 0, {}, correlation);
+    telemetry.setGauge("tracegarden_collector_database_ready", databaseReady ? 1 : 0, {}, correlation);
+    telemetry.setGauge("tracegarden_collector_migrations_ready", migrationReady ? 1 : 0, {}, correlation);
+    let pool = { total: 0, idle: 0, waiting: 0 };
+    try {
+      pool = database?.poolState?.() ?? pool;
+    } catch {
+      // Pool gauges are diagnostic and cannot affect probe behavior.
+    }
+    telemetry.setGauge("tracegarden_database_pool_total", pool.total, {}, correlation);
+    telemetry.setGauge("tracegarden_database_pool_idle", pool.idle, {}, correlation);
+    telemetry.setGauge("tracegarden_database_pool_waiting", pool.waiting, {}, correlation);
+    let migrationValue = migrationReady ? 1 : 0;
+    try {
+      if (database?.migrationStatus?.() === "failed") migrationValue = -1;
+    } catch {
+      migrationValue = -1;
+    }
+    telemetry.setGauge("tracegarden_migration_status", migrationValue, {}, correlation);
+  };
+  const refreshDatabaseReadiness = async (): Promise<void> => {
+    if (!database) {
+      databaseReady = true;
+      return;
+    }
+    try {
+      databaseReady = await database.ping();
+    } catch {
+      databaseReady = false;
+    }
+  };
   const rememberResourceVersion = (version: string): void => {
     if (!signalState.lastResourceVersion || compareResourceVersions(version, signalState.lastResourceVersion) > 0) {
       signalState.lastResourceVersion = version;
     }
   };
   let stopping = false;
+  let collectionReady = false;
   const shutdownController = new AbortController();
   let activeWatch: Promise<void> | null = null;
   let activeRetentionCleanup: Promise<void> | null = null;
@@ -304,9 +414,9 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     if (!retentionStore || stopping) return;
     try {
       const result = await retentionStore.cleanupRetention(WORKSPACE_ID, now());
-      if (result.failures > 0) console.error(`Tracegarden retention cleanup failed; failures: ${result.failures}`);
+      if (result.failures > 0) telemetry.log("warn", "collector.retention_cleanup.failure", telemetry.correlation("collector-retention"), { failures: result.failures });
     } catch {
-      console.error("Tracegarden retention cleanup failed; retrying on the next schedule");
+      telemetry.log("warn", "collector.retention_cleanup.failure", telemetry.correlation("collector-retention"), { error_type: "unknown" });
     }
   };
   const scheduleRetentionCleanup = options.retentionCleanupScheduler ?? ((task: () => void, intervalMs: number): (() => void) => {
@@ -316,6 +426,13 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   });
 
   const configuredScope = async (): Promise<ClusterScope | null> => options.scope ?? await database?.clusterScope?.get(WORKSPACE_ID) ?? null;
+  try {
+    const initialScope = await configuredScope();
+    collectionReady = hasCollectionPreconditions(initialScope, adapter);
+  } catch {
+    databaseReady = false;
+    collectionReady = false;
+  }
 
   const list = async (scope: ClusterScope, signal?: AbortSignal): Promise<KubernetesListResult> => {
     signal?.throwIfAborted();
@@ -333,6 +450,8 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
         normalized.push(normalizeObservation(scope, resource, observedAt ?? now().toISOString()));
       } catch (error) {
         signalState.normalizationFailures += 1;
+        telemetry.log("error", "collector.normalization.failure", telemetry.correlation("collector-normalization"), { error_type: error instanceof Error ? error.name : "unknown" });
+        syncCollectorMetrics();
         throw new CollectorRecoveryError("Collector recovery boundary: observation normalization failed", { cause: error });
       }
     }
@@ -341,7 +460,11 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
 
   const collectNormalized = async (): Promise<readonly NormalizedObservation[]> => {
     const scope = await configuredScope();
-    if (!scope) return [];
+    if (!hasCollectionPreconditions(scope, adapter)) {
+      collectionReady = false;
+      syncCollectorMetrics();
+      return [];
+    }
     return normalizeResources(scope, await collectScopedResources(scope, adapter));
   };
 
@@ -351,6 +474,8 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   ): Promise<readonly ObservationPersistenceResult[]> => {
     if (!observationStore?.recordObservationsAndCheckpoint) {
       signalState.persistenceFailures += 1;
+      telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: "unavailable" });
+      syncCollectorMetrics();
       throw new CollectorRecoveryError("Collector recovery boundary: transactional checkpoint persistence is unavailable");
     }
     try {
@@ -359,6 +484,8 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
       return result;
     } catch (error) {
       signalState.persistenceFailures += 1;
+      telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: error instanceof Error ? error.name : "unknown" });
+      syncCollectorMetrics();
       throw new CollectorRecoveryError("Collector recovery boundary: observation and checkpoint persistence failed", { cause: error });
     }
   };
@@ -368,6 +495,8 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   ): Promise<readonly ObservationPersistenceResult[]> => {
     if (!observationStore) {
       signalState.persistenceFailures += 1;
+      telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: "unavailable" });
+      syncCollectorMetrics();
       throw new CollectorRecoveryError("Collector recovery boundary: observation persistence is unavailable");
     }
     try {
@@ -378,6 +507,8 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     } catch (error) {
       if (error instanceof CollectorRecoveryError) throw error;
       signalState.persistenceFailures += 1;
+      telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: error instanceof Error ? error.name : "unknown" });
+      syncCollectorMetrics();
       throw new CollectorRecoveryError("Collector recovery boundary: observation persistence failed", { cause: error });
     }
   };
@@ -388,8 +519,25 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   };
 
   const collectObservations = async (): Promise<readonly ObservationPersistenceResult[]> => {
-    const normalized = await collectNormalized();
-    return persistWithoutCheckpoint(normalized);
+    const span = telemetry.startSpan("collector.collect_observations", telemetry.correlation("collector-collect"));
+    try {
+      const scope = await configuredScope();
+      if (!hasCollectionPreconditions(scope, adapter)) {
+        collectionReady = false;
+        syncCollectorMetrics();
+        span.end({ observations: 0 });
+        return [];
+      }
+      const normalized = await collectNormalized();
+      const persisted = await persistWithoutCheckpoint(normalized);
+      collectionReady = true;
+      span.end({ observations: persisted.length });
+      return persisted;
+    } catch (error) {
+      collectionReady = false;
+      span.fail(error);
+      throw error;
+    }
   };
 
   const synchronizeList = async (
@@ -413,6 +561,8 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
       return await observationStore.getIngestionCheckpoint(scope.workspaceId, scope.clusterId, "Pod", namespace);
     } catch (error) {
       signalState.persistenceFailures += 1;
+      telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: error instanceof Error ? error.name : "unknown" });
+      syncCollectorMetrics();
       throw new CollectorRecoveryError("Collector recovery boundary: ingestion checkpoint read failed", { cause: error });
     }
   };
@@ -420,12 +570,16 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   const clearCheckpoint = async (scope: ClusterScope, namespace: string): Promise<void> => {
     if (!observationStore?.clearIngestionCheckpoint) {
       signalState.persistenceFailures += 1;
+      telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: "unavailable" });
+      syncCollectorMetrics();
       throw new CollectorRecoveryError("Collector recovery boundary: transactional checkpoint clearing is unavailable");
     }
     try {
       await observationStore.clearIngestionCheckpoint(checkpointIdentity(scope, namespace));
     } catch (error) {
       signalState.persistenceFailures += 1;
+      telemetry.log("error", "collector.persistence.failure", telemetry.correlation("collector-persistence"), { error_type: error instanceof Error ? error.name : "unknown" });
+      syncCollectorMetrics();
       throw new CollectorRecoveryError("Collector recovery boundary: ingestion checkpoint clearing failed", { cause: error });
     }
   };
@@ -436,6 +590,7 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     if (!Number.isFinite(parsed)) return;
     signalState.lastEventAt = new Date(parsed).toISOString();
     signalState.lagSeconds = Math.max(0, (now().getTime() - parsed) / 1_000);
+    syncCollectorMetrics();
   };
 
   const runWatch = async (watchOptions: CollectorWatchOptions = {}): Promise<void> => {
@@ -446,10 +601,20 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     if (activeWatch) return activeWatch;
     const promise = (async (): Promise<void> => {
       const scope = await configuredScope();
-      if (!scope || adapter.kind === "inert" || scope.namespaces.length === 0 || !scope.resourceKinds.includes("Pod")) return;
+      if (!hasCollectionPreconditions(scope, adapter)) {
+        collectionReady = false;
+        syncCollectorMetrics();
+        return;
+      }
       const watch = adapter.watch;
-      if (!watch) throw new CollectorRecoveryError("Collector recovery boundary: Kubernetes watch is unavailable");
+      if (!watch) {
+        collectionReady = false;
+        syncCollectorMetrics();
+        throw new CollectorRecoveryError("Collector recovery boundary: Kubernetes watch is unavailable");
+      }
       if (!observationStore?.getIngestionCheckpoint) {
+        collectionReady = false;
+        syncCollectorMetrics();
         throw new CollectorRecoveryError("Collector recovery boundary: durable namespace checkpoints are unavailable");
       }
       const watchController = new AbortController();
@@ -487,6 +652,7 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
               if (event.type === "BOOKMARK") {
                 if (version && shouldAdvanceResourceVersion(version, currentVersion)) {
                   await persistWithCheckpoint([], checkpointInput(scope, namespace, version));
+                  collectionReady = true;
                   currentVersion = version;
                 }
                 continue;
@@ -496,9 +662,11 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
               const normalized = normalizeResources(streamScope, [event.resource], observedAt);
               if (version && shouldAdvanceResourceVersion(version, currentVersion)) {
                 await persistWithCheckpoint(normalized, checkpointInput(scope, namespace, version));
+                collectionReady = true;
                 currentVersion = version;
               } else {
                 await persistWithoutCheckpoint(normalized);
+                collectionReady = true;
               }
               updateLag(observedAt);
             }
@@ -512,6 +680,8 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
             recoveryAttempts += 1;
             if (isGone(error)) {
               signalState.relists += 1;
+              telemetry.log("warn", "collector.watch.relist", telemetry.correlation("collector-watch"), { namespace, error_type: "resource_version_gone" });
+              syncCollectorMetrics();
               currentVersion = null;
               needsRelist = true;
               await clearCheckpoint(scope, namespace);
@@ -519,8 +689,10 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
             }
             signalState.reconnects += 1;
             const delay = backoffDelay(policy, backoffAttempts);
+            telemetry.log("warn", "collector.watch.reconnect", telemetry.correlation("collector-watch"), { namespace, attempt: recoveryAttempts, delay_ms: delay, error_type: error instanceof Error ? error.name : "unknown" });
             backoffAttempts += 1;
             signalState.backoffDelaysMs.push(delay);
+            syncCollectorMetrics();
             await cancellableSleep(sleep, delay, signal);
           }
         }
@@ -539,8 +711,11 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
       };
       try {
         const namespaceResults = await Promise.all(scope.namespaces.map(runNamespaceWithIsolation));
+        collectionReady = namespaceResults.every((result) => result);
         if (namespaceResults.every((result) => !result) && budgetFailures[0]) throw budgetFailures[0];
       } catch (error) {
+        collectionReady = false;
+        telemetry.log("error", "collector.watch.failure", telemetry.correlation("collector-watch"), { error_type: error instanceof Error ? error.name : "unknown" });
         watchController.abort();
         throw error;
       } finally {
@@ -557,14 +732,26 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   };
 
   const runtimeStatus = (): StatusResponse => {
-    const base = collectorStatus();
+    try {
+      const migrationStatus = database?.migrationStatus?.();
+      if (migrationStatus === "failed" || migrationStatus === "pending") migrationReady = false;
+      if (migrationStatus === "ready") migrationReady = true;
+    } catch {
+      migrationReady = false;
+    }
+    syncCollectorMetrics();
     const currentSignals = signalSnapshot();
+    const readiness = state(databaseReady && migrationReady && collectionReady && startupState === "ready");
     return {
-      ...base,
+      service: "tracegarden-collector",
+      status: readiness,
+      startup: startupState,
+      readiness,
+      liveness: stopping ? "stopping" : "alive",
       checks: {
-        ...base.checks,
-        database: database ? "ready" : "not-ready",
-        migrations: database ? "ready" : "not-ready",
+        database: state(databaseReady),
+        migrations: state(migrationReady),
+        collector: state(collectionReady && startupState === "ready"),
         clusterContacted: adapter.contacted,
       },
       signals: {
@@ -580,15 +767,57 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     };
   };
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
-    if (request.method !== "GET") {
-      response.statusCode = 405;
+    const path = new URL(request.url ?? "/", "http://tracegarden.invalid").pathname;
+    const correlation = telemetry.correlation();
+    const requestSpan = telemetry.startSpan("http.request", correlation, {
+      method: request.method ?? "GET",
+      path,
+    });
+    response.setHeader("x-request-id", requestSpan.correlation.requestId);
+    response.setHeader("x-trace-id", requestSpan.correlation.traceId);
+    response.setHeader("traceparent", `00-${requestSpan.correlation.traceId}-${requestSpan.correlation.spanId}-01`);
+    let responseEnded = false;
+    const end = (body: string): void => {
+      if (responseEnded) return;
+      responseEnded = true;
+      response.end(body);
+    };
+    void (async () => {
+      if (request.method !== "GET") {
+        response.statusCode = 405;
+        response.setHeader("content-type", "application/json; charset=utf-8");
+        end(JSON.stringify({ error: "method_not_allowed" }));
+        return;
+      }
+      if (path === "/metrics") {
+        await refreshDatabaseReadiness();
+        syncCollectorMetrics();
+        response.statusCode = 200;
+        response.setHeader("content-type", "text/plain; version=0.0.4; charset=utf-8");
+        end(telemetry.metricsText());
+        return;
+      }
+      if (path !== "/health/live") await refreshDatabaseReadiness();
+      const current = runtimeStatus();
+      const healthy = path === "/health/live"
+        ? current.liveness === "alive"
+        : path === "/health/startup"
+          ? current.startup === "ready"
+          : current.readiness === "ready";
+      response.statusCode = healthy ? 200 : 503;
       response.setHeader("content-type", "application/json; charset=utf-8");
-      response.end(JSON.stringify({ error: "method_not_allowed" }));
-      return;
-    }
-    response.statusCode = 200;
-    response.setHeader("content-type", "application/json; charset=utf-8");
-    response.end(JSON.stringify(runtimeStatus()));
+      if (path === "/health/live") end(JSON.stringify({ service: current.service, status: current.liveness, liveness: current.liveness }));
+      else if (path === "/health/startup") end(JSON.stringify({ ...current, status: current.startup === "ready" ? "ready" : "not-ready" }));
+      else end(JSON.stringify(current));
+    })().catch((error: unknown) => {
+      response.statusCode = 503;
+      response.setHeader("content-type", "application/json; charset=utf-8");
+      end(JSON.stringify({ error: "service_unavailable" }));
+      telemetry.log("error", "collector.request.failure", requestSpan.correlation, { error_type: error instanceof Error ? error.name : "unknown" });
+      requestSpan.fail(error);
+    }).finally(() => {
+      requestSpan.end({ status_code: response.statusCode });
+    });
   };
 
   if (options.collectOnStart) {
@@ -606,7 +835,25 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   const server = createServer(requestHandler);
   const port = options.port ?? Number(environment.COLLECTOR_PORT ?? "3001");
   const host = options.host ?? environment.HOST ?? "127.0.0.1";
-  await new Promise<void>((resolve) => server.listen(port, host, resolve));
+  try {
+    await listenForStartup(server, port, host);
+  } catch (error) {
+    startupState = "failed";
+    telemetry.log("error", "collector.startup.failure", startupCorrelation, {
+      error_type: error instanceof Error ? error.name : "unknown",
+    });
+    if (ownsDatabase) {
+      try {
+        await database?.close();
+      } catch {
+        // Cleanup cannot mask the bind failure.
+      }
+    }
+    throw error;
+  }
+  startupState = "ready";
+  telemetry.log("info", "collector.started", startupCorrelation, { host, port });
+  syncCollectorMetrics();
   if (retentionStore) {
     cancelRetentionCleanup = scheduleRetentionCleanup(() => {
       const run = runScheduledRetentionCleanup();
@@ -620,6 +867,7 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     server,
     status: runtimeStatus,
     signals: signalSnapshot,
+    telemetry,
     collect,
     collectNormalized,
     collectObservations,

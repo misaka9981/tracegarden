@@ -300,10 +300,10 @@ export type RecentLogTelemetryEvent = Readonly<{
 }>;
 
 export type RecentLogTelemetry = Readonly<{
-  structuredLog?: (event: RecentLogTelemetryEvent) => void;
-  trace?: (event: RecentLogTelemetryEvent) => void;
-  metric?: (event: RecentLogTelemetryEvent) => void;
-  analytics?: (event: RecentLogTelemetryEvent) => void;
+  structuredLog?: (event: RecentLogTelemetryEvent) => void | Promise<void>;
+  trace?: (event: RecentLogTelemetryEvent) => void | Promise<void>;
+  metric?: (event: RecentLogTelemetryEvent) => void | Promise<void>;
+  analytics?: (event: RecentLogTelemetryEvent) => void | Promise<void>;
 }>;
 
 export type RecentLogRequestOptions = Readonly<{
@@ -331,7 +331,8 @@ function emitTelemetry(telemetry: RecentLogTelemetry | undefined, event: RecentL
   if (!telemetry) return;
   for (const emitter of [telemetry.structuredLog, telemetry.trace, telemetry.metric, telemetry.analytics]) {
     try {
-      emitter?.(event);
+      const result = emitter?.(event);
+      if (result) void result.catch(() => undefined);
     } catch {
       // Telemetry is best effort and never changes the ephemeral response.
     }
