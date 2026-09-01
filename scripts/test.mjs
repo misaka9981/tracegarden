@@ -4,7 +4,7 @@ import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../di
 import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
-import { createExperiment, ExperimentLifecycleError, ExperimentValidationError, hasExperimentWrite, parseExperimentInput } from "../dist/packages/domain/src/index.js";
+import { confirmCorrelationSuggestion, correlationSignalsBetween, createExperiment, ExperimentLifecycleError, ExperimentValidationError, hasCorrelationReview, hasExperimentWrite, parseExperimentInput, rejectCorrelationSuggestion, suggestCorrelationCandidates } from "../dist/packages/domain/src/index.js";
 import {
   boundRecentLogWindow,
   ConfiguredKubernetesLogAdapter,
@@ -122,12 +122,14 @@ if (renamedAdmission.admitted && ownerAdmission.admitted) {
 }
 assert.equal(admissionStore.memberCount(), 2);
 
+const productionTimeline = new MemoryObservationStore("production-test-cursor-secret");
 const productionRuntime = await createWebRuntime({
   database: {
     kind: "postgres",
     admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "test-google-subject" }),
     clusterScope: new MemoryClusterScopeStore(),
-    timeline: new MemoryObservationStore("production-test-cursor-secret"),
+    timeline: productionTimeline,
+    experiments: productionTimeline,
     migrate: async () => {},
     ping: async () => true,
     close: async () => {},
@@ -166,6 +168,33 @@ try {
 } finally {
   await productionRuntime.close();
 }
+await assert.rejects(
+  createWebRuntime({
+    database: {
+      kind: "postgres",
+      admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "injected-experiment" }),
+      clusterScope: new MemoryClusterScopeStore(),
+      timeline: productionTimeline,
+      experiments: productionTimeline,
+      migrate: async () => {},
+      ping: async () => true,
+      close: async () => {},
+    },
+    experimentStore: new MemoryObservationStore("injected-experiment-secret"),
+    environment: {
+      NODE_ENV: "production",
+      GOOGLE_CLIENT_ID: "test-client",
+      GOOGLE_CLIENT_SECRET: "test-secret",
+      GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
+      BETTER_AUTH_SECRET: "test-secret-secret",
+      TIMELINE_CURSOR_SECRET: "test-timeline-cursor-secret",
+      BETTER_AUTH_URL: "https://tracegarden.test",
+      TRACEGARDEN_BOOTSTRAP_ISSUER: GOOGLE_ISSUER,
+      TRACEGARDEN_BOOTSTRAP_SUBJECT: "injected-experiment",
+    },
+  }),
+  /Production Experiment must use the database-owned durable store/,
+);
 await assert.rejects(
   createWebRuntime({
     database: {
@@ -282,12 +311,14 @@ const callbackAuthRuntime = {
   session: async () => callbackSession,
 };
 const callbackAdmissionStore = new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" });
+const callbackTimeline = new MemoryObservationStore("production-test-cursor-secret");
 const callbackRuntime = await createWebRuntime({
   database: {
     kind: "postgres",
     admission: callbackAdmissionStore,
     clusterScope: new MemoryClusterScopeStore(),
-    timeline: new MemoryObservationStore("production-test-cursor-secret"),
+    timeline: callbackTimeline,
+    experiments: callbackTimeline,
     migrate: async () => {},
     ping: async () => true,
     close: async () => {},
@@ -325,7 +356,8 @@ await assert.rejects(
       kind: "postgres",
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" }),
       clusterScope: new MemoryClusterScopeStore(),
-      timeline: new MemoryObservationStore("production-test-cursor-secret"),
+      timeline: productionTimeline,
+      experiments: productionTimeline,
       migrate: async () => {},
       ping: async () => true,
       close: async () => {},
@@ -1130,6 +1162,69 @@ try {
   assert.equal(viewerUpdateExperiment.status, 403);
 } finally {
   await viewerScopeRuntime.close();
+}
+
+const correlationObservation = (id, name, revision, labels, owners = []) => ({
+  id,
+  workspaceId: "workspace-single",
+  occurredAt: "2026-01-01T00:00:00.000Z",
+  clusterId: "lab-cluster",
+  observation: {
+    kind: "Pod",
+    name,
+    namespace: "default",
+    clusterId: "lab-cluster",
+    sourceIdentity: `lab-cluster:${id}`,
+    ownerReferences: owners,
+    labels,
+    revision,
+  },
+});
+const signalEntry = correlationObservation("uid-a", "api", "r1", { app: "api" });
+const relatedSignalEntry = correlationObservation("uid-b", "worker", "r1", { app: "api" }, [{ kind: "Pod", name: "api", uid: "uid-a" }]);
+assert.deepEqual(correlationSignalsBetween(signalEntry, relatedSignalEntry), ["time", "ownership", "label", "revision"]);
+assert.equal(suggestCorrelationCandidates([signalEntry, relatedSignalEntry]).length, 1);
+const correlationStore = new MemoryObservationStore();
+const correlationScope = { workspaceId: "workspace-single", clusterId: "lab-cluster", name: "Lab", endpoint: "https://cluster.example.test", namespaces: ["default"], resourceKinds: ["Pod"] };
+const correlationPod = normalizePodObservation(correlationScope, {
+  kind: "Pod",
+  metadata: { name: "api", namespace: "default", uid: "correlation-pod", resourceVersion: "1", labels: { app: "api" } },
+  status: { phase: "Pending" },
+}, "2026-01-01T00:00:00.000Z");
+const correlationPersisted = await correlationStore.recordObservation(correlationPod);
+await correlationStore.recordObservation(normalizePodObservation(correlationScope, {
+  kind: "Pod",
+  metadata: { name: "worker", namespace: "default", uid: "correlation-worker", resourceVersion: "2", labels: { app: "api" } },
+  status: { phase: "Running" },
+}, "2026-01-01T00:01:00.000Z"));
+const correlationExperiment = await correlationStore.createExperiment("workspace-single", ownerActor.id, {
+  hypothesis: "review",
+  change: "adjust workload",
+  observation: "pending",
+  conclusion: "",
+  state: "active",
+  tags: [],
+  workloads: [{ clusterId: "lab-cluster", namespace: "default", kind: "Pod", name: "api" }],
+  gitRevision: null,
+});
+const pendingCorrelation = await correlationStore.listCorrelationSuggestions("workspace-single");
+assert.ok(pendingCorrelation.length > 0);
+const experimentCorrelation = pendingCorrelation.find((candidate) => candidate.leftEntryId === correlationExperiment.timelineEntryId || candidate.rightEntryId === correlationExperiment.timelineEntryId);
+assert.ok(experimentCorrelation);
+assert.ok(hasCorrelationReview(ownerActor));
+const confirmedCorrelation = await confirmCorrelationSuggestion(ownerActor, correlationStore, experimentCorrelation.id);
+assert.equal(confirmedCorrelation?.confirmedLink?.confirmedByMemberId, ownerActor.id);
+assert.equal((await confirmCorrelationSuggestion(ownerActor, correlationStore, experimentCorrelation.id))?.idempotent, true);
+const linkedObservation = await correlationStore.getTimelineEntry("workspace-single", correlationPersisted.entry.id);
+assert.equal(linkedObservation?.confirmedLinks?.length, 1);
+const linkedExperiment = await correlationStore.getExperiment("workspace-single", correlationExperiment.id);
+assert.equal(linkedExperiment?.confirmedLinks?.length, 1);
+if (invitedAdmission.admitted) await assert.rejects(() => rejectCorrelationSuggestion(invitedAdmission.session.member, correlationStore, experimentCorrelation.id), /Missing capability/);
+const rejectionCandidate = (await correlationStore.listCorrelationSuggestions("workspace-single")).find((candidate) => candidate.id !== experimentCorrelation.id);
+if (rejectionCandidate) {
+  const rejectedCorrelation = await rejectCorrelationSuggestion(ownerActor, correlationStore, rejectionCandidate.id);
+  assert.equal(rejectedCorrelation?.suggestion.status, "rejected");
+  assert.equal((await correlationStore.listCorrelationSuggestions("workspace-single")).some((candidate) => candidate.id === rejectionCandidate.id), false);
 }
 
 let migrationFailed = false;

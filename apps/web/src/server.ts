@@ -11,6 +11,7 @@ import {
   type ObservationTimelineEntry,
   type TimelineEntry,
   type TimelinePage,
+  CorrelationDecisionConflictError,
   type TimelineQuery,
   type TimelineStore,
 } from "../../../packages/db/src/index.js";
@@ -47,6 +48,11 @@ import {
   hasExperimentWrite,
   ExperimentLifecycleError,
   ExperimentValidationError,
+  confirmCorrelationSuggestion,
+  rejectCorrelationSuggestion,
+  hasCorrelationReview,
+  type ConfirmedLinkRecord,
+  type CorrelationSuggestionRecord,
   type ExperimentRecord,
 } from "../../../packages/domain/src/index.js";
 import {
@@ -363,7 +369,14 @@ function renderExperimentSummary(messages: Messages, experiment: ExperimentRecor
         <dt>${escapeHtml(messages.workloads)}</dt><dd>${escapeHtml(experiment.workloads.map(workloadText).join("; ") || "—")}</dd>
         <dt>${escapeHtml(messages.gitRevision)}</dt><dd>${escapeHtml(experiment.gitRevision ?? "—")}</dd>
       </dl>
+      ${confirmedLinkDetails(messages, experiment.confirmedLinks)}
     </article>`;
+}
+
+function confirmedLinkDetails(messages: Messages, links: readonly ConfirmedLinkRecord[] | undefined): string {
+  if (!links || links.length === 0) return "";
+  const relationships = links.map((link) => `${link.leftEntryId} ↔ ${link.rightEntryId}`).join(", ");
+  return `<p class="notice"><strong>${escapeHtml(messages.confirmedLink)}</strong>: ${escapeHtml(relationships)} · ${escapeHtml(messages.confirmedBy)}: ${escapeHtml(links.map((link) => link.confirmedByMemberId).join(", "))}</p>`;
 }
 
 function renderExperimentsSection(
@@ -390,10 +403,40 @@ function renderExperimentsSection(
     </section>`;
 }
 
+function renderCorrelationSection(
+  language: Language,
+  messages: Messages,
+  member: AuthenticatedSession["member"],
+  suggestions: readonly CorrelationSuggestionRecord[],
+  entries: readonly TimelineEntry[],
+  feedback?: Readonly<{ decision?: "confirmed" | "rejected"; error?: string }>,
+): string {
+  const labelFor = (id: string): string => {
+    const entry = entries.find((candidate) => candidate.id === id);
+    if (!entry) return id;
+    return entry.entryType === "experiment"
+      ? `${messages.experimentsTitle}: ${entry.experiment.hypothesis}`
+      : `${entry.observation.kind} ${entry.observation.namespace}/${entry.observation.name}`;
+  };
+  const rows = suggestions.map((suggestion) => `<article data-correlation-suggestion-id="${escapeHtml(suggestion.id)}">
+      <h3>${escapeHtml(messages.correlationsTitle)}</h3>
+      <p>${escapeHtml(labelFor(suggestion.leftEntryId))} ↔ ${escapeHtml(labelFor(suggestion.rightEntryId))}</p>
+      <p><strong>${escapeHtml(messages.correlationSignals)}:</strong> ${escapeHtml(suggestion.signals.map((signal) => messages.correlationSignalLabels[signal] ?? signal).join(", "))}</p>
+      ${hasCorrelationReview(member) ? `<form method="post" action="/correlations/suggestions/${encodeURIComponent(suggestion.id)}/confirm?lang=${language}"><button type="submit">${escapeHtml(messages.confirmSuggestion)}</button></form><form method="post" action="/correlations/suggestions/${encodeURIComponent(suggestion.id)}/reject?lang=${language}"><button type="submit">${escapeHtml(messages.rejectSuggestion)}</button></form>` : `<p class="hint">${escapeHtml(messages.correlationReviewDenied)}</p>`}
+    </article>`).join("");
+  return `<section aria-labelledby="correlations-title">
+      <h2 id="correlations-title">${escapeHtml(messages.correlationsTitle)}</h2>
+      <p>${escapeHtml(messages.correlationsDescription)}</p>
+      ${feedback?.decision === "confirmed" ? `<p class="notice" role="status">${escapeHtml(messages.suggestionConfirmed)}</p>` : feedback?.decision === "rejected" ? `<p class="notice" role="status">${escapeHtml(messages.suggestionRejected)}</p>` : ""}
+      ${feedback?.error ? `<p class="error" role="alert">${escapeHtml(feedback.error)}</p>` : ""}
+      ${rows || `<p>${escapeHtml(messages.noCorrelationSuggestions)}</p>`}
+    </section>`;
+}
+
 function renderTimelineSection(language: Language, messages: Messages, page: TimelinePage, query: TimelineQuery, reviewed = false): string {
   const rows = page.entries.map((entry) => {
     if (entry.entryType === "experiment") {
-      return `<article data-entry-id="${escapeHtml(entry.id)}"><h3>${escapeHtml(messages.experimentsTitle)} · ${escapeHtml(experimentStateLabel(messages, entry.experiment.state))}</h3><p>${escapeHtml(entry.experiment.hypothesis)}</p><p>${escapeHtml(entry.occurredAt)}</p></article>`;
+      return `<article data-entry-id="${escapeHtml(entry.id)}"><h3>${escapeHtml(messages.experimentsTitle)} · ${escapeHtml(experimentStateLabel(messages, entry.experiment.state))}</h3><p>${escapeHtml(entry.experiment.hypothesis)}</p><p>${escapeHtml(entry.occurredAt)}</p>${confirmedLinkDetails(messages, entry.confirmedLinks)}</article>`;
     }
     const observation = entry.observation;
     const owners = (observation.ownerReferences ?? []).map((owner) => `${owner.kind}/${owner.name}`).join(", ");
@@ -405,6 +448,7 @@ function renderTimelineSection(language: Language, messages: Messages, page: Tim
         <p>${escapeHtml(observation.namespace)}/${escapeHtml(observation.name)} · ${escapeHtml(observationDetail(entry, messages))}</p>
         ${attention}
         ${entry.recoveryOf || observation.classification === "recovery" ? `<p class="notice">${escapeHtml(messages.recovery)}</p>` : ""}
+        ${confirmedLinkDetails(messages, entry.confirmedLinks)}
         <dl>
           <dt>${escapeHtml(messages.clusterName)}</dt><dd>${escapeHtml(entry.clusterId)}</dd>
           <dt>${escapeHtml(messages.resourceIdentity)}</dt><dd>${escapeHtml(observation.sourceIdentity)}</dd>
@@ -451,11 +495,12 @@ export function renderApplicationPage(
   language: Language,
   session: AuthenticatedSession,
   scope: ClusterScope | null = null,
-  feedback?: Readonly<{ saved?: boolean; error?: string; logResult?: RecentLogWindow; logError?: string; attentionReviewed?: boolean; experimentSaved?: "created" | "updated"; experimentError?: string }>,
+  feedback?: Readonly<{ saved?: boolean; error?: string; logResult?: RecentLogWindow; logError?: string; attentionReviewed?: boolean; experimentSaved?: "created" | "updated"; experimentError?: string; correlationDecision?: "confirmed" | "rejected"; correlationError?: string }>,
   timelineEntries: readonly TimelineEntry[] = [],
   timelinePageOrExperiments: TimelinePage | readonly ExperimentRecord[] = [],
   timelineQuery?: TimelineQuery,
   experiments: readonly ExperimentRecord[] = [],
+  correlationSuggestions: readonly CorrelationSuggestionRecord[] = [],
 ): string {
   const messages = messagesFor(language);
   const member = session.member;
@@ -491,6 +536,10 @@ export function renderApplicationPage(
       ${hasCapability(member, capabilities.timelineRead) ? renderExperimentsSection(language, messages, member, listedExperiments, {
         ...(feedback?.experimentSaved ? { saved: feedback.experimentSaved } : {}),
         ...(feedback?.experimentError ? { error: feedback.experimentError } : {}),
+      }) : ""}
+      ${hasCapability(member, capabilities.timelineRead) ? renderCorrelationSection(language, messages, member, correlationSuggestions, timelinePage.entries, {
+        ...(feedback?.correlationDecision ? { decision: feedback.correlationDecision } : {}),
+        ...(feedback?.correlationError ? { error: feedback.correlationError } : {}),
       }) : ""}
       ${renderRecentLogsSection(language, messages, member, scope, feedback)}
       <form method="post" action="/auth/logout?lang=${language}">
@@ -730,6 +779,20 @@ function hasExperimentStore(value: TimelineStore | null): value is TimelineStore
     && typeof candidate.listExperiments === "function";
 }
 
+function hasCorrelationStore(value: TimelineStore | null): value is TimelineStore & {
+  listCorrelationSuggestions: NonNullable<TimelineStore["listCorrelationSuggestions"]>;
+  getCorrelationSuggestion: NonNullable<TimelineStore["getCorrelationSuggestion"]>;
+  decideCorrelationSuggestion: NonNullable<TimelineStore["decideCorrelationSuggestion"]>;
+  listConfirmedLinks: NonNullable<TimelineStore["listConfirmedLinks"]>;
+} {
+  if (!value) return false;
+  const candidate = value as Partial<TimelineStore>;
+  return typeof candidate.listCorrelationSuggestions === "function"
+    && typeof candidate.getCorrelationSuggestion === "function"
+    && typeof candidate.decideCorrelationSuggestion === "function"
+    && typeof candidate.listConfirmedLinks === "function";
+}
+
 function requestHeaders(request: IncomingMessage): Headers {
   const headers = new Headers();
   for (const [name, value] of Object.entries(request.headers ?? {})) {
@@ -778,6 +841,14 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     if (options.timelineStore || !database.timeline) {
       await database.close();
       throw new Error("Production Timeline must use the database-owned durable store");
+    }
+    if (options.experimentStore || !database.experiments) {
+      await database.close();
+      throw new Error("Production Experiment must use the database-owned durable store");
+    }
+    if (!hasCorrelationStore(database.timeline ?? null)) {
+      await database.close();
+      throw new Error("Production Correlation must use the database-owned durable store");
     }
     admissionStore = database.admission;
     clusterScopeStore = database.clusterScope;
@@ -884,11 +955,17 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     }
   };
   const membershipStore = hasMembershipStore(admissionStore) ? admissionStore : null;
-  const timelineStore = options.timelineStore ?? database.timeline ?? null;
-  const experimentStore = options.experimentStore ?? database.experiments ?? (hasExperimentStore(timelineStore) ? timelineStore : null);
+  const timelineStore = environment.NODE_ENV === "production"
+    ? database.timeline ?? null
+    : options.timelineStore ?? database.timeline ?? null;
+  const experimentStore = environment.NODE_ENV === "production"
+    ? database.experiments ?? null
+    : options.experimentStore ?? database.experiments ?? (hasExperimentStore(timelineStore) ? timelineStore : null);
   const logAuditStore = hasLogAuditStore(admissionStore) ? admissionStore : undefined;
 
   const scopeForSession = (session: AuthenticatedSession): Promise<ClusterScope | null> => clusterScopeStore.get(session.member.workspaceId);
+  const correlationSuggestionsForSession = async (session: AuthenticatedSession): Promise<readonly CorrelationSuggestionRecord[]> =>
+    hasCorrelationStore(timelineStore) ? timelineStore.listCorrelationSuggestions(session.member.workspaceId) : [];
 
   const sendJson = (response: ServerResponse, statusCode: number, payload: unknown): void => {
     response.statusCode = statusCode;
@@ -1119,6 +1196,67 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         sendJson(response, 200, result);
         return;
       }
+      const correlationDecisionMatch = requestUrl.pathname.match(/^\/api\/correlations\/suggestions\/([^/]+)\/(confirm|reject)$/);
+      const correlationGetMatch = requestUrl.pathname.match(/^\/api\/correlations\/suggestions\/([^/]+)$/);
+      if (requestUrl.pathname === "/api/correlations/suggestions" || correlationDecisionMatch || correlationGetMatch) {
+        const lookup = await sessionForRequest(request);
+        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (!hasTimelineAccess(lookup.session)) {
+          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
+          return;
+        }
+        if (!hasCorrelationStore(timelineStore)) {
+          sendJson(response, 503, { error: "correlation_store_unavailable" });
+          return;
+        }
+        if (method === "GET" && requestUrl.pathname === "/api/correlations/suggestions") {
+          sendJson(response, 200, { suggestions: await timelineStore.listCorrelationSuggestions(lookup.session.member.workspaceId) });
+          return;
+        }
+        if (method === "GET" && correlationGetMatch) {
+          const suggestion = await timelineStore.getCorrelationSuggestion(lookup.session.member.workspaceId, correlationGetMatch[1] ?? "");
+          if (!suggestion) {
+            sendJson(response, 404, { error: "correlation_suggestion_not_found" });
+            return;
+          }
+          sendJson(response, 200, { suggestion });
+          return;
+        }
+        if (method !== "POST" || !correlationDecisionMatch) {
+          sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        if (!hasCorrelationReview(lookup.session.member)) {
+          sendJson(response, 403, { error: "missing_capability", capability: capabilities.correlationReview });
+          return;
+        }
+        let suggestionId = "";
+        try { suggestionId = decodeURIComponent(correlationDecisionMatch[1] ?? ""); } catch { /* invalid id handled below */ }
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(suggestionId)) {
+          sendJson(response, 400, { error: "invalid_correlation_suggestion" });
+          return;
+        }
+        try {
+          const result = correlationDecisionMatch[2] === "confirm"
+            ? await confirmCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId)
+            : await rejectCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId);
+          if (!result) {
+            sendJson(response, 404, { error: "correlation_suggestion_not_found" });
+            return;
+          }
+          sendJson(response, 200, result);
+        } catch (error: unknown) {
+          if (error instanceof CorrelationDecisionConflictError) {
+            sendJson(response, 409, { error: "correlation_suggestion_already_decided", status: error.status });
+            return;
+          }
+          throw error;
+        }
+        return;
+      }
       const experimentMatch = requestUrl.pathname.match(/^\/api\/experiments\/([^/]+)$/);
       if (requestUrl.pathname === "/api/experiments" || experimentMatch) {
         const lookup = await sessionForRequest(request);
@@ -1330,6 +1468,65 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         response.end();
         return;
       }
+      const correlationDecisionPageMatch = requestUrl.pathname.match(/^\/correlations\/suggestions\/([^/]+)\/(confirm|reject)$/);
+      if (correlationDecisionPageMatch && method === "POST") {
+        const lookup = await sessionForRequest(request);
+        const messages = messagesFor(language);
+        if (!lookup.session) {
+          response.statusCode = lookup.rejection ? 403 : 302;
+          if (lookup.rejection) {
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderRejectionPage(language, lookup.rejection));
+          } else {
+            response.setHeader("location", `/?lang=${language}`);
+            response.end();
+          }
+          return;
+        }
+        if (!hasTimelineAccess(lookup.session) || !hasCorrelationStore(timelineStore)) {
+          response.statusCode = 403;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messages.correlationReviewDenied }));
+          return;
+        }
+        if (!hasCorrelationReview(lookup.session.member)) {
+          response.statusCode = 403;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messages.correlationReviewDenied }, [], [], undefined, [], await correlationSuggestionsForSession(lookup.session)));
+          return;
+        }
+        let suggestionId = "";
+        try { suggestionId = decodeURIComponent(correlationDecisionPageMatch[1] ?? ""); } catch { /* invalid id handled below */ }
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(suggestionId)) {
+          response.statusCode = 400;
+          response.setHeader("content-type", "text/html; charset=utf-8");
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messages.noCorrelationSuggestions }));
+          return;
+        }
+        try {
+          const result = correlationDecisionPageMatch[2] === "confirm"
+            ? await confirmCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId)
+            : await rejectCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId);
+          if (!result) {
+            response.statusCode = 404;
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messages.noCorrelationSuggestions }));
+            return;
+          }
+          response.statusCode = 303;
+          response.setHeader("location", `/app?lang=${language}&correlation=${result.suggestion.status}`);
+          response.end();
+        } catch (error: unknown) {
+          if (error instanceof CorrelationDecisionConflictError) {
+            response.statusCode = 409;
+            response.setHeader("content-type", "text/html; charset=utf-8");
+            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { correlationError: messages.correlationDecisionConflict }));
+            return;
+          }
+          throw error;
+        }
+        return;
+      }
       const experimentPageMatch = requestUrl.pathname.match(/^\/experiments\/([^/]+)$/);
       if (requestUrl.pathname === "/experiments" || experimentPageMatch) {
         const lookup = await sessionForRequest(request);
@@ -1358,6 +1555,9 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           return;
         }
         const experiments = await experimentStore.listExperiments(lookup.session.member.workspaceId);
+        const correlationSuggestions = hasTimelineAccess(lookup.session)
+          ? await correlationSuggestionsForSession(lookup.session)
+          : [];
         if (method === "GET") {
           if (experimentPageMatch && !experiments.some((experiment) => experiment.id === experimentPageMatch[1])) {
             response.statusCode = 404;
@@ -1370,7 +1570,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
             : [];
           response.statusCode = 200;
           response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), undefined, timelineEntries, experiments));
+          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), undefined, timelineEntries, experiments, undefined, [], correlationSuggestions));
           return;
         }
         const creating = requestUrl.pathname === "/experiments" && method === "POST";
@@ -1706,6 +1906,9 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         const experiments = experimentStore && hasTimelineAccess(lookup.session)
           ? await experimentStore.listExperiments(lookup.session.member.workspaceId)
           : [];
+        const correlationSuggestions = hasTimelineAccess(lookup.session)
+          ? await correlationSuggestionsForSession(lookup.session)
+          : [];
         const experimentNotice = requestUrl.searchParams.get("experiment");
         response.statusCode = 200;
         response.setHeader("content-type", "text/html; charset=utf-8");
@@ -1714,7 +1917,9 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           attentionReviewed: requestUrl.searchParams.get("attention") === "reviewed",
           ...(experimentNotice === "created" ? { experimentSaved: "created" as const } : {}),
           ...(experimentNotice === "updated" ? { experimentSaved: "updated" as const } : {}),
-        }, timelinePage.entries, timelinePage, timelineQuery, experiments));
+          ...(requestUrl.searchParams.get("correlation") === "confirmed" ? { correlationDecision: "confirmed" as const } : {}),
+          ...(requestUrl.searchParams.get("correlation") === "rejected" ? { correlationDecision: "rejected" as const } : {}),
+        }, timelinePage.entries, timelinePage, timelineQuery, experiments, correlationSuggestions));
         return;
       }
       if (requestUrl.pathname === "/") {
@@ -1753,9 +1958,14 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
             const experiments = experimentStore && hasTimelineAccess(lookup.session)
               ? await experimentStore.listExperiments(lookup.session.member.workspaceId)
               : [];
+            const correlationSuggestions = hasTimelineAccess(lookup.session)
+              ? await correlationSuggestionsForSession(lookup.session)
+              : [];
             response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
               attentionReviewed: requestUrl.searchParams.get("attention") === "reviewed",
-            }, timelinePage.entries, timelinePage, timelineQuery, experiments));
+              ...(requestUrl.searchParams.get("correlation") === "confirmed" ? { correlationDecision: "confirmed" as const } : {}),
+              ...(requestUrl.searchParams.get("correlation") === "rejected" ? { correlationDecision: "rejected" as const } : {}),
+            }, timelinePage.entries, timelinePage, timelineQuery, experiments, correlationSuggestions));
           } else {
             response.end(renderLoginPage(language, current.checks.database === "ready", identityAdapter));
           }

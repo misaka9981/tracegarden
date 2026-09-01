@@ -50,6 +50,13 @@ import {
   createExperimentRecord,
   ExperimentValidationError,
   updateExperimentRecord,
+  suggestCorrelationCandidates,
+  type ConfirmedLinkRecord,
+  type CorrelationDecision,
+  type CorrelationDecisionResult,
+  type CorrelationEntry,
+  type CorrelationSignal,
+  type CorrelationSuggestionRecord,
   type ExperimentRecord,
   type ExperimentState,
   type ExperimentWorkload,
@@ -79,6 +86,7 @@ export const NORMALIZED_OBSERVATION_MIGRATION_ID = "0008_normalized_observations
 export const OBSERVATION_CHECKPOINTS_MIGRATION_ID = "0009_observation_checkpoints";
 export const TIMELINE_ATTENTION_MIGRATION_ID = "0010_timeline_attention";
 export const STRUCTURED_EXPERIMENTS_MIGRATION_ID = "0011_structured_experiments";
+export const CORRELATION_LINKS_MIGRATION_ID = "0012_correlation_links";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -94,6 +102,7 @@ const migrations: readonly Migration[] = [
   { id: OBSERVATION_CHECKPOINTS_MIGRATION_ID, path: "../migrations/0009_observation_checkpoints.sql" },
   { id: TIMELINE_ATTENTION_MIGRATION_ID, path: "../migrations/0010_timeline_attention.sql" },
   { id: STRUCTURED_EXPERIMENTS_MIGRATION_ID, path: "../migrations/0011_structured_experiments.sql" },
+  { id: CORRELATION_LINKS_MIGRATION_ID, path: "../migrations/0012_correlation_links.sql" },
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -305,6 +314,7 @@ export type ObservationTimelineEntry = Readonly<{
   observation: NormalizedObservation;
   attention: boolean;
   attentionUnread: boolean;
+  confirmedLinks?: readonly ConfirmedLinkRecord[];
 }>;
 
 export type ExperimentTimelineEntry = Readonly<{
@@ -314,6 +324,7 @@ export type ExperimentTimelineEntry = Readonly<{
   entryType: "experiment";
   occurredAt: string;
   experiment: ExperimentRecord;
+  confirmedLinks?: readonly ConfirmedLinkRecord[];
 }>;
 
 export type TimelineEntry = ObservationTimelineEntry | ExperimentTimelineEntry;
@@ -338,6 +349,20 @@ export type TimelinePage = Readonly<{
   nextCursor: string | null;
   unreadAttentionCount?: number;
 }>;
+
+export class CorrelationDecisionConflictError extends Error {
+  constructor(readonly status: "confirmed" | "rejected") {
+    super(`Correlation Suggestion is already ${status}`);
+    this.name = "CorrelationDecisionConflictError";
+  }
+}
+
+export interface CorrelationStore {
+  listCorrelationSuggestions(workspaceId: string): Promise<readonly CorrelationSuggestionRecord[]>;
+  getCorrelationSuggestion(workspaceId: string, id: string): Promise<CorrelationSuggestionRecord | null>;
+  decideCorrelationSuggestion(workspaceId: string, id: string, memberId: string, decision: CorrelationDecision): Promise<CorrelationDecisionResult | null>;
+  listConfirmedLinks(workspaceId: string, entryId?: string): Promise<readonly ConfirmedLinkRecord[]>;
+}
 
 export type AttentionReviewResult = Readonly<{
   entryId: string;
@@ -516,6 +541,10 @@ export interface TimelineStore {
   countTimelineEntries(workspaceId: string): Promise<number>;
   unreadAttentionCount?(workspaceId: string, memberId: string): Promise<number>;
   reviewAttentionItem?(workspaceId: string, memberId: string, entryId: string): Promise<AttentionReviewResult | null>;
+  listCorrelationSuggestions?(workspaceId: string): Promise<readonly CorrelationSuggestionRecord[]>;
+  getCorrelationSuggestion?(workspaceId: string, id: string): Promise<CorrelationSuggestionRecord | null>;
+  decideCorrelationSuggestion?(workspaceId: string, id: string, memberId: string, decision: CorrelationDecision): Promise<CorrelationDecisionResult | null>;
+  listConfirmedLinks?(workspaceId: string, entryId?: string): Promise<readonly ConfirmedLinkRecord[]>;
 }
 
 export function isAttentionObservation(observation: Pick<NormalizedObservation, "attention">): boolean {
@@ -567,13 +596,32 @@ function cloneExperiment(experiment: ExperimentRecord): ExperimentRecord {
     ...experiment,
     tags: [...experiment.tags],
     workloads: experiment.workloads.map((workload) => ({ ...workload })),
+    ...(experiment.confirmedLinks ? { confirmedLinks: experiment.confirmedLinks.map((link) => ({ ...link })) } : {}),
   };
 }
 
 function cloneEntry(entry: TimelineEntry): TimelineEntry {
   return entry.entryType === "observation"
-    ? { ...entry, observation: cloneObservation(entry.observation) }
-    : { ...entry, experiment: cloneExperiment(entry.experiment) };
+    ? { ...entry, observation: cloneObservation(entry.observation), ...(entry.confirmedLinks ? { confirmedLinks: entry.confirmedLinks.map((link) => ({ ...link })) } : {}) }
+    : { ...entry, experiment: cloneExperiment(entry.experiment), ...(entry.confirmedLinks ? { confirmedLinks: entry.confirmedLinks.map((link) => ({ ...link })) } : {}) };
+}
+
+function correlationEntryFor(entry: TimelineEntry): CorrelationEntry {
+  return entry.entryType === "observation"
+    ? {
+      id: entry.id,
+      workspaceId: entry.workspaceId,
+      occurredAt: entry.occurredAt,
+      clusterId: entry.clusterId,
+      observation: entry.observation,
+    }
+    : {
+      id: entry.id,
+      workspaceId: entry.workspaceId,
+      occurredAt: entry.occurredAt,
+      clusterId: entry.clusterId,
+      experiment: entry.experiment,
+    };
 }
 
 function timelineEntryFor(observation: NormalizedObservation): TimelineEntry {
@@ -628,6 +676,8 @@ export class MemoryObservationStore implements TimelineStore {
   private nextIngestionOrder = 0n;
   private readonly checkpoints = new Map<string, IngestionCheckpoint>();
   private readonly attentionReviews = new Set<string>();
+  private readonly correlationSuggestions = new Map<string, CorrelationSuggestionRecord>();
+  private readonly confirmedLinks = new Map<string, ConfirmedLinkRecord>();
 
   private readonly cursorSecret: string;
   private readonly clusterScopeStore: ClusterScopeStore | undefined;
@@ -715,14 +765,18 @@ export class MemoryObservationStore implements TimelineStore {
   }
 
   async recordObservations(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]> {
-    return this.recordObservationsInternal(observations);
+    const results = this.recordObservationsInternal(observations);
+    for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) await this.refreshCorrelationSuggestions(workspaceId);
+    return results;
   }
 
   async recordObservationsAndCheckpoint(
     observations: readonly NormalizedObservation[],
     checkpoint: IngestionCheckpointInput,
   ): Promise<readonly ObservationPersistenceResult[]> {
-    return this.recordObservationsInternal(observations, checkpoint);
+    const results = this.recordObservationsInternal(observations, checkpoint);
+    for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) await this.refreshCorrelationSuggestions(workspaceId);
+    return results;
   }
 
   async getIngestionCheckpoint(workspaceId: string, clusterId: string, resourceKind: string, namespace: string): Promise<IngestionCheckpoint | null> {
@@ -758,6 +812,7 @@ export class MemoryObservationStore implements TimelineStore {
     };
     this.experiments.set(experiment.id, experiment);
     this.entries.set(entry.id, entry);
+    await this.refreshCorrelationSuggestions(workspaceId);
     return cloneExperiment(experiment);
   }
 
@@ -771,19 +826,87 @@ export class MemoryObservationStore implements TimelineStore {
     const replacement: ExperimentTimelineEntry = { ...entry, clusterId: updated.workloads[0]?.clusterId ?? null, experiment: updated };
     this.experiments.set(id, updated);
     this.entries.set(updated.timelineEntryId, replacement);
+    await this.refreshCorrelationSuggestions(workspaceId);
     return cloneExperiment(updated);
   }
 
   async getExperiment(workspaceId: string, id: string): Promise<ExperimentRecord | null> {
+    await this.refreshCorrelationSuggestions(workspaceId);
     const experiment = this.experiments.get(id);
-    return experiment?.workspaceId === workspaceId ? cloneExperiment(experiment) : null;
+    if (!experiment || experiment.workspaceId !== workspaceId) return null;
+    const links = [...this.confirmedLinks.values()].filter((link) => link.leftEntryId === experiment.timelineEntryId || link.rightEntryId === experiment.timelineEntryId);
+    return cloneExperiment(links.length > 0 ? { ...experiment, confirmedLinks: links } : experiment);
   }
 
   async listExperiments(workspaceId: string): Promise<readonly ExperimentRecord[]> {
+    await this.refreshCorrelationSuggestions(workspaceId);
     return Object.freeze([...this.experiments.values()]
       .filter((experiment) => experiment.workspaceId === workspaceId)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
-      .map(cloneExperiment));
+      .map((experiment) => {
+        const links = [...this.confirmedLinks.values()].filter((link) => link.leftEntryId === experiment.timelineEntryId || link.rightEntryId === experiment.timelineEntryId);
+        return cloneExperiment(links.length > 0 ? { ...experiment, confirmedLinks: links } : experiment);
+      }));
+  }
+
+  private async refreshCorrelationSuggestions(workspaceId: string): Promise<void> {
+    const entries = [...this.entries.values()].filter((entry) => entry.workspaceId === workspaceId);
+    for (const candidate of suggestCorrelationCandidates(entries.map(correlationEntryFor))) {
+      const key = `${candidate.workspaceId}\u0000${candidate.leftEntryId}\u0000${candidate.rightEntryId}`;
+      const existing = this.correlationSuggestions.get(key);
+      this.correlationSuggestions.set(key, existing
+        ? { ...existing, signals: [...candidate.signals] }
+        : candidate);
+    }
+  }
+
+  async listCorrelationSuggestions(workspaceId: string): Promise<readonly CorrelationSuggestionRecord[]> {
+    await this.refreshCorrelationSuggestions(workspaceId);
+    return Object.freeze([...this.correlationSuggestions.values()]
+      .filter((suggestion) => suggestion.workspaceId === workspaceId && suggestion.status === "pending")
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .map((suggestion) => ({ ...suggestion, signals: [...suggestion.signals] })));
+  }
+
+  async getCorrelationSuggestion(workspaceId: string, id: string): Promise<CorrelationSuggestionRecord | null> {
+    await this.refreshCorrelationSuggestions(workspaceId);
+    const suggestion = [...this.correlationSuggestions.values()].find((candidate) => candidate.workspaceId === workspaceId && candidate.id === id);
+    if (!suggestion) return null;
+    const link = [...this.confirmedLinks.values()].find((candidate) => candidate.suggestionId === id);
+    return { ...suggestion, signals: [...suggestion.signals], ...(link ? { confirmedLink: { ...link } } : {}) };
+  }
+
+  async decideCorrelationSuggestion(workspaceId: string, id: string, memberId: string, decision: CorrelationDecision): Promise<CorrelationDecisionResult | null> {
+    if (!workspaceId.trim() || !id.trim() || !memberId.trim()) throw new Error("Correlation decision identifiers are required");
+    await this.refreshCorrelationSuggestions(workspaceId);
+    const suggestion = [...this.correlationSuggestions.values()].find((candidate) => candidate.workspaceId === workspaceId && candidate.id === id);
+    if (!suggestion) return null;
+    const existingLink = [...this.confirmedLinks.values()].find((candidate) => candidate.suggestionId === id) ?? null;
+    if (suggestion.status !== "pending") {
+      if ((decision === "confirm") !== (suggestion.status === "confirmed")) throw new CorrelationDecisionConflictError(suggestion.status);
+      return { suggestion: { ...suggestion, signals: [...suggestion.signals], ...(existingLink ? { confirmedLink: { ...existingLink } } : {}) }, confirmedLink: existingLink, idempotent: true };
+    }
+    const now = new Date().toISOString();
+    let confirmedLink: ConfirmedLinkRecord | null = null;
+    if (decision === "confirm") {
+      confirmedLink = { id: randomUUID(), workspaceId, suggestionId: id, leftEntryId: suggestion.leftEntryId, rightEntryId: suggestion.rightEntryId, confirmedByMemberId: memberId, confirmedAt: now };
+      this.confirmedLinks.set(id, confirmedLink);
+    }
+    const decided: CorrelationSuggestionRecord = { ...suggestion, status: decision === "confirm" ? "confirmed" : "rejected", decidedAt: now, decidedByMemberId: memberId, ...(confirmedLink ? { confirmedLink } : {}) };
+    this.correlationSuggestions.set(`${workspaceId}\u0000${suggestion.leftEntryId}\u0000${suggestion.rightEntryId}`, decided);
+    return { suggestion: { ...decided, signals: [...decided.signals] }, confirmedLink, idempotent: false };
+  }
+
+  async listConfirmedLinks(workspaceId: string, entryId?: string): Promise<readonly ConfirmedLinkRecord[]> {
+    return Object.freeze([...this.confirmedLinks.values()]
+      .filter((link) => link.workspaceId === workspaceId && (entryId === undefined || link.leftEntryId === entryId || link.rightEntryId === entryId))
+      .sort((left, right) => left.confirmedAt.localeCompare(right.confirmedAt) || left.id.localeCompare(right.id))
+      .map((link) => ({ ...link })));
+  }
+
+  private entryWithLinks(entry: TimelineEntry): TimelineEntry {
+    const links = [...this.confirmedLinks.values()].filter((link) => link.leftEntryId === entry.id || link.rightEntryId === entry.id);
+    return links.length > 0 ? { ...entry, confirmedLinks: links } : entry;
   }
 
   async listTimelineEntries(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<TimelinePage> {
@@ -792,16 +915,16 @@ export class MemoryObservationStore implements TimelineStore {
     }
     const entries = [...this.entries.values()]
       .filter((entry) => entry.workspaceId === workspaceId)
-      .map((entry): TimelineEntry => entry.entryType === "observation"
+      .map((entry): TimelineEntry => this.entryWithLinks(entry.entryType === "observation"
         ? { ...entry, attentionUnread: memberId !== undefined && entry.attentionItem && !this.attentionReviews.has(`${entry.id}\u0000${memberId}`) }
-        : entry);
+        : entry));
     const page = pageFromEntries(entries, query, this.cursorSecret, memberId);
     return memberId ? { ...page, unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) } : page;
   }
 
   async getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null> {
     const entry = this.entries.get(id);
-    return entry?.workspaceId === workspaceId ? cloneEntry(entry) : null;
+    return entry?.workspaceId === workspaceId ? cloneEntry(this.entryWithLinks(entry)) : null;
   }
 
   async unreadAttentionCount(workspaceId: string, memberId: string): Promise<number> {
@@ -942,6 +1065,57 @@ type CheckpointRow = Readonly<{
   resource_version: string;
   updated_at: string | Date;
 }>;
+
+type CorrelationSuggestionRow = Readonly<{
+  id: string;
+  workspace_id: string;
+  left_entry_id: string;
+  right_entry_id: string;
+  signals: string[];
+  status: "pending" | "confirmed" | "rejected";
+  created_at: string | Date;
+  decided_at: string | Date | null;
+  decided_by_member_id: string | null;
+}>;
+
+type ConfirmedLinkRow = Readonly<{
+  id: string;
+  workspace_id: string;
+  suggestion_id: string;
+  left_entry_id: string;
+  right_entry_id: string;
+  confirmed_by_member_id: string;
+  confirmed_at: string | Date;
+}>;
+
+const correlationSignalValues: readonly CorrelationSignal[] = ["time", "ownership", "label", "revision"];
+
+function correlationSuggestionFromRow(row: CorrelationSuggestionRow, confirmedLink?: ConfirmedLinkRecord): CorrelationSuggestionRecord {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    leftEntryId: row.left_entry_id,
+    rightEntryId: row.right_entry_id,
+    signals: row.signals.filter((signal): signal is CorrelationSignal => correlationSignalValues.includes(signal as CorrelationSignal)),
+    status: row.status,
+    createdAt: timestamp(row.created_at) ?? new Date(0).toISOString(),
+    decidedAt: timestamp(row.decided_at),
+    decidedByMemberId: row.decided_by_member_id,
+    ...(confirmedLink ? { confirmedLink } : {}),
+  };
+}
+
+function confirmedLinkFromRow(row: ConfirmedLinkRow): ConfirmedLinkRecord {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    suggestionId: row.suggestion_id,
+    leftEntryId: row.left_entry_id,
+    rightEntryId: row.right_entry_id,
+    confirmedByMemberId: row.confirmed_by_member_id,
+    confirmedAt: timestamp(row.confirmed_at) ?? new Date(0).toISOString(),
+  };
+}
 
 function normalizedFacts(observation: NormalizedObservation): Record<string, unknown> {
   return { ...observation };
@@ -1314,6 +1488,7 @@ export class PostgresObservationStore implements TimelineStore {
       const results: ObservationPersistenceResult[] = [];
       for (const observation of observations) results.push(await this.recordObservationInTransaction(client, observation));
       await client.query("COMMIT");
+      for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) await this.refreshCorrelationSuggestions(workspaceId);
       return results;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -1335,6 +1510,7 @@ export class PostgresObservationStore implements TimelineStore {
       for (const observation of observations) results.push(await this.recordObservationInTransaction(client, observation));
       await this.saveCheckpointInTransaction(client, checkpoint);
       await client.query("COMMIT");
+      for (const workspaceId of new Set(observations.map((observation) => observation.workspaceId))) await this.refreshCorrelationSuggestions(workspaceId);
       return results;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -1431,6 +1607,7 @@ export class PostgresObservationStore implements TimelineStore {
       if (!row) throw new Error("Experiment persistence returned no row");
       const entry = timelineEntryFromRow(row);
       if (entry.entryType !== "experiment") throw new Error("Experiment persistence returned the wrong Timeline entry");
+      await this.refreshCorrelationSuggestions(workspaceId);
       return cloneExperiment(entry.experiment);
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -1487,6 +1664,7 @@ export class PostgresObservationStore implements TimelineStore {
       if (!row) throw new Error("Experiment update returned no row");
       const entry = timelineEntryFromRow(row);
       if (entry.entryType !== "experiment") throw new Error("Experiment update returned the wrong Timeline entry");
+      await this.refreshCorrelationSuggestions(workspaceId);
       return cloneExperiment(entry.experiment);
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -1503,17 +1681,168 @@ export class PostgresObservationStore implements TimelineStore {
     const row = result.rows[0];
     if (!row) return null;
     const entry = timelineEntryFromRow(row);
-    return entry.entryType === "experiment" ? cloneExperiment(entry.experiment) : null;
+    if (entry.entryType !== "experiment") return null;
+    const links = await this.listConfirmedLinks(workspaceId, entry.id);
+    return cloneExperiment(links.length > 0 ? { ...entry.experiment, confirmedLinks: links } : entry.experiment);
   }
 
   async listExperiments(workspaceId: string): Promise<readonly ExperimentRecord[]> {
     const pool = await this.poolProvider();
     const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.workspace_id = $1 AND t.entry_type = 'experiment' ORDER BY t.occurred_at, t.id`, [workspaceId]);
+    const links = await this.listConfirmedLinks(workspaceId);
     return Object.freeze(result.rows.map((row) => {
       const entry = timelineEntryFromRow(row);
       if (entry.entryType !== "experiment") throw new Error("Experiment query returned the wrong Timeline entry");
-      return cloneExperiment(entry.experiment);
+      const related = links.filter((link) => link.leftEntryId === entry.id || link.rightEntryId === entry.id);
+      return cloneExperiment(related.length > 0 ? { ...entry.experiment, confirmedLinks: related } : entry.experiment);
     }));
+  }
+
+  private async allTimelineEntriesForCorrelation(workspaceId: string): Promise<readonly TimelineEntry[]> {
+    const entries: TimelineEntry[] = [];
+    let cursor: string | undefined;
+    while (true) {
+      const page = await this.listTimelineEntries(workspaceId, { limit: 100, ...(cursor ? { cursor } : {}) });
+      entries.push(...page.entries);
+      if (!page.nextCursor) return entries;
+      cursor = page.nextCursor;
+    }
+  }
+
+  private async refreshCorrelationSuggestions(workspaceId: string): Promise<void> {
+    const candidates = suggestCorrelationCandidates((await this.allTimelineEntriesForCorrelation(workspaceId)).map(correlationEntryFor));
+    if (candidates.length === 0) return;
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const candidate of candidates) {
+        await client.query(
+          `INSERT INTO tracegarden_correlation_suggestions
+             (id, workspace_id, left_entry_id, right_entry_id, signals, status, created_at)
+           VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+           ON CONFLICT (workspace_id, left_entry_id, right_entry_id) DO UPDATE SET signals = EXCLUDED.signals`,
+          [candidate.id, candidate.workspaceId, candidate.leftEntryId, candidate.rightEntryId, candidate.signals, candidate.createdAt],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw new Error("Tracegarden Correlation Suggestion persistence failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async listCorrelationSuggestions(workspaceId: string): Promise<readonly CorrelationSuggestionRecord[]> {
+    await this.refreshCorrelationSuggestions(workspaceId);
+    const pool = await this.poolProvider();
+    const result = await pool.query<CorrelationSuggestionRow>(
+      `SELECT id, workspace_id, left_entry_id, right_entry_id, signals, status, created_at, decided_at, decided_by_member_id
+         FROM tracegarden_correlation_suggestions
+        WHERE workspace_id = $1 AND status = 'pending'
+        ORDER BY created_at, id`,
+      [workspaceId],
+    );
+    return Object.freeze(result.rows.map((row) => correlationSuggestionFromRow(row)));
+  }
+
+  async getCorrelationSuggestion(workspaceId: string, id: string): Promise<CorrelationSuggestionRecord | null> {
+    await this.refreshCorrelationSuggestions(workspaceId);
+    const pool = await this.poolProvider();
+    const result = await pool.query<CorrelationSuggestionRow>(
+      `SELECT id, workspace_id, left_entry_id, right_entry_id, signals, status, created_at, decided_at, decided_by_member_id
+         FROM tracegarden_correlation_suggestions WHERE workspace_id = $1 AND id = $2`,
+      [workspaceId, id],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const links = await this.listConfirmedLinks(workspaceId);
+    return correlationSuggestionFromRow(row, links.find((link) => link.suggestionId === id));
+  }
+
+  async decideCorrelationSuggestion(workspaceId: string, id: string, memberId: string, decision: CorrelationDecision): Promise<CorrelationDecisionResult | null> {
+    if (!workspaceId.trim() || !id.trim() || !memberId.trim()) throw new Error("Correlation decision identifiers are required");
+    await this.refreshCorrelationSuggestions(workspaceId);
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<CorrelationSuggestionRow>(
+        `SELECT id, workspace_id, left_entry_id, right_entry_id, signals, status, created_at, decided_at, decided_by_member_id
+           FROM tracegarden_correlation_suggestions
+          WHERE workspace_id = $1 AND id = $2 FOR UPDATE`,
+        [workspaceId, id],
+      );
+      const row = result.rows[0];
+      if (!row) {
+        await client.query("COMMIT");
+        return null;
+      }
+      if (row.status !== "pending") {
+        if ((decision === "confirm") !== (row.status === "confirmed")) {
+          await client.query("COMMIT");
+          throw new CorrelationDecisionConflictError(row.status);
+        }
+        const existing = await client.query<ConfirmedLinkRow>(
+          `SELECT id, workspace_id, suggestion_id, left_entry_id, right_entry_id, confirmed_by_member_id, confirmed_at
+             FROM tracegarden_confirmed_links WHERE suggestion_id = $1`,
+          [id],
+        );
+        await client.query("COMMIT");
+        const link = existing.rows[0] ? confirmedLinkFromRow(existing.rows[0]) : null;
+        return { suggestion: correlationSuggestionFromRow(row, link ?? undefined), confirmedLink: link, idempotent: true };
+      }
+      const now = new Date().toISOString();
+      let link: ConfirmedLinkRecord | null = null;
+      if (decision === "confirm") {
+        const inserted = await client.query<ConfirmedLinkRow>(
+          `INSERT INTO tracegarden_confirmed_links
+             (id, workspace_id, suggestion_id, left_entry_id, right_entry_id, confirmed_by_member_id, confirmed_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (suggestion_id) DO UPDATE SET suggestion_id = EXCLUDED.suggestion_id
+           RETURNING id, workspace_id, suggestion_id, left_entry_id, right_entry_id, confirmed_by_member_id, confirmed_at`,
+          [randomUUID(), workspaceId, id, row.left_entry_id, row.right_entry_id, memberId, now],
+        );
+        link = inserted.rows[0] ? confirmedLinkFromRow(inserted.rows[0]) : null;
+      }
+      await client.query(
+        `UPDATE tracegarden_correlation_suggestions
+            SET status = $1, decided_at = $2, decided_by_member_id = $3
+          WHERE id = $4 AND workspace_id = $5`,
+        [decision === "confirm" ? "confirmed" : "rejected", now, memberId, id, workspaceId],
+      );
+      await client.query("COMMIT");
+      const suggestion = { ...correlationSuggestionFromRow({ ...row, status: decision === "confirm" ? "confirmed" : "rejected", decided_at: now, decided_by_member_id: memberId }, link ?? undefined) };
+      return { suggestion, confirmedLink: link, idempotent: false };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (error instanceof CorrelationDecisionConflictError) throw error;
+      throw new Error("Tracegarden Correlation Suggestion decision failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async listConfirmedLinks(workspaceId: string, entryId?: string): Promise<readonly ConfirmedLinkRecord[]> {
+    const pool = await this.poolProvider();
+    const values: unknown[] = [workspaceId];
+    const condition = entryId === undefined ? "" : ` AND (left_entry_id = $2 OR right_entry_id = $2)`;
+    if (entryId !== undefined) values.push(entryId);
+    const result = await pool.query<ConfirmedLinkRow>(
+      `SELECT id, workspace_id, suggestion_id, left_entry_id, right_entry_id, confirmed_by_member_id, confirmed_at
+         FROM tracegarden_confirmed_links WHERE workspace_id = $1${condition} ORDER BY confirmed_at, id`,
+      values,
+    );
+    return Object.freeze(result.rows.map(confirmedLinkFromRow));
+  }
+
+  private async attachConfirmedLinks(workspaceId: string, entries: readonly TimelineEntry[]): Promise<readonly TimelineEntry[]> {
+    const links = await this.listConfirmedLinks(workspaceId);
+    return entries.map((entry) => {
+      const related = links.filter((link) => link.leftEntryId === entry.id || link.rightEntryId === entry.id);
+      return related.length > 0 ? { ...entry, confirmedLinks: related } : entry;
+    });
   }
 
   async listTimelineEntries(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<TimelinePage> {
@@ -1557,7 +1886,8 @@ export class PostgresObservationStore implements TimelineStore {
       : "(ai.entry_id IS NOT NULL AND ar.entry_id IS NULL) AS attention_unread";
     const listSelect = timelineSelect.replace("         false AS attention_unread", `         ${attentionUnreadSelect}`) + joins;
     const result = await pool.query<TimelineJoinRow>(`${listSelect} WHERE ${condition} ORDER BY t.occurred_at, t.id LIMIT $${values.length}`, values);
-    const entries = result.rows.slice(0, query.limit).map(timelineEntryFromRow);
+    const rawEntries = result.rows.slice(0, query.limit).map(timelineEntryFromRow);
+    const entries = await this.attachConfirmedLinks(workspaceId, rawEntries);
     return {
       entries,
       nextCursor: result.rows.length > query.limit && entries.length > 0 ? encodeTimelineCursor(entries[entries.length - 1] as TimelineEntry, query, this.cursorSecret, memberId) : null,
@@ -1568,7 +1898,10 @@ export class PostgresObservationStore implements TimelineStore {
   async getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null> {
     const pool = await this.poolProvider();
     const result = await pool.query<TimelineJoinRow>(`${timelineSelect} WHERE t.workspace_id = $1 AND t.id = $2`, [workspaceId, id]);
-    return result.rows[0] ? timelineEntryFromRow(result.rows[0]) : null;
+    if (!result.rows[0]) return null;
+    const entry = timelineEntryFromRow(result.rows[0]);
+    const links = await this.listConfirmedLinks(workspaceId, id);
+    return links.length > 0 ? { ...entry, confirmedLinks: links } : entry;
   }
 
   async unreadAttentionCount(workspaceId: string, memberId: string): Promise<number> {

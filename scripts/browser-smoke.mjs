@@ -235,6 +235,109 @@ try {
   await page.waitForLoadState("domcontentloaded");
   assert.match(await page.locator("body").innerText(), /Marked reviewed/);
   assert.match(await page.locator("body").innerText(), /Unread Attention Items: 0/);
+  const correlationExperiment = await page.evaluate(async () => {
+    const response = await fetch("/api/experiments", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hypothesis: "浏览器关系", change: "检查 Pod", observation: "等待审核", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "browser-cluster", namespace: "tracegarden", kind: "Pod", name: "pending-review" }] }),
+    });
+    return { status: response.status, experiment: (await response.json()).experiment };
+  });
+  assert.equal(correlationExperiment.status, 201);
+  assert.ok(correlationExperiment.experiment.timelineEntryId);
+  await page.goto(`http://127.0.0.1:${port}/app?lang=zh-CN`, { waitUntil: "domcontentloaded" });
+  assert.match(await page.locator("body").innerText(), /Correlation Suggestions/);
+  assert.doesNotMatch(await page.locator("body").innerText(), /cause|root cause/i);
+  const correlationSuggestionId = await page.evaluate(async (timelineEntryId) => {
+    const suggestions = (await (await fetch("/api/correlations/suggestions")).json()).suggestions;
+    return suggestions.find((suggestion) => suggestion.leftEntryId === timelineEntryId || suggestion.rightEntryId === timelineEntryId)?.id;
+  }, correlationExperiment.experiment.timelineEntryId);
+  assert.ok(correlationSuggestionId);
+  const correlationCard = page.locator(`[data-correlation-suggestion-id="${correlationSuggestionId}"]`);
+  assert.match(await correlationCard.innerText(), /浏览器关系|pending-review/);
+  const createPendingRejectionExperiment = async (hypothesis) => page.evaluate(async (value) => {
+    const response = await fetch("/api/experiments", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hypothesis: value, change: "检查 Pod", observation: "保持待审核", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "browser-cluster", namespace: "tracegarden", kind: "Pod", name: "pending-review" }] }),
+    });
+    return { status: response.status, experiment: (await response.json()).experiment };
+  }, hypothesis);
+  const chineseRejectionExperiment = await createPendingRejectionExperiment("浏览器拒绝关系");
+  const englishRejectionExperiment = await createPendingRejectionExperiment("Browser rejection relationship");
+  assert.equal(chineseRejectionExperiment.status, 201);
+  assert.equal(englishRejectionExperiment.status, 201);
+  const chineseRejectionSuggestionId = await page.evaluate(async (timelineEntryId) => {
+    const suggestions = (await (await fetch("/api/correlations/suggestions")).json()).suggestions;
+    return suggestions.find((suggestion) => suggestion.leftEntryId === timelineEntryId || suggestion.rightEntryId === timelineEntryId)?.id;
+  }, chineseRejectionExperiment.experiment.timelineEntryId);
+  const englishRejectionSuggestionId = await page.evaluate(async (timelineEntryId) => {
+    const suggestions = (await (await fetch("/api/correlations/suggestions")).json()).suggestions;
+    return suggestions.find((suggestion) => suggestion.leftEntryId === timelineEntryId || suggestion.rightEntryId === timelineEntryId)?.id;
+  }, englishRejectionExperiment.experiment.timelineEntryId);
+  assert.ok(chineseRejectionSuggestionId);
+  assert.ok(englishRejectionSuggestionId);
+  await page.goto(`http://127.0.0.1:${port}/app?lang=zh-CN`, { waitUntil: "domcontentloaded" });
+  const chineseRejectionCard = page.locator(`[data-correlation-suggestion-id="${chineseRejectionSuggestionId}"]`);
+  await chineseRejectionCard.getByRole("button", { name: "拒绝 Correlation Suggestion" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Correlation Suggestion 已拒绝/);
+  assert.equal(await page.locator(`[data-correlation-suggestion-id="${chineseRejectionSuggestionId}"]`).count(), 0);
+  const chinesePersistedStatus = await page.evaluate(async (suggestionId) => (await (await fetch(`/api/correlations/suggestions/${suggestionId}`)).json()).suggestion.status, chineseRejectionSuggestionId);
+  assert.equal(chinesePersistedStatus, "rejected");
+  await page.goto(`http://127.0.0.1:${port}/app?lang=en`, { waitUntil: "domcontentloaded" });
+  const englishRejectionCard = page.locator(`[data-correlation-suggestion-id="${englishRejectionSuggestionId}"]`);
+  await englishRejectionCard.getByRole("button", { name: "Reject Correlation Suggestion" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /Correlation Suggestion rejected/);
+  assert.equal(await page.locator(`[data-correlation-suggestion-id="${englishRejectionSuggestionId}"]`).count(), 0);
+  const englishPersistedStatus = await page.evaluate(async (suggestionId) => (await (await fetch(`/api/correlations/suggestions/${suggestionId}`)).json()).suggestion.status, englishRejectionSuggestionId);
+  assert.equal(englishPersistedStatus, "rejected");
+
+  await page.goto(`http://127.0.0.1:${port}/members?lang=en`, { waitUntil: "domcontentloaded" });
+  const invitedViewerRole = page.locator('select[aria-label="Role: invited@example.test"]');
+  await invitedViewerRole.selectOption("viewer");
+  await invitedViewerRole.locator("xpath=ancestor::form").getByRole("button", { name: "Save role" }).click();
+  await page.waitForLoadState("domcontentloaded");
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  const unauthorizedCorrelationReview = await page.evaluate(async (suggestionId) => (await fetch(`/api/correlations/suggestions/${suggestionId}/confirm`, { method: "POST" })).status, correlationSuggestionId);
+  assert.equal(unauthorizedCorrelationReview, 401);
+
+  await page.locator("#identity").selectOption("invited");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  await page.goto(`http://127.0.0.1:${port}/app?lang=zh-CN`, { waitUntil: "domcontentloaded" });
+  assert.match(await page.locator("body").innerText(), /你没有审核 Correlation Suggestion 的 Capability/);
+  const deniedCorrelationCard = page.locator(`[data-correlation-suggestion-id="${correlationSuggestionId}"]`);
+  assert.equal(await deniedCorrelationCard.getByRole("button", { name: "确认 Correlation Suggestion" }).count(), 0);
+  const deniedCorrelationReview = await page.evaluate(async (suggestionId) => (await fetch(`/api/correlations/suggestions/${suggestionId}/confirm`, { method: "POST" })).status, correlationSuggestionId);
+  assert.equal(deniedCorrelationReview, 403);
+  await page.goto(`http://127.0.0.1:${port}/app?lang=en`, { waitUntil: "domcontentloaded" });
+  assert.match(await page.locator("body").innerText(), /You do not have the Capability to review Correlation Suggestions/);
+  assert.equal(await page.locator(`[data-correlation-suggestion-id="${correlationSuggestionId}"]`).getByRole("button", { name: "Confirm Correlation Suggestion" }).count(), 0);
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  await page.locator("#identity").selectOption("owner");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  await page.goto(`http://127.0.0.1:${port}/app?lang=zh-CN`, { waitUntil: "domcontentloaded" });
+  const correlationOwnerCard = page.locator(`[data-correlation-suggestion-id="${correlationSuggestionId}"]`);
+  await correlationOwnerCard.getByRole("button", { name: "确认 Correlation Suggestion" }).click();
+  await page.waitForLoadState("domcontentloaded");
+  assert.match(await page.locator("body").innerText(), /已确认，已创建 Confirmed Link/);
+  const conflictingReview = await page.evaluate(async (suggestionId) => {
+    const response = await fetch(`/correlations/suggestions/${suggestionId}/reject?lang=en`, { method: "POST" });
+    return { status: response.status, body: await response.text() };
+  }, correlationSuggestionId);
+  assert.equal(conflictingReview.status, 409);
+  assert.match(conflictingReview.body, /decision conflict/);
+  assert.doesNotMatch(conflictingReview.body, /Correlation Suggestion rejected/i);
+  await page.goto(`http://127.0.0.1:${port}/app?lang=en`, { waitUntil: "domcontentloaded" });
+  assert.match(await page.locator("body").innerText(), /Confirmed Link/);
+  assert.match(await page.locator(`[data-entry-id="${correlationExperiment.experiment.timelineEntryId}"]`).innerText(), /Confirmed Link/);
   console.log("Playwright browser smoke passed");
 } finally {
   await timelineDatabase?.close();

@@ -136,6 +136,19 @@ export type Messages = Readonly<{
   experimentWriteDenied: string;
   experimentInvalid: string;
   experimentUnavailable: string;
+  correlationsTitle: string;
+  correlationsDescription: string;
+  noCorrelationSuggestions: string;
+  correlationSignals: string;
+  correlationSignalLabels: Readonly<Record<string, string>>;
+  confirmSuggestion: string;
+  rejectSuggestion: string;
+  suggestionConfirmed: string;
+  suggestionRejected: string;
+  correlationDecisionConflict: string;
+  correlationReviewDenied: string;
+  confirmedLink: string;
+  confirmedBy: string;
 }>;
 
 export const catalogs: Readonly<Record<Language, Messages>> = {
@@ -284,7 +297,20 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     experimentUpdated: "Experiment 已更新。",
     experimentWriteDenied: "你没有创建或更新 Experiment 的 Capability。",
     experimentInvalid: "Experiment 请求无效，请检查结构化字段。",
-    experimentUnavailable: "Experiment 当前不可用。"
+    experimentUnavailable: "Experiment 当前不可用。",
+    correlationsTitle: "Correlation Suggestions",
+    correlationsDescription: "这些是基于时间、所属关系、标签或修订版本的待审核关系；它们不会替代 Member 的判断。",
+    noCorrelationSuggestions: "暂无待审核的 Correlation Suggestion。",
+    correlationSignals: "候选信号",
+    correlationSignalLabels: { time: "时间接近", ownership: "所属关系", label: "标签匹配", revision: "修订版本匹配" },
+    confirmSuggestion: "确认 Correlation Suggestion",
+    rejectSuggestion: "拒绝 Correlation Suggestion",
+    suggestionConfirmed: "Correlation Suggestion 已确认，已创建 Confirmed Link。",
+    suggestionRejected: "Correlation Suggestion 已拒绝。",
+    correlationDecisionConflict: "Correlation Suggestion 决策冲突；该关系已被处理。",
+    correlationReviewDenied: "你没有审核 Correlation Suggestion 的 Capability。",
+    confirmedLink: "Confirmed Link",
+    confirmedBy: "确认 Member",
   },
   en: {
     appName: "Tracegarden",
@@ -431,7 +457,20 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     experimentUpdated: "Experiment updated.",
     experimentWriteDenied: "You do not have the Capability to create or update Experiments.",
     experimentInvalid: "The Experiment request is invalid. Check the structured fields.",
-    experimentUnavailable: "The Experiment is currently unavailable."
+    experimentUnavailable: "The Experiment is currently unavailable.",
+    correlationsTitle: "Correlation Suggestions",
+    correlationsDescription: "These reviewable relationships use time, ownership, labels, or revisions; they remain separate from Member judgment.",
+    noCorrelationSuggestions: "No pending Correlation Suggestions.",
+    correlationSignals: "Candidate signals",
+    correlationSignalLabels: { time: "Close in time", ownership: "Ownership", label: "Matching label", revision: "Matching revision" },
+    confirmSuggestion: "Confirm Correlation Suggestion",
+    rejectSuggestion: "Reject Correlation Suggestion",
+    suggestionConfirmed: "Correlation Suggestion confirmed; a Confirmed Link was created.",
+    suggestionRejected: "Correlation Suggestion rejected.",
+    correlationDecisionConflict: "Correlation Suggestion decision conflict; it has already been decided.",
+    correlationReviewDenied: "You do not have the Capability to review Correlation Suggestions.",
+    confirmedLink: "Confirmed Link",
+    confirmedBy: "Confirming Member",
   },
 };
 

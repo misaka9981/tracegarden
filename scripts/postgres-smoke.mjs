@@ -59,8 +59,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention', '0011_structured_experiments');");
-  assert.equal(migrationCount, "11");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention', '0011_structured_experiments', '0012_correlation_links');");
+  assert.equal(migrationCount, "12");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -421,6 +421,63 @@ try {
     status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
   }, "2099-10-01T00:00:02.000Z");
   await timelineStore.recordObservation(runningObservation);
+  const correlationExperimentResponse = await fetch(`http://127.0.0.1:${webPort}/api/experiments`, {
+    method: "POST",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ hypothesis: "review correlation", change: "inspect Pod", observation: "Pod remains pending", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "local-postgres-smoke", namespace: "tracegarden", kind: "Pod", name: "api" }] }),
+  });
+  assert.equal(correlationExperimentResponse.status, 201);
+  const correlationExperiment = (await correlationExperimentResponse.json()).experiment;
+  const correlationSuggestionsResponse = await fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions`, { headers: { cookie: ownerCookie } });
+  assert.equal(correlationSuggestionsResponse.status, 200);
+  const correlationSuggestions = (await correlationSuggestionsResponse.json()).suggestions;
+  const correlationSuggestion = correlationSuggestions.find((candidate) => (candidate.leftEntryId === correlationExperiment.timelineEntryId || candidate.rightEntryId === correlationExperiment.timelineEntryId) && candidate.signals.includes("ownership"));
+  assert.ok(correlationSuggestion);
+  const confirmedCorrelationResponse = await fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions/${correlationSuggestion.id}/confirm`, { method: "POST", headers: { cookie: ownerCookie } });
+  assert.equal(confirmedCorrelationResponse.status, 200);
+  const confirmedCorrelation = await confirmedCorrelationResponse.json();
+  assert.equal(confirmedCorrelation.confirmedLink.confirmedByMemberId, sessionBody.member.id);
+  const repeatedConfirmation = await fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions/${correlationSuggestion.id}/confirm`, { method: "POST", headers: { cookie: ownerCookie } });
+  assert.equal((await repeatedConfirmation.json()).idempotent, true);
+  const concurrentExperimentResponse = await fetch(`http://127.0.0.1:${webPort}/api/experiments`, {
+    method: "POST",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ hypothesis: "concurrent review", change: "inspect Pod", observation: "pending", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "local-postgres-smoke", namespace: "tracegarden", kind: "Pod", name: "api" }] }),
+  });
+  const concurrentExperiment = (await concurrentExperimentResponse.json()).experiment;
+  const concurrentSuggestions = (await (await fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions`, { headers: { cookie: ownerCookie } })).json()).suggestions;
+  const concurrentSuggestion = concurrentSuggestions.find((candidate) => (candidate.leftEntryId === concurrentExperiment.timelineEntryId || candidate.rightEntryId === concurrentExperiment.timelineEntryId) && candidate.signals.includes("ownership"));
+  assert.ok(concurrentSuggestion);
+  const concurrentResponses = await Promise.all([1, 2].map(() => fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions/${concurrentSuggestion.id}/confirm`, { method: "POST", headers: { cookie: ownerCookie } })));
+  assert.deepEqual((await Promise.all(concurrentResponses.map(async (response) => (await response.json()).idempotent))).sort(), [false, true]);
+  const concurrentLinks = await collectorDatabase.timeline.listConfirmedLinks("workspace-single", concurrentExperiment.timelineEntryId);
+  assert.equal(concurrentLinks.filter((link) => link.suggestionId === concurrentSuggestion.id).length, 1);
+  const linkedCorrelationTimeline = await fetch(`http://127.0.0.1:${webPort}/api/timeline?limit=100`, { headers: { cookie: ownerCookie } });
+  const linkedTimelineEntries = (await linkedCorrelationTimeline.json()).entries;
+  assert.ok(linkedTimelineEntries.find((entry) => entry.id === correlationExperiment.timelineEntryId)?.confirmedLinks?.length);
+  const linkedCorrelationExperiment = await fetch(`http://127.0.0.1:${webPort}/api/experiments/${correlationExperiment.id}`, { headers: { cookie: ownerCookie } });
+  assert.ok((await linkedCorrelationExperiment.json()).experiment.confirmedLinks.length >= 1);
+  const secondCorrelationExperimentResponse = await fetch(`http://127.0.0.1:${webPort}/api/experiments`, {
+    method: "POST",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ hypothesis: "reject correlation", change: "inspect Pod", observation: "not a review", conclusion: "", state: "active", tags: [], workloads: [{ clusterId: "local-postgres-smoke", namespace: "tracegarden", kind: "Pod", name: "api" }] }),
+  });
+  const secondCorrelationExperiment = (await secondCorrelationExperimentResponse.json()).experiment;
+  const postConfirmSuggestions = (await (await fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions`, { headers: { cookie: ownerCookie } })).json()).suggestions;
+  const rejectedCorrelationSuggestion = postConfirmSuggestions.find((candidate) => candidate.leftEntryId === secondCorrelationExperiment.timelineEntryId || candidate.rightEntryId === secondCorrelationExperiment.timelineEntryId);
+  assert.ok(rejectedCorrelationSuggestion);
+  const rejectedCorrelationResponse = await fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions/${rejectedCorrelationSuggestion.id}/reject`, { method: "POST", headers: { cookie: ownerCookie } });
+  assert.equal(rejectedCorrelationResponse.status, 200);
+  const remainingSuggestions = (await (await fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions`, { headers: { cookie: ownerCookie } })).json()).suggestions;
+  assert.equal(remainingSuggestions.some((candidate) => candidate.id === rejectedCorrelationSuggestion.id), false);
+  const viewerRoleResponse = await fetch(`http://127.0.0.1:${webPort}/api/members/${invitedSessionBody.member.id}/role`, {
+    method: "PATCH",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ role: "viewer" }),
+  });
+  assert.equal(viewerRoleResponse.status, 200);
+  const viewerDecision = await fetch(`http://127.0.0.1:${webPort}/api/correlations/suggestions/${correlationSuggestion.id}/confirm`, { method: "POST", headers: { cookie: invitedLogin.headers.get("set-cookie") ?? "" } });
+  assert.equal(viewerDecision.status, 403);
   const historyPageOne = await timelineStore.listTimelineEntries("workspace-single", { limit: 1 }, sessionBody.member.id);
   assert.equal(historyPageOne.entries.length, 1);
   assert.ok(historyPageOne.nextCursor);
@@ -563,7 +620,7 @@ try {
   const memberCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_members;");
   assert.equal(memberCount, raceAdmission.status === 303 ? "3" : "2");
   const auditCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_audit_records;");
-  assert.equal(auditCount, "9");
+  assert.equal(auditCount, "10");
   const auditMetadata = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT coalesce(string_agg(metadata::text, ' '), '') FROM tracegarden_audit_records;");
   assert.doesNotMatch(auditMetadata, /token/i);
   let auditMutationRejected = false;

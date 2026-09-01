@@ -12,6 +12,16 @@ export type ExperimentWorkload = Readonly<{
   name: string;
 }>;
 
+export type ConfirmedLinkRecord = Readonly<{
+  id: string;
+  workspaceId: string;
+  suggestionId: string;
+  leftEntryId: string;
+  rightEntryId: string;
+  confirmedByMemberId: string;
+  confirmedAt: string;
+}>;
+
 export type ExperimentRecord = Readonly<{
   id: string;
   workspaceId: string;
@@ -27,6 +37,7 @@ export type ExperimentRecord = Readonly<{
   gitRevision: string | null;
   createdAt: string;
   updatedAt: string;
+  confirmedLinks?: readonly ConfirmedLinkRecord[];
 }>;
 
 export type ExperimentInput = Readonly<{
@@ -256,4 +267,189 @@ export async function updateExperiment(
 
 export function hasExperimentWrite(member: Pick<MemberRecord, "capabilities">): boolean {
   return member.capabilities.includes(capabilities.experimentWrite);
+}
+
+export const CORRELATION_SIGNALS = ["time", "ownership", "label", "revision"] as const;
+export type CorrelationSignal = (typeof CORRELATION_SIGNALS)[number];
+export const CORRELATION_SUGGESTION_STATUSES = ["pending", "confirmed", "rejected"] as const;
+export type CorrelationSuggestionStatus = (typeof CORRELATION_SUGGESTION_STATUSES)[number];
+export type CorrelationDecision = "confirm" | "reject";
+
+export const CORRELATION_TIME_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+type CorrelationOwner = Readonly<{ kind: string; name: string; uid: string | null }>;
+type CorrelationObservation = Readonly<{
+  kind: string;
+  name: string;
+  namespace: string;
+  clusterId: string;
+  sourceIdentity: string;
+  ownerReferences: readonly CorrelationOwner[];
+  labels: Readonly<Record<string, string>>;
+  revision: string | null;
+}>;
+type CorrelationWorkload = Readonly<{
+  clusterId: string;
+  namespace: string;
+  kind: string;
+  name: string;
+}>;
+export type CorrelationEntry = Readonly<{
+  id: string;
+  workspaceId: string;
+  occurredAt: string;
+  clusterId: string | null;
+  observation?: CorrelationObservation;
+  experiment?: Readonly<{ workloads: readonly CorrelationWorkload[]; gitRevision: string | null }>;
+}>;
+
+export type CorrelationSuggestionRecord = Readonly<{
+  id: string;
+  workspaceId: string;
+  leftEntryId: string;
+  rightEntryId: string;
+  signals: readonly CorrelationSignal[];
+  status: CorrelationSuggestionStatus;
+  createdAt: string;
+  decidedAt: string | null;
+  decidedByMemberId: string | null;
+  confirmedLink?: ConfirmedLinkRecord;
+}>;
+export type CorrelationSuggestion = CorrelationSuggestionRecord;
+
+export type CorrelationDecisionResult = Readonly<{
+  suggestion: CorrelationSuggestionRecord;
+  confirmedLink: ConfirmedLinkRecord | null;
+  idempotent: boolean;
+}>;
+
+function correlationObservation(entry: CorrelationEntry): CorrelationObservation | null {
+  return entry.observation ?? null;
+}
+
+function correlationExperiment(entry: CorrelationEntry): Readonly<{ workloads: readonly CorrelationWorkload[]; gitRevision: string | null }> | null {
+  return entry.experiment ?? null;
+}
+
+function workloadMatchesObservation(workload: CorrelationWorkload, observation: CorrelationObservation): boolean {
+  if (workload.clusterId !== observation.clusterId || workload.namespace !== observation.namespace) return false;
+  if (workload.kind === observation.kind && workload.name === observation.name) return true;
+  return observation.ownerReferences.some((owner) => owner.kind === workload.kind && owner.name === workload.name);
+}
+
+function observationUid(observation: CorrelationObservation): string {
+  const separator = observation.sourceIdentity.indexOf(":");
+  return separator < 0 ? observation.sourceIdentity : observation.sourceIdentity.slice(separator + 1);
+}
+
+function ownershipSignal(left: CorrelationEntry, right: CorrelationEntry): boolean {
+  const leftObservation = correlationObservation(left);
+  const rightObservation = correlationObservation(right);
+  if (leftObservation && rightObservation) {
+    return leftObservation.clusterId === rightObservation.clusterId
+      && (leftObservation.ownerReferences.some((owner) => owner.uid === observationUid(rightObservation) || (owner.kind === rightObservation.kind && owner.name === rightObservation.name))
+        || rightObservation.ownerReferences.some((owner) => owner.uid === observationUid(leftObservation) || (owner.kind === leftObservation.kind && owner.name === leftObservation.name)));
+  }
+  const leftExperiment = correlationExperiment(left);
+  const rightExperiment = correlationExperiment(right);
+  if (leftExperiment && rightObservation) return leftExperiment.workloads.some((workload) => workloadMatchesObservation(workload, rightObservation));
+  if (rightExperiment && leftObservation) return rightExperiment.workloads.some((workload) => workloadMatchesObservation(workload, leftObservation));
+  if (leftExperiment && rightExperiment) {
+    return leftExperiment.workloads.some((leftWorkload) => rightExperiment.workloads.some((rightWorkload) =>
+      leftWorkload.clusterId === rightWorkload.clusterId && leftWorkload.namespace === rightWorkload.namespace
+        && leftWorkload.kind === rightWorkload.kind && leftWorkload.name === rightWorkload.name));
+  }
+  return false;
+}
+
+function labelSignal(left: CorrelationEntry, right: CorrelationEntry): boolean {
+  const leftObservation = correlationObservation(left);
+  const rightObservation = correlationObservation(right);
+  if (!leftObservation || !rightObservation) return false;
+  return Object.entries(leftObservation.labels).some(([key, value]) => rightObservation.labels[key] === value);
+}
+
+function revisionSignal(left: CorrelationEntry, right: CorrelationEntry): boolean {
+  const leftObservation = correlationObservation(left);
+  const rightObservation = correlationObservation(right);
+  const leftExperiment = correlationExperiment(left);
+  const rightExperiment = correlationExperiment(right);
+  const revisions = [
+    leftObservation?.revision,
+    rightObservation?.revision,
+    leftExperiment?.gitRevision,
+    rightExperiment?.gitRevision,
+  ].filter((revision): revision is string => Boolean(revision));
+  return new Set(revisions).size < revisions.length;
+}
+
+export function correlationSignalsBetween(left: CorrelationEntry, right: CorrelationEntry): readonly CorrelationSignal[] {
+  if (left.id === right.id || left.workspaceId !== right.workspaceId) return [];
+  const signals: CorrelationSignal[] = [];
+  const leftTime = Date.parse(left.occurredAt);
+  const rightTime = Date.parse(right.occurredAt);
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && Math.abs(leftTime - rightTime) <= CORRELATION_TIME_WINDOW_MS) signals.push("time");
+  if (ownershipSignal(left, right)) signals.push("ownership");
+  if (labelSignal(left, right)) signals.push("label");
+  if (revisionSignal(left, right)) signals.push("revision");
+  return signals;
+}
+
+export function suggestCorrelationCandidates(entries: readonly CorrelationEntry[], now = new Date().toISOString()): readonly CorrelationSuggestionRecord[] {
+  // ponytail: O(n²) scan is sufficient for the MVP; add indexed signal joins if Timeline volume requires it.
+  const candidates: CorrelationSuggestionRecord[] = [];
+  for (let leftIndex = 0; leftIndex < entries.length; leftIndex += 1) {
+    const left = entries[leftIndex];
+    if (!left) continue;
+    for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex += 1) {
+      const right = entries[rightIndex];
+      if (!right) continue;
+      const signals = correlationSignalsBetween(left, right);
+      if (signals.length === 0) continue;
+      const leftEntryId = left.id < right.id ? left.id : right.id;
+      const rightEntryId = left.id < right.id ? right.id : left.id;
+      candidates.push({
+        id: randomUUID(),
+        workspaceId: left.workspaceId,
+        leftEntryId,
+        rightEntryId,
+        signals,
+        status: "pending",
+        createdAt: now,
+        decidedAt: null,
+        decidedByMemberId: null,
+      });
+    }
+  }
+  return candidates;
+}
+
+export function requireCorrelationReview(member: Pick<MemberRecord, "capabilities">): void {
+  requireCapability(member, capabilities.correlationReview);
+}
+
+export function hasCorrelationReview(member: Pick<MemberRecord, "capabilities">): boolean {
+  return member.capabilities.includes(capabilities.correlationReview);
+}
+
+export interface CorrelationDecisionStore {
+  decideCorrelationSuggestion(workspaceId: string, id: string, memberId: string, decision: CorrelationDecision): Promise<CorrelationDecisionResult | null>;
+}
+
+export async function confirmCorrelationSuggestion(
+  member: Pick<MemberRecord, "id" | "workspaceId" | "capabilities">,
+  store: CorrelationDecisionStore,
+  id: string,
+): Promise<CorrelationDecisionResult | null> {
+  requireCorrelationReview(member);
+  return store.decideCorrelationSuggestion(member.workspaceId, id, member.id, "confirm");
+}
+
+export async function rejectCorrelationSuggestion(
+  member: Pick<MemberRecord, "id" | "workspaceId" | "capabilities">,
+  store: CorrelationDecisionStore,
+  id: string,
+): Promise<CorrelationDecisionResult | null> {
+  requireCorrelationReview(member);
+  return store.decideCorrelationSuggestion(member.workspaceId, id, member.id, "reject");
 }
