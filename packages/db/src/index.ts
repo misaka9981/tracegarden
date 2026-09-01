@@ -35,6 +35,7 @@ import {
 } from "../../identity/src/index.js";
 import { randomUUID } from "node:crypto";
 import {
+  compareResourceVersions,
   MemoryClusterScopeStore,
   type AttentionReasonCode,
   type ClusterScope,
@@ -64,6 +65,7 @@ export const CLUSTER_SCOPE_MIGRATION_ID = "0005_cluster_scope";
 export const OBSERVATION_TIMELINE_MIGRATION_ID = "0006_observation_timeline";
 export const RECENT_LOGS_MIGRATION_ID = "0007_recent_logs";
 export const NORMALIZED_OBSERVATION_MIGRATION_ID = "0008_normalized_observations";
+export const OBSERVATION_CHECKPOINTS_MIGRATION_ID = "0009_observation_checkpoints";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -76,6 +78,7 @@ const migrations: readonly Migration[] = [
   { id: OBSERVATION_TIMELINE_MIGRATION_ID, path: "../migrations/0006_observation_timeline.sql" },
   { id: RECENT_LOGS_MIGRATION_ID, path: "../migrations/0007_recent_logs.sql" },
   { id: NORMALIZED_OBSERVATION_MIGRATION_ID, path: "../migrations/0008_normalized_observations.sql" },
+  { id: OBSERVATION_CHECKPOINTS_MIGRATION_ID, path: "../migrations/0009_observation_checkpoints.sql" },
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -287,6 +290,15 @@ export type ObservationPersistenceResult = Readonly<{
   duplicate: boolean;
 }>;
 
+export type IngestionCheckpoint = Readonly<{
+  workspaceId: string;
+  clusterId: string;
+  namespace: string;
+  resourceKind: string;
+  resourceVersion: string;
+  updatedAt: string;
+}>;
+
 export type TimelinePage = Readonly<{
   entries: readonly TimelineEntry[];
   nextCursor: string | null;
@@ -342,16 +354,49 @@ export function parseTimelineQuery(input: unknown): TimelineQuery {
 export interface TimelineStore {
   recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult>;
   recordObservations?(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]>;
+  getIngestionCheckpoint?(workspaceId: string, clusterId: string, resourceKind: string, namespace: string): Promise<IngestionCheckpoint | null>;
+  recordObservationsAndCheckpoint?(
+    observations: readonly NormalizedObservation[],
+    checkpoint: IngestionCheckpointInput,
+  ): Promise<readonly ObservationPersistenceResult[]>;
+  advanceIngestionCheckpoint?(checkpoint: IngestionCheckpointInput): Promise<IngestionCheckpoint | null>;
+  clearIngestionCheckpoint?(checkpoint: Omit<IngestionCheckpointInput, "resourceVersion">): Promise<void>;
   listTimelineEntries(workspaceId: string, query: TimelineQuery): Promise<TimelinePage>;
   getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null>;
   countObservations(workspaceId: string): Promise<number>;
   countTimelineEntries(workspaceId: string): Promise<number>;
 }
 
+export type IngestionCheckpointInput = Readonly<{
+  workspaceId: string;
+  clusterId: string;
+  namespace: string;
+  resourceKind: string;
+  resourceVersion: string;
+}>;
+
 export type ObservationStore = TimelineStore;
 
 function observationKey(observation: NormalizedObservation): string {
   return `${observation.workspaceId}\u0000${observation.clusterId}\u0000${observation.sourceKey}`;
+}
+
+function checkpointKey(checkpoint: Pick<IngestionCheckpointInput, "workspaceId" | "clusterId" | "namespace" | "resourceKind">): string {
+  return `${checkpoint.workspaceId}\u0000${checkpoint.clusterId}\u0000${checkpoint.namespace}\u0000${checkpoint.resourceKind}`;
+}
+
+function checkpointVersionShouldReplace(candidate: string, previous: string): boolean {
+  if (candidate === previous) return false;
+  const candidateIsDecimal = /^\d+$/.test(candidate);
+  const previousIsDecimal = /^\d+$/.test(previous);
+  return candidateIsDecimal && previousIsDecimal ? compareResourceVersions(candidate, previous) > 0 : true;
+}
+
+function checkpointRecord(checkpoint: IngestionCheckpointInput): IngestionCheckpoint {
+  return {
+    ...checkpoint,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function cloneObservation(observation: NormalizedObservation): NormalizedObservation {
@@ -398,6 +443,7 @@ export class MemoryObservationStore implements TimelineStore {
   private readonly entries = new Map<string, TimelineEntry>();
   private readonly ingestionOrders = new Map<string, bigint>();
   private nextIngestionOrder = 0n;
+  private readonly checkpoints = new Map<string, IngestionCheckpoint>();
 
   async recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult> {
     const results = await this.recordObservations([observation]);
@@ -406,10 +452,14 @@ export class MemoryObservationStore implements TimelineStore {
     return result;
   }
 
-  async recordObservations(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]> {
+  private recordObservationsInternal(
+    observations: readonly NormalizedObservation[],
+    checkpoint?: IngestionCheckpointInput,
+  ): readonly ObservationPersistenceResult[] {
     const pendingObservations = new Map(this.observations);
     const pendingEntries = new Map(this.entries);
     const pendingOrders = new Map(this.ingestionOrders);
+    const pendingCheckpoints = new Map(this.checkpoints);
     const results: ObservationPersistenceResult[] = [];
     for (const observation of observations) {
       const key = observationKey(observation);
@@ -434,13 +484,52 @@ export class MemoryObservationStore implements TimelineStore {
       pendingOrders.set(key, ++this.nextIngestionOrder);
       results.push({ observation: cloneObservation(storedObservation), entry: cloneEntry(entry), duplicate: false });
     }
+    if (checkpoint) {
+      const key = checkpointKey(checkpoint);
+      const previous = pendingCheckpoints.get(key);
+      if (!previous || checkpointVersionShouldReplace(checkpoint.resourceVersion, previous.resourceVersion)) {
+        pendingCheckpoints.set(key, checkpointRecord(checkpoint));
+      }
+    }
     this.observations.clear();
     for (const [key, observation] of pendingObservations) this.observations.set(key, observation);
     this.entries.clear();
     for (const [id, entry] of pendingEntries) this.entries.set(id, entry);
     this.ingestionOrders.clear();
     for (const [key, order] of pendingOrders) this.ingestionOrders.set(key, order);
+    this.checkpoints.clear();
+    for (const [key, value] of pendingCheckpoints) this.checkpoints.set(key, value);
     return results;
+  }
+
+  async recordObservations(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]> {
+    return this.recordObservationsInternal(observations);
+  }
+
+  async recordObservationsAndCheckpoint(
+    observations: readonly NormalizedObservation[],
+    checkpoint: IngestionCheckpointInput,
+  ): Promise<readonly ObservationPersistenceResult[]> {
+    return this.recordObservationsInternal(observations, checkpoint);
+  }
+
+  async getIngestionCheckpoint(workspaceId: string, clusterId: string, resourceKind: string, namespace: string): Promise<IngestionCheckpoint | null> {
+    const checkpoint = this.checkpoints.get(checkpointKey({ workspaceId, clusterId, namespace, resourceKind }));
+    return checkpoint ? { ...checkpoint } : null;
+  }
+
+  async advanceIngestionCheckpoint(checkpoint: IngestionCheckpointInput): Promise<IngestionCheckpoint | null> {
+    const key = checkpointKey(checkpoint);
+    const previous = this.checkpoints.get(key);
+    if (!previous || checkpointVersionShouldReplace(checkpoint.resourceVersion, previous.resourceVersion)) {
+      this.checkpoints.set(key, checkpointRecord(checkpoint));
+    }
+    const current = this.checkpoints.get(key);
+    return current ? { ...current } : null;
+  }
+
+  async clearIngestionCheckpoint(checkpoint: Omit<IngestionCheckpointInput, "resourceVersion">): Promise<void> {
+    this.checkpoints.delete(checkpointKey(checkpoint));
   }
 
   async listTimelineEntries(workspaceId: string, query: TimelineQuery): Promise<TimelinePage> {
@@ -552,6 +641,15 @@ type TimelineJoinRow = Readonly<{
   facts: Record<string, unknown>;
   observed_at: string | Date;
   ingestion_order: string | number;
+}>;
+
+type CheckpointRow = Readonly<{
+  workspace_id: string;
+  cluster_id: string;
+  namespace: string;
+  resource_kind: string;
+  resource_version: string;
+  updated_at: string | Date;
 }>;
 
 function normalizedFacts(observation: NormalizedObservation): Record<string, unknown> {
@@ -682,6 +780,17 @@ const observationSelect = `
          resource_version, facts, observed_at, ingestion_order
     FROM tracegarden_observations`;
 
+function checkpointFromRow(row: CheckpointRow): IngestionCheckpoint {
+  return {
+    workspaceId: row.workspace_id,
+    clusterId: row.cluster_id,
+    namespace: row.namespace,
+    resourceKind: row.resource_kind,
+    resourceVersion: row.resource_version,
+    updatedAt: timestamp(row.updated_at) ?? new Date(0).toISOString(),
+  };
+}
+
 export class PostgresObservationStore implements TimelineStore {
   constructor(private readonly poolProvider: PoolProvider) {}
 
@@ -732,6 +841,66 @@ export class PostgresObservationStore implements TimelineStore {
     return { observation: entry.observation, entry, duplicate };
   }
 
+  private async saveCheckpointInTransaction(
+    client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
+    checkpoint: IngestionCheckpointInput,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO tracegarden_ingestion_checkpoints
+         (workspace_id, cluster_id, namespace, resource_kind, resource_version)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (workspace_id, cluster_id, namespace, resource_kind) DO UPDATE SET
+         resource_version = CASE
+           WHEN tracegarden_ingestion_checkpoints.resource_version ~ '^[0-9]+$'
+                AND EXCLUDED.resource_version ~ '^[0-9]+$'
+             THEN GREATEST(tracegarden_ingestion_checkpoints.resource_version::numeric, EXCLUDED.resource_version::numeric)::text
+           ELSE EXCLUDED.resource_version
+         END,
+         updated_at = CASE
+           WHEN tracegarden_ingestion_checkpoints.resource_version ~ '^[0-9]+$'
+                AND EXCLUDED.resource_version ~ '^[0-9]+$'
+                AND EXCLUDED.resource_version::numeric > tracegarden_ingestion_checkpoints.resource_version::numeric
+             THEN now()
+           WHEN NOT (tracegarden_ingestion_checkpoints.resource_version ~ '^[0-9]+$'
+                     AND EXCLUDED.resource_version ~ '^[0-9]+$')
+                AND EXCLUDED.resource_version <> tracegarden_ingestion_checkpoints.resource_version
+             THEN now()
+           ELSE tracegarden_ingestion_checkpoints.updated_at
+         END`,
+      [checkpoint.workspaceId, checkpoint.clusterId, checkpoint.namespace, checkpoint.resourceKind, checkpoint.resourceVersion],
+    );
+  }
+
+  private async advanceCheckpointInTransaction(
+    client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
+    checkpoint: IngestionCheckpointInput,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO tracegarden_ingestion_checkpoints
+         (workspace_id, cluster_id, namespace, resource_kind, resource_version)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (workspace_id, cluster_id, namespace, resource_kind) DO UPDATE SET
+         resource_version = CASE
+           WHEN tracegarden_ingestion_checkpoints.resource_version ~ '^[0-9]+$'
+                AND EXCLUDED.resource_version ~ '^[0-9]+$'
+             THEN GREATEST(tracegarden_ingestion_checkpoints.resource_version::numeric, EXCLUDED.resource_version::numeric)::text
+           ELSE EXCLUDED.resource_version
+         END,
+         updated_at = CASE
+           WHEN tracegarden_ingestion_checkpoints.resource_version ~ '^[0-9]+$'
+                AND EXCLUDED.resource_version ~ '^[0-9]+$'
+                AND EXCLUDED.resource_version::numeric > tracegarden_ingestion_checkpoints.resource_version::numeric
+             THEN now()
+           WHEN NOT (tracegarden_ingestion_checkpoints.resource_version ~ '^[0-9]+$'
+                     AND EXCLUDED.resource_version ~ '^[0-9]+$')
+                AND EXCLUDED.resource_version <> tracegarden_ingestion_checkpoints.resource_version
+             THEN now()
+           ELSE tracegarden_ingestion_checkpoints.updated_at
+         END`,
+      [checkpoint.workspaceId, checkpoint.clusterId, checkpoint.namespace, checkpoint.resourceKind, checkpoint.resourceVersion],
+    );
+  }
+
   async recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult> {
     const results = await this.recordObservations([observation]);
     const result = results[0];
@@ -762,6 +931,79 @@ export class PostgresObservationStore implements TimelineStore {
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw new Error("Tracegarden observation persistence failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async recordObservationsAndCheckpoint(
+    observations: readonly NormalizedObservation[],
+    checkpoint: IngestionCheckpointInput,
+  ): Promise<readonly ObservationPersistenceResult[]> {
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const results: ObservationPersistenceResult[] = [];
+      for (const observation of observations) results.push(await this.recordObservationInTransaction(client, observation));
+      await this.saveCheckpointInTransaction(client, checkpoint);
+      await client.query("COMMIT");
+      return results;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw new Error("Tracegarden observation checkpoint persistence failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async getIngestionCheckpoint(workspaceId: string, clusterId: string, resourceKind: string, namespace: string): Promise<IngestionCheckpoint | null> {
+    const pool = await this.poolProvider();
+    const result = await pool.query<CheckpointRow>(
+      `SELECT workspace_id, cluster_id, namespace, resource_kind, resource_version, updated_at
+         FROM tracegarden_ingestion_checkpoints
+        WHERE workspace_id = $1 AND cluster_id = $2 AND namespace = $3 AND resource_kind = $4`,
+      [workspaceId, clusterId, namespace, resourceKind],
+    );
+    return result.rows[0] ? checkpointFromRow(result.rows[0]) : null;
+  }
+
+  async advanceIngestionCheckpoint(checkpoint: IngestionCheckpointInput): Promise<IngestionCheckpoint | null> {
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.advanceCheckpointInTransaction(client, checkpoint);
+      const result = await client.query<CheckpointRow>(
+        `SELECT workspace_id, cluster_id, namespace, resource_kind, resource_version, updated_at
+           FROM tracegarden_ingestion_checkpoints
+          WHERE workspace_id = $1 AND cluster_id = $2 AND namespace = $3 AND resource_kind = $4`,
+        [checkpoint.workspaceId, checkpoint.clusterId, checkpoint.namespace, checkpoint.resourceKind],
+      );
+      await client.query("COMMIT");
+      return result.rows[0] ? checkpointFromRow(result.rows[0]) : null;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw new Error("Tracegarden ingestion checkpoint persistence failed", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async clearIngestionCheckpoint(checkpoint: Omit<IngestionCheckpointInput, "resourceVersion">): Promise<void> {
+    const pool = await this.poolProvider();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `DELETE FROM tracegarden_ingestion_checkpoints
+          WHERE workspace_id = $1 AND cluster_id = $2 AND namespace = $3 AND resource_kind = $4`,
+        [checkpoint.workspaceId, checkpoint.clusterId, checkpoint.namespace, checkpoint.resourceKind],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw new Error("Tracegarden ingestion checkpoint clearing failed", { cause: error });
     } finally {
       client.release();
     }

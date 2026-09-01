@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
 import {
+  CoreV1Api,
+  KubeConfig,
+  Observable,
+  Watch,
+  type RequestContext,
+  type ResponseContext,
+} from "@kubernetes/client-node";
+import {
   capabilities,
   requireCapability,
   type MemberRecord,
@@ -241,6 +249,36 @@ export type KubernetesResource = Readonly<{
   eventTime?: string;
   [key: string]: unknown;
 }>;
+
+export type KubernetesListResult = Readonly<{
+  resources: readonly KubernetesResource[];
+  resourceVersion?: string | null;
+}>;
+
+export type KubernetesWatchEvent = Readonly<{
+  type: "ADDED" | "MODIFIED" | "DELETED" | "BOOKMARK" | "ERROR";
+  resource?: KubernetesResource;
+  resourceVersion?: string | null;
+  observedAt?: string;
+  statusCode?: number;
+  reason?: string | null;
+}>;
+
+export class KubernetesWatchDisconnectedError extends Error {
+  constructor(message = "Kubernetes watch disconnected", options?: ErrorOptions) {
+    super(message, options);
+    this.name = "KubernetesWatchDisconnectedError";
+  }
+}
+
+export class KubernetesWatchGoneError extends Error {
+  readonly statusCode = 410;
+
+  constructor(message = "Kubernetes watch resource version is gone") {
+    super(message);
+    this.name = "KubernetesWatchGoneError";
+  }
+}
 
 export type NormalizedOwnerReference = Readonly<{
   kind: string;
@@ -727,19 +765,111 @@ export function markRecovery(
 export interface KubernetesObservationAdapter {
   readonly kind: "deterministic" | "inert" | "production";
   readonly contacted: boolean;
-  list(scope: ClusterScope): Promise<readonly KubernetesResource[]>;
+  list(scope: ClusterScope, signal?: AbortSignal): Promise<readonly KubernetesResource[]>;
+  listResult?(scope: ClusterScope, signal?: AbortSignal): Promise<KubernetesListResult>;
+  watch?(scope: ClusterScope, resourceVersion?: string | null, signal?: AbortSignal): Promise<AsyncIterable<KubernetesWatchEvent>>;
+}
+
+export type DeterministicWatchPlan = Readonly<{
+  events?: readonly KubernetesWatchEvent[];
+  error?: unknown;
+}>;
+
+export type DeterministicKubernetesAdapterOptions = Readonly<{
+  listResults?: readonly (KubernetesListResult | readonly KubernetesResource[])[];
+  watchPlans?: readonly (DeterministicWatchPlan | readonly KubernetesWatchEvent[])[];
+}>;
+
+function deterministicListResult(value: KubernetesListResult | readonly KubernetesResource[]): KubernetesListResult {
+  if (Array.isArray(value)) return { resources: value as readonly KubernetesResource[] };
+  return value as KubernetesListResult;
+}
+
+function resourceVersionOf(resource: KubernetesResource): string | null {
+  return optionalString(resource.metadata.resourceVersion);
+}
+
+function greatestResourceVersion(resources: readonly KubernetesResource[]): string | null {
+  let greatest: string | null = null;
+  for (const resource of resources) {
+    const version = resourceVersionOf(resource);
+    if (!version) continue;
+    if (!greatest || compareResourceVersions(version, greatest) > 0) greatest = version;
+  }
+  return greatest;
+}
+
+export function compareResourceVersions(left: string, right: string): number {
+  const leftValue = left.trim();
+  const rightValue = right.trim();
+  if (/^\d+$/.test(leftValue) && /^\d+$/.test(rightValue)) {
+    const leftNumber = BigInt(leftValue);
+    const rightNumber = BigInt(rightValue);
+    return leftNumber < rightNumber ? -1 : leftNumber > rightNumber ? 1 : 0;
+  }
+  // Kubernetes may use opaque resource versions. Without an ordering contract,
+  // only equality is safe; callers retain the durable position on ambiguity.
+  return 0;
 }
 
 export class DeterministicKubernetesAdapter implements KubernetesObservationAdapter {
   readonly kind = "deterministic" as const;
   readonly contacted = false;
   readonly requests: ClusterScope[] = [];
+  readonly watchRequests: Readonly<{ scope: ClusterScope; resourceVersion: string | null }>[] = [];
+  private readonly listQueue: (KubernetesListResult | readonly KubernetesResource[])[];
+  private readonly watchQueue: (DeterministicWatchPlan | readonly KubernetesWatchEvent[])[];
 
-  constructor(private readonly resources: readonly KubernetesResource[]) {}
+  constructor(
+    private readonly resources: readonly KubernetesResource[],
+    options: DeterministicKubernetesAdapterOptions = {},
+  ) {
+    this.listQueue = [...(options.listResults ?? [])];
+    this.watchQueue = [...(options.watchPlans ?? [])];
+  }
 
-  async list(scope: ClusterScope): Promise<readonly KubernetesResource[]> {
+  enqueueList(result: KubernetesListResult | readonly KubernetesResource[]): void {
+    this.listQueue.push(result);
+  }
+
+  enqueueWatch(plan: DeterministicWatchPlan | readonly KubernetesWatchEvent[]): void {
+    this.watchQueue.push(plan);
+  }
+
+  async listResult(scope: ClusterScope, signal?: AbortSignal): Promise<KubernetesListResult> {
+    signal?.throwIfAborted();
     this.requests.push(scope);
-    return this.resources.filter((resource) => isResourceInScope(scope, resource));
+    const configured = this.listQueue.shift();
+    if (configured !== undefined) {
+      const result = deterministicListResult(configured);
+      return {
+        resources: result.resources.filter((resource) => isResourceInScope(scope, resource)),
+        ...(result.resourceVersion ? { resourceVersion: result.resourceVersion } : {}),
+      };
+    }
+    const scoped = this.resources.filter((resource) => isResourceInScope(scope, resource));
+    const resourceVersion = greatestResourceVersion(scoped);
+    return { resources: scoped, ...(resourceVersion ? { resourceVersion } : {}) };
+  }
+
+  async list(scope: ClusterScope, signal?: AbortSignal): Promise<readonly KubernetesResource[]> {
+    return (await this.listResult(scope, signal)).resources;
+  }
+
+  async watch(scope: ClusterScope, resourceVersion: string | null = null, signal?: AbortSignal): Promise<AsyncIterable<KubernetesWatchEvent>> {
+    signal?.throwIfAborted();
+    this.watchRequests.push({ scope, resourceVersion });
+    const configured = this.watchQueue.shift() ?? { events: [] };
+    const plan: DeterministicWatchPlan = Array.isArray(configured)
+      ? { events: configured as readonly KubernetesWatchEvent[] }
+      : configured as DeterministicWatchPlan;
+    return (async function* (): AsyncGenerator<KubernetesWatchEvent> {
+      for (const event of plan.events ?? []) {
+        if (signal?.aborted) return;
+        yield event;
+      }
+      if (plan.error && !signal?.aborted) throw plan.error;
+    })();
   }
 }
 
@@ -921,13 +1051,78 @@ function projectResourceResponse(value: unknown, namespace: string, kind: Suppor
   };
 }
 
+function parseKubernetesWatchEventValue(value: unknown): KubernetesWatchEvent {
+  const record = objectValue(value);
+  if (!record) throw new KubernetesWatchDisconnectedError("Kubernetes watch returned an invalid event");
+  const type = record.type;
+  if (type !== "ADDED" && type !== "MODIFIED" && type !== "DELETED" && type !== "BOOKMARK" && type !== "ERROR") {
+    throw new KubernetesWatchDisconnectedError("Kubernetes watch returned an invalid event type");
+  }
+  const resource = objectValue(record.object);
+  const metadata = objectValue(resource?.metadata);
+  // Status errors put code/reason on object itself, not under object.status.
+  const status = objectValue(resource?.status);
+  const rawCode = resource?.code ?? status?.code ?? record.code;
+  const statusCode = typeof rawCode === "number"
+    ? Number.isSafeInteger(rawCode) ? rawCode : undefined
+    : typeof rawCode === "string" && /^\d+$/.test(rawCode.trim()) ? Number(rawCode) : undefined;
+  const resourceVersion = optionalString(metadata?.resourceVersion) ?? optionalString(record.resourceVersion);
+  const reason = optionalString(resource?.reason) ?? optionalString(status?.reason) ?? optionalString(record.reason);
+  return {
+    type,
+    ...(resource ? { resource: resource as KubernetesResource } : {}),
+    ...(resourceVersion ? { resourceVersion } : {}),
+    ...(statusCode === undefined ? {} : { statusCode }),
+    ...(reason ? { reason } : {}),
+  };
+}
+
+export function parseKubernetesWatchEvent(line: string): KubernetesWatchEvent {
+  try {
+    return parseKubernetesWatchEventValue(JSON.parse(line));
+  } catch (error) {
+    if (error instanceof KubernetesWatchDisconnectedError) throw error;
+    throw new KubernetesWatchDisconnectedError("Kubernetes watch returned invalid JSON", { cause: error });
+  }
+}
+
+type KubernetesRequestMiddleware = Readonly<{
+  pre(context: RequestContext): Observable<RequestContext>;
+  post(context: ResponseContext): Observable<ResponseContext>;
+}>;
+
+function requestOptionsForSignal(signal: AbortSignal): { middleware: KubernetesRequestMiddleware[] } {
+  const middleware: KubernetesRequestMiddleware = {
+    pre: (context) => {
+      context.setSignal(signal);
+      return new Observable(Promise.resolve(context));
+    },
+    post: (context) => new Observable(Promise.resolve(context)),
+  };
+  return { middleware: [middleware] };
+}
+
+function watchCompletionError(value: unknown): Error {
+  if (value instanceof KubernetesWatchGoneError) return value;
+  const statusCode = typeof value === "object" && value !== null
+    ? "statusCode" in value
+      ? (value as { statusCode?: unknown }).statusCode
+      : "code" in value ? (value as { code?: unknown }).code : undefined
+    : undefined;
+  if (statusCode === 410) return new KubernetesWatchGoneError();
+  if (value instanceof KubernetesWatchDisconnectedError) return value;
+  return new KubernetesWatchDisconnectedError("Kubernetes watch disconnected", {
+    ...(value === undefined || value === null ? {} : { cause: value }),
+  });
+}
+
 export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter {
   readonly kind = "production" as const;
   contacted = false;
 
   constructor(readonly configuration: KubernetesAdapterConfiguration) {}
 
-  private endpointForScope(scope: ClusterScope, kind: SupportedResourceKind): URL {
+  private endpointForScope(scope: ClusterScope, kind: SupportedResourceKind = "Pod"): URL {
     const configuredEndpoint = new URL(this.configuration.endpoint);
     const scopeEndpoint = new URL(scope.endpoint);
     if (configuredEndpoint.protocol !== "https:" || scopeEndpoint.protocol !== "https:" || configuredEndpoint.origin !== scopeEndpoint.origin) {
@@ -936,37 +1131,192 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
     const basePath = scopeEndpoint.pathname.replace(/\/$/, "");
     const core = kind === "Pod";
     const group = kind === "Event" ? "events.k8s.io" : kind === "Deployment" || kind === "StatefulSet" || kind === "DaemonSet" || kind === "ReplicaSet" ? "apps" : "batch";
-    const version = kind === "Event" ? "v1" : kind === "Pod" ? "v1" : "v1";
+    const version = "v1";
     return new URL(`${basePath}/${core ? "api" : "apis"}/${core ? version : `${group}/${version}`}`, scope.endpoint);
   }
 
-  async list(scope: ClusterScope): Promise<readonly KubernetesResource[]> {
+  private kubeConfigForScope(scope: ClusterScope): KubeConfig {
+    const kubeConfig = new KubeConfig();
+    kubeConfig.loadFromOptions({
+      clusters: [{ name: "tracegarden-observation", server: scope.endpoint.replace(/\/+$/, ""), skipTLSVerify: false }],
+      users: [{ name: "tracegarden-observer", token: this.configuration.token }],
+      contexts: [{ name: "tracegarden-observation", cluster: "tracegarden-observation", user: "tracegarden-observer" }],
+      currentContext: "tracegarden-observation",
+    });
+    return kubeConfig;
+  }
+
+  async listResult(scope: ClusterScope, signal?: AbortSignal): Promise<KubernetesListResult> {
     const resources: KubernetesResource[] = [];
+    let listResourceVersion: string | null = null;
+    const coreApi = scope.resourceKinds.includes("Pod") ? this.kubeConfigForScope(scope).makeApiClient(CoreV1Api) : null;
     for (const kind of SUPPORTED_RESOURCE_KINDS) {
       if (!scope.resourceKinds.includes(kind)) continue;
       const apiEndpoint = this.endpointForScope(scope, kind);
       for (const namespace of scope.namespaces) {
-        const plural = `${kind.toLowerCase()}s`.replace("ingresss", "ingresses").replace("cronjobs", "cronjobs");
-        const endpoint = new URL(`${apiEndpoint.pathname}/namespaces/${encodeURIComponent(namespace)}/${plural}`, apiEndpoint.origin);
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10_000);
+        signal?.throwIfAborted();
         try {
           this.contacted = true;
-          const response = await fetch(endpoint, {
-            headers: { authorization: `Bearer ${this.configuration.token}`, accept: "application/json" },
-            signal: controller.signal,
-          });
-          if (!response.ok) throw new Error(`Kubernetes ${kind} list failed with HTTP ${response.status}`);
-          const body: unknown = await response.json();
+          let body: unknown;
+          if (kind === "Pod" && coreApi) {
+            body = signal
+              ? await coreApi.listNamespacedPod({ namespace }, requestOptionsForSignal(signal))
+              : await coreApi.listNamespacedPod({ namespace });
+          } else {
+            const plural = kind === "Event" ? "events" : `${kind.toLowerCase()}s`;
+            const endpoint = new URL(`${apiEndpoint.pathname}/namespaces/${encodeURIComponent(namespace)}/${plural}`, apiEndpoint.origin);
+            const response = await fetch(endpoint, {
+              headers: { authorization: `Bearer ${this.configuration.token}`, accept: "application/json" },
+              signal,
+            });
+            if (!response.ok) {
+              if (response.status === 410) throw new KubernetesWatchGoneError(`Kubernetes ${kind} list resource version is gone`);
+              throw new Error(`Kubernetes ${kind} list failed with HTTP ${response.status}`);
+            }
+            body = await response.json();
+          }
+          signal?.throwIfAborted();
+          const metadata = objectValue(body)?.metadata;
+          const responseResourceVersion = optionalString(objectValue(metadata)?.resourceVersion);
+          if (responseResourceVersion && (!listResourceVersion || compareResourceVersions(responseResourceVersion, listResourceVersion) > 0)) {
+            listResourceVersion = responseResourceVersion;
+          }
           const items = objectValue(body)?.items;
           if (!Array.isArray(items)) throw new Error(`Kubernetes ${kind} list returned an invalid response`);
           resources.push(...items.map((item) => projectResourceResponse(item, namespace, kind)));
-        } finally {
-          clearTimeout(timeout);
+        } catch (error) {
+          if (typeof error === "object" && error !== null
+            && (("statusCode" in error && (error as { statusCode?: unknown }).statusCode === 410)
+              || ("code" in error && (error as { code?: unknown }).code === 410))) {
+            throw new KubernetesWatchGoneError(`Kubernetes ${kind} list resource version is gone`);
+          }
+          throw error;
         }
       }
     }
-    return resources.filter((resource) => isResourceInScope(scope, resource));
+    return {
+      resources: resources.filter((resource) => isResourceInScope(scope, resource)),
+      ...(listResourceVersion ? { resourceVersion: listResourceVersion } : {}),
+    };
+  }
+
+  async list(scope: ClusterScope, signal?: AbortSignal): Promise<readonly KubernetesResource[]> {
+    return (await this.listResult(scope, signal)).resources;
+  }
+
+  private async watchNamespace(
+    scope: ClusterScope,
+    namespace: string,
+    resourceVersion: string | null,
+    signal?: AbortSignal,
+  ): Promise<AsyncIterable<KubernetesWatchEvent>> {
+    this.endpointForScope(scope);
+    const path = `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods`;
+    const queryParams = {
+      allowWatchBookmarks: true,
+      ...(resourceVersion ? { resourceVersion } : {}),
+    };
+    const events: KubernetesWatchEvent[] = [];
+    const watcher = new Watch(this.kubeConfigForScope(scope));
+    let wake: (() => void) | null = null;
+    let complete = false;
+    let failure: Error | null = null;
+    let requestController: AbortController | null = null;
+    const push = (event: KubernetesWatchEvent): void => {
+      if (complete || signal?.aborted) return;
+      events.push(event);
+      wake?.();
+      wake = null;
+    };
+    const finish = (error?: unknown): void => {
+      if (complete) return;
+      complete = true;
+      if (error !== undefined && error !== null) failure = watchCompletionError(error);
+      wake?.();
+      wake = null;
+    };
+    this.contacted = true;
+    const requestPromise = watcher.watch(
+      path,
+      queryParams,
+      (type, object, watchObject) => {
+        try {
+          const record = objectValue(watchObject) ?? {};
+          push(parseKubernetesWatchEventValue({ ...record, type, object }));
+        } catch (error) {
+          finish(error);
+        }
+      },
+      finish,
+    );
+    if (signal) {
+      let resolveAbort: (() => void) | null = null;
+      const abortPromise = new Promise<null>((resolve) => {
+        resolveAbort = () => resolve(null);
+      });
+      const abort = (): void => {
+        requestController?.abort();
+        resolveAbort?.();
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      try {
+        if (signal.aborted) abort();
+        const controller = await Promise.race([requestPromise, abortPromise]);
+        if (controller === null) {
+          void requestPromise.then((pendingController) => pendingController.abort(), () => undefined);
+          throw new DOMException("Kubernetes watch was aborted", "AbortError");
+        }
+        requestController = controller;
+      } catch (error) {
+        signal.removeEventListener("abort", abort);
+        throw error;
+      }
+      return (async function* (): AsyncGenerator<KubernetesWatchEvent> {
+        try {
+          while (events.length > 0 || (!complete && !signal.aborted)) {
+            if (events.length > 0) {
+              yield events.shift() as KubernetesWatchEvent;
+              continue;
+            }
+            if (failure) throw failure;
+            if (complete || signal.aborted) return;
+            await new Promise<void>((resolve) => { wake = resolve; });
+          }
+          if (failure) throw failure;
+        } finally {
+          signal.removeEventListener("abort", abort);
+          requestController?.abort();
+          finish();
+        }
+      })();
+    }
+    requestController = await requestPromise;
+    return (async function* (): AsyncGenerator<KubernetesWatchEvent> {
+      try {
+        while (events.length > 0 || !complete) {
+          if (events.length > 0) {
+            yield events.shift() as KubernetesWatchEvent;
+            continue;
+          }
+          if (failure) throw failure;
+          if (complete) return;
+          await new Promise<void>((resolve) => { wake = resolve; });
+        }
+        if (failure) throw failure;
+      } finally {
+        requestController?.abort();
+        finish();
+      }
+    })();
+  }
+
+  async watch(scope: ClusterScope, resourceVersion: string | null = null, signal?: AbortSignal): Promise<AsyncIterable<KubernetesWatchEvent>> {
+    if (!scope.resourceKinds.includes("Pod")) return (async function* (): AsyncGenerator<KubernetesWatchEvent> {})();
+    signal?.throwIfAborted();
+    if (scope.namespaces.length !== 1) throw new Error("Configured Kubernetes watch requires one namespace per stream");
+    const namespace = scope.namespaces[0];
+    if (!namespace) return (async function* (): AsyncGenerator<KubernetesWatchEvent> {})();
+    return this.watchNamespace(scope, namespace, resourceVersion, signal);
   }
 }
 

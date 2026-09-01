@@ -9,6 +9,7 @@ export type StatusResponse = Readonly<{
     collector?: ProcessState;
     clusterContacted?: boolean;
   }>;
+  signals?: Readonly<Record<string, number | string | boolean | null | readonly string[]>>;
 }>;
 
 export function state(ready: boolean): ProcessState {

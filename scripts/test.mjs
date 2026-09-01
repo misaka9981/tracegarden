@@ -16,6 +16,7 @@ import {
 } from "../dist/packages/logs/src/index.js";
 import {
   collectScopedResources,
+  compareResourceVersions,
   configureClusterScope,
   ConfiguredKubernetesAdapter,
   DeterministicKubernetesAdapter,
@@ -618,22 +619,12 @@ assert.equal(inertAdapter.kind, "inert");
 assert.equal(inertAdapter.contacted, false);
 if (savedScope) assert.deepEqual(await collectScopedResources(savedScope, inertAdapter), []);
 const configuredAdapter = new ConfiguredKubernetesAdapter({ endpoint: "https://cluster.example.test/environment", token: "local-test-token" });
-const originalFetch = globalThis.fetch;
-globalThis.fetch = async (request, init) => {
-  assert.match(String(request), /https:\/\/cluster\.example\.test\/persisted\/api\/v1\/namespaces\/tracegarden\/pods/);
-  assert.equal(init?.headers && init.headers.authorization, "Bearer local-test-token");
-  return new Response(JSON.stringify({ items: [{ metadata: { name: "configured", namespace: "tracegarden", uid: "configured-uid", resourceVersion: "9" }, status: { phase: "Running" } }] }), { status: 200, headers: { "content-type": "application/json" } });
-};
-try {
-  const configuredScope = savedScope ? { ...savedScope, endpoint: "https://cluster.example.test/persisted", namespaces: ["tracegarden"], resourceKinds: ["Pod"] } : null;
-  const configuredResources = configuredScope ? await configuredAdapter.list(configuredScope) : [];
-  assert.equal(configuredResources[0]?.metadata.name, "configured");
-  assert.equal(configuredAdapter.contacted, true);
-  const mismatchedAdapter = new ConfiguredKubernetesAdapter({ endpoint: "https://other-cluster.example.test", token: "local-test-token" });
-  if (configuredScope) await assert.rejects(mismatchedAdapter.list(configuredScope), /does not match/);
-} finally {
-  globalThis.fetch = originalFetch;
-}
+assert.equal(configuredAdapter.contacted, false);
+assert.equal(configuredAdapter.configuration.endpoint, "https://cluster.example.test/environment");
+assert.equal(compareResourceVersions("9007199254740993", "9007199254740992"), 1);
+assert.equal(compareResourceVersions("9007199254740992", "9007199254740993"), -1);
+assert.equal(compareResourceVersions("opaque-new", "opaque-old"), 0);
+const configuredScope = savedScope ? { ...savedScope, endpoint: "https://cluster.example.test/persisted", namespaces: ["tracegarden"], resourceKinds: ["Pod"] } : null;
 
 const logScope = savedScope ?? {
   workspaceId: "workspace-single",

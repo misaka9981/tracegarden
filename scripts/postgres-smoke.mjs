@@ -59,8 +59,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations');");
-  assert.equal(migrationCount, "8");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints');");
+  assert.equal(migrationCount, "9");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -236,6 +236,83 @@ try {
   }
   assert.equal(await collectorDatabase.timeline.countObservations("workspace-single"), 4);
   assert.equal(await collectorDatabase.timeline.countTimelineEntries("workspace-single"), 4);
+  // Checkpoint writes remain transactional and compare opaque and large numeric versions safely.
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([firstObservation[0].observation], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: "local-postgres-smoke",
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "7",
+  });
+  assert.equal((await collectorDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"))?.resourceVersion, "7");
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: "local-postgres-smoke",
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "opaque-1",
+  });
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: "local-postgres-smoke",
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "opaque-2",
+  });
+  assert.equal((await collectorDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"))?.resourceVersion, "opaque-2");
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: "local-postgres-smoke",
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "9007199254740993",
+  });
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: "local-postgres-smoke",
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "9007199254740992",
+  });
+  assert.equal((await collectorDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"))?.resourceVersion, "9007199254740993");
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([firstObservation[0].observation], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: observationScope.clusterId,
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "7",
+  });
+  assert.equal((await collectorDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"))?.resourceVersion, "7");
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: observationScope.clusterId,
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "opaque-1",
+  });
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: observationScope.clusterId,
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "opaque-2",
+  });
+  assert.equal((await collectorDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"))?.resourceVersion, "opaque-2");
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: observationScope.clusterId,
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "9007199254740993",
+  });
+  await collectorDatabase.timeline.recordObservationsAndCheckpoint([], {
+    workspaceId: observationScope.workspaceId,
+    clusterId: observationScope.clusterId,
+    namespace: "tracegarden",
+    resourceKind: "Pod",
+    resourceVersion: "9007199254740992",
+  });
+  assert.equal((await collectorDatabase.timeline.getIngestionCheckpoint("workspace-single", "local-postgres-smoke", "Pod", "tracegarden"))?.resourceVersion, "9007199254740993");
   const timelineResponse = await fetch(`http://127.0.0.1:${webPort}/api/timeline?limit=10`, { headers: { cookie: ownerCookie } });
   assert.equal(timelineResponse.status, 200);
   const timelineBody = await timelineResponse.json();
