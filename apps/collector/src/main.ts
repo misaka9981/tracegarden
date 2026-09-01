@@ -3,11 +3,11 @@ import { state, type StatusResponse } from "../../../packages/contracts/src/inde
 import {
   collectScopedResources,
   createKubernetesAdapter,
-  normalizePodObservation,
+  normalizeObservation,
   type ClusterScope,
   type KubernetesObservationAdapter,
   type KubernetesResource,
-  type NormalizedPodObservation,
+  type NormalizedObservation,
 } from "../../../packages/cluster/src/index.js";
 import { createDatabase, type DatabaseBoundary, type ObservationPersistenceResult, type TimelineStore } from "../../../packages/db/src/index.js";
 import { WORKSPACE_ID } from "../../../packages/identity/src/index.js";
@@ -34,7 +34,7 @@ export type CollectorRuntime = Readonly<{
   server: Server;
   status: () => StatusResponse;
   collect: () => Promise<readonly KubernetesResource[]>;
-  collectNormalized: () => Promise<readonly NormalizedPodObservation[]>;
+  collectNormalized: () => Promise<readonly NormalizedObservation[]>;
   collectObservations: () => Promise<readonly ObservationPersistenceResult[]>;
   close: () => Promise<void>;
 }>;
@@ -72,13 +72,11 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
     const scope = await configuredScope();
     return scope ? collectScopedResources(scope, adapter) : [];
   };
-  const collectNormalized = async (): Promise<readonly NormalizedPodObservation[]> => {
+  const collectNormalized = async (): Promise<readonly NormalizedObservation[]> => {
     const scope = await configuredScope();
     if (!scope) return [];
     const resources = await collectScopedResources(scope, adapter);
-    return resources
-      .filter((resource) => resource.kind === "Pod")
-      .map((resource) => normalizePodObservation(scope, resource));
+    return resources.map((resource) => normalizeObservation(scope, resource));
   };
   const collectObservations = async (): Promise<readonly ObservationPersistenceResult[]> => {
     if (!observationStore) throw new CollectorRecoveryError("Collector recovery boundary: observation persistence is unavailable");
@@ -91,7 +89,7 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
       return persisted;
     } catch (error) {
       if (error instanceof CollectorRecoveryError) throw error;
-      throw new CollectorRecoveryError("Collector recovery boundary: Pod observation persistence failed", { cause: error });
+      throw new CollectorRecoveryError("Collector recovery boundary: observation persistence failed", { cause: error });
     }
   };
   const runtimeStatus = (): StatusResponse => {

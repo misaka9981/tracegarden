@@ -232,16 +232,59 @@ function renderClusterSection(
     </section>`;
 }
 
+function resourceKindLabel(kind: TimelineEntry["observation"]["kind"], messages: Messages): string {
+  if (kind === "Pod") return messages.podObservation;
+  const labels: Record<TimelineEntry["observation"]["kind"], string> = {
+    Deployment: messages.resourceKindDeployment,
+    StatefulSet: messages.resourceKindStatefulSet,
+    DaemonSet: messages.resourceKindDaemonSet,
+    ReplicaSet: messages.resourceKindReplicaSet,
+    Pod: messages.resourceKindPod,
+    Job: messages.resourceKindJob,
+    CronJob: messages.resourceKindCronJob,
+    Event: messages.resourceKindEvent,
+  };
+  return labels[kind];
+}
+
+function observationStateLabel(entry: TimelineEntry, messages: Messages): string {
+  if (entry.recoveryOf || entry.observation.classification === "recovery") return messages.recovery;
+  if (entry.attentionItem || entry.observation.classification === "attention") return messages.attentionItem;
+  return messages.observationChange;
+}
+
+function observationDetail(entry: TimelineEntry, messages: Messages): string {
+  const observation = entry.observation;
+  const recovery = observation.classification === "recovery" || entry.recoveryOf !== null;
+  if (observation.kind === "Pod") return observation.phase ?? messages.timelineUnknownState;
+  if (observation.kind === "Event") return observation.reason ?? observation.eventType ?? messages.timelineUnknownState;
+  if (observation.kind === "Job") {
+    if (recovery) return messages.recovery;
+    if (entry.attentionItem || observation.classification === "attention") return messages.attentionItem;
+    return observation.completionTime ?? messages.timelineUnknownState;
+  }
+  if (observation.kind === "CronJob") return observation.suspend ? messages.attentionItem : observation.schedule ?? messages.timelineUnknownState;
+  return observation.revision ?? messages.timelineUnknownState;
+}
+
+function attentionReasonLabel(entry: TimelineEntry, messages: Messages): string {
+  return entry.attentionReason ? messages.attentionReasonLabels[entry.attentionReason] ?? messages.timelineUnknownState : messages.timelineUnknownState;
+}
+
 function renderTimelineSection(messages: Messages, entries: readonly TimelineEntry[]): string {
   const rows = entries.map((entry) => {
     const observation = entry.observation;
-    const state = observation.phase ?? messages.timelineUnknownState;
+    const owners = (observation.ownerReferences ?? []).map((owner) => `${owner.kind}/${owner.name}`).join(", ");
     return `<article data-entry-id="${escapeHtml(entry.id)}">
-        <h3>${escapeHtml(messages.podObservation)}</h3>
-        <p>${escapeHtml(observation.namespace)}/${escapeHtml(observation.name)} · ${escapeHtml(state)}</p>
+        <h3>${escapeHtml(resourceKindLabel(observation.kind, messages))} · ${escapeHtml(observationStateLabel(entry, messages))}</h3>
+        <p>${escapeHtml(observation.namespace)}/${escapeHtml(observation.name)} · ${escapeHtml(observationDetail(entry, messages))}</p>
+        ${entry.attentionItem ? `<p class="error"><strong>${escapeHtml(messages.attentionItem)}:</strong> ${escapeHtml(attentionReasonLabel(entry, messages))}</p>` : ""}
+        ${entry.recoveryOf || observation.classification === "recovery" ? `<p class="notice">${escapeHtml(messages.recovery)}</p>` : ""}
         <dl>
           <dt>${escapeHtml(messages.clusterName)}</dt><dd>${escapeHtml(entry.clusterId)}</dd>
           <dt>${escapeHtml(messages.resourceIdentity)}</dt><dd>${escapeHtml(observation.sourceIdentity)}</dd>
+          <dt>${escapeHtml(messages.ownership)}</dt><dd>${escapeHtml(owners || messages.timelineUnknownState)}</dd>
+          <dt>${escapeHtml(messages.revision)}</dt><dd>${escapeHtml(observation.revision ?? messages.timelineUnknownState)}</dd>
           <dt>${escapeHtml(messages.observedAt)}</dt><dd>${escapeHtml(entry.occurredAt)}</dd>
         </dl>
       </article>`;

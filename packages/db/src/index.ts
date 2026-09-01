@@ -36,9 +36,12 @@ import {
 import { randomUUID } from "node:crypto";
 import {
   MemoryClusterScopeStore,
+  type AttentionReasonCode,
   type ClusterScope,
   type ClusterScopeStore,
+  type NormalizedObservation,
   type NormalizedPodObservation,
+  markRecovery,
 } from "../../cluster/src/index.js";
 
 export type DatabaseStatus = "ready" | "not-ready";
@@ -60,6 +63,7 @@ export const MEMBERSHIP_MIGRATION_ID = "0004_membership_management";
 export const CLUSTER_SCOPE_MIGRATION_ID = "0005_cluster_scope";
 export const OBSERVATION_TIMELINE_MIGRATION_ID = "0006_observation_timeline";
 export const RECENT_LOGS_MIGRATION_ID = "0007_recent_logs";
+export const NORMALIZED_OBSERVATION_MIGRATION_ID = "0008_normalized_observations";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -70,7 +74,8 @@ const migrations: readonly Migration[] = [
   { id: MEMBERSHIP_MIGRATION_ID, path: "../migrations/0004_membership_management.sql" },
   { id: CLUSTER_SCOPE_MIGRATION_ID, path: "../migrations/0005_cluster_scope.sql" },
   { id: OBSERVATION_TIMELINE_MIGRATION_ID, path: "../migrations/0006_observation_timeline.sql" },
-  { id: RECENT_LOGS_MIGRATION_ID, path: "../migrations/0007_recent_logs.sql" }
+  { id: RECENT_LOGS_MIGRATION_ID, path: "../migrations/0007_recent_logs.sql" },
+  { id: NORMALIZED_OBSERVATION_MIGRATION_ID, path: "../migrations/0008_normalized_observations.sql" },
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -270,11 +275,14 @@ export type TimelineEntry = Readonly<{
   clusterId: string;
   entryType: "observation";
   occurredAt: string;
-  observation: NormalizedPodObservation;
+  attentionItem: boolean;
+  attentionReason: AttentionReasonCode | null;
+  recoveryOf: string | null;
+  observation: NormalizedObservation;
 }>;
 
 export type ObservationPersistenceResult = Readonly<{
-  observation: NormalizedPodObservation;
+  observation: NormalizedObservation;
   entry: TimelineEntry;
   duplicate: boolean;
 }>;
@@ -332,8 +340,8 @@ export function parseTimelineQuery(input: unknown): TimelineQuery {
 }
 
 export interface TimelineStore {
-  recordObservation(observation: NormalizedPodObservation): Promise<ObservationPersistenceResult>;
-  recordObservations?(observations: readonly NormalizedPodObservation[]): Promise<readonly ObservationPersistenceResult[]>;
+  recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult>;
+  recordObservations?(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]>;
   listTimelineEntries(workspaceId: string, query: TimelineQuery): Promise<TimelinePage>;
   getTimelineEntry(workspaceId: string, id: string): Promise<TimelineEntry | null>;
   countObservations(workspaceId: string): Promise<number>;
@@ -342,16 +350,34 @@ export interface TimelineStore {
 
 export type ObservationStore = TimelineStore;
 
-function observationKey(observation: NormalizedPodObservation): string {
+function observationKey(observation: NormalizedObservation): string {
   return `${observation.workspaceId}\u0000${observation.clusterId}\u0000${observation.sourceKey}`;
 }
 
-function cloneObservation(observation: NormalizedPodObservation): NormalizedPodObservation {
-  return { ...observation };
+function cloneObservation(observation: NormalizedObservation): NormalizedObservation {
+  return {
+    ...observation,
+    ownerReferences: [...observation.ownerReferences],
+    labels: { ...observation.labels },
+  };
 }
 
 function cloneEntry(entry: TimelineEntry): TimelineEntry {
   return { ...entry, observation: cloneObservation(entry.observation) };
+}
+
+function timelineEntryFor(observation: NormalizedObservation): TimelineEntry {
+  return {
+    id: randomUUID(),
+    workspaceId: observation.workspaceId,
+    clusterId: observation.clusterId,
+    entryType: "observation",
+    occurredAt: observation.observedAt,
+    attentionItem: observation.attention,
+    attentionReason: observation.attentionReason,
+    recoveryOf: observation.recoveryOf,
+    observation,
+  };
 }
 
 function pageFromEntries(entries: readonly TimelineEntry[], query: TimelineQuery): TimelinePage {
@@ -368,19 +394,22 @@ function pageFromEntries(entries: readonly TimelineEntry[], query: TimelineQuery
 }
 
 export class MemoryObservationStore implements TimelineStore {
-  private readonly observations = new Map<string, NormalizedPodObservation>();
+  private readonly observations = new Map<string, NormalizedObservation>();
   private readonly entries = new Map<string, TimelineEntry>();
+  private readonly ingestionOrders = new Map<string, bigint>();
+  private nextIngestionOrder = 0n;
 
-  async recordObservation(observation: NormalizedPodObservation): Promise<ObservationPersistenceResult> {
+  async recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult> {
     const results = await this.recordObservations([observation]);
     const result = results[0];
     if (!result) throw new Error("Observation persistence returned no row");
     return result;
   }
 
-  async recordObservations(observations: readonly NormalizedPodObservation[]): Promise<readonly ObservationPersistenceResult[]> {
+  async recordObservations(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]> {
     const pendingObservations = new Map(this.observations);
     const pendingEntries = new Map(this.entries);
+    const pendingOrders = new Map(this.ingestionOrders);
     const results: ObservationPersistenceResult[] = [];
     for (const observation of observations) {
       const key = observationKey(observation);
@@ -391,23 +420,26 @@ export class MemoryObservationStore implements TimelineStore {
         results.push({ observation: cloneObservation(existing), entry: cloneEntry(entry), duplicate: true });
         continue;
       }
-      const storedObservation = cloneObservation(observation);
-      const entry: TimelineEntry = {
-        id: randomUUID(),
-        workspaceId: observation.workspaceId,
-        clusterId: observation.clusterId,
-        entryType: "observation",
-        occurredAt: observation.observedAt,
-        observation: storedObservation,
-      };
+      const previous = [...pendingObservations.entries()]
+        .filter(([, candidate]) => candidate.workspaceId === observation.workspaceId && candidate.clusterId === observation.clusterId && candidate.sourceIdentity === observation.sourceIdentity)
+        .sort(([leftKey], [rightKey]) => {
+          const leftOrder = pendingOrders.get(leftKey) ?? 0n;
+          const rightOrder = pendingOrders.get(rightKey) ?? 0n;
+          return leftOrder < rightOrder ? 1 : leftOrder > rightOrder ? -1 : 0;
+        })[0]?.[1] ?? null;
+      const storedObservation = cloneObservation(markRecovery(observation, previous));
+      const entry = timelineEntryFor(storedObservation);
       pendingObservations.set(key, storedObservation);
       pendingEntries.set(entry.id, entry);
+      pendingOrders.set(key, ++this.nextIngestionOrder);
       results.push({ observation: cloneObservation(storedObservation), entry: cloneEntry(entry), duplicate: false });
     }
     this.observations.clear();
     for (const [key, observation] of pendingObservations) this.observations.set(key, observation);
     this.entries.clear();
     for (const [id, entry] of pendingEntries) this.entries.set(id, entry);
+    this.ingestionOrders.clear();
+    for (const [key, order] of pendingOrders) this.ingestionOrders.set(key, order);
     return results;
   }
 
@@ -432,6 +464,10 @@ export class MemoryObservationStore implements TimelineStore {
 export const MemoryTimelineStore = MemoryObservationStore;
 
 export async function recordPodObservation(store: TimelineStore, observation: NormalizedPodObservation): Promise<ObservationPersistenceResult> {
+  return store.recordObservation(observation);
+}
+
+export async function recordObservation(store: TimelineStore, observation: NormalizedObservation): Promise<ObservationPersistenceResult> {
   return store.recordObservation(observation);
 }
 
@@ -485,7 +521,7 @@ type ObservationRow = Readonly<{
   id: string;
   workspace_id: string;
   cluster_id: string;
-  kind: "Pod";
+  kind: NormalizedObservation["kind"];
   source_identity: string;
   source_key: string;
   uid: string;
@@ -494,6 +530,7 @@ type ObservationRow = Readonly<{
   resource_version: string | null;
   facts: Record<string, unknown>;
   observed_at: string | Date;
+  ingestion_order: string | number;
 }>;
 
 type TimelineJoinRow = Readonly<{
@@ -505,7 +542,7 @@ type TimelineJoinRow = Readonly<{
   observation_id: string;
   workspace_id: string;
   cluster_id: string;
-  kind: "Pod";
+  kind: NormalizedObservation["kind"];
   source_identity: string;
   source_key: string;
   uid: string;
@@ -514,27 +551,59 @@ type TimelineJoinRow = Readonly<{
   resource_version: string | null;
   facts: Record<string, unknown>;
   observed_at: string | Date;
+  ingestion_order: string | number;
 }>;
 
-function normalizedFacts(observation: NormalizedPodObservation): Record<string, unknown> {
-  return {
-    kind: observation.kind,
-    name: observation.name,
-    namespace: observation.namespace,
-    uid: observation.uid,
-    resourceVersion: observation.resourceVersion,
-    phase: observation.phase,
-    ready: observation.ready,
-    reason: observation.reason,
-  };
+function normalizedFacts(observation: NormalizedObservation): Record<string, unknown> {
+  return { ...observation };
 }
 
-function observationFromRow(row: ObservationRow): NormalizedPodObservation {
-  const phase = row.facts.phase;
-  const ready = row.facts.ready;
-  const reason = row.facts.reason;
+function factString(facts: Record<string, unknown>, key: string): string | null {
+  return typeof facts[key] === "string" ? facts[key] as string : null;
+}
+
+function factNumber(facts: Record<string, unknown>, key: string): number | null {
+  const value = facts[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function factBoolean(facts: Record<string, unknown>, key: string): boolean | null {
+  return typeof facts[key] === "boolean" ? facts[key] as boolean : null;
+}
+
+function factAttentionReason(facts: Record<string, unknown>): AttentionReasonCode | null {
+  const value = facts.attentionReason;
+  const codes: readonly AttentionReasonCode[] = [
+    "condition_failed",
+    "pod_not_ready",
+    "deployment_replicas_unavailable",
+    "statefulset_replicas_not_ready",
+    "daemonset_nodes_not_ready",
+    "replicaset_replicas_not_ready",
+    "job_failed",
+    "cronjob_suspended",
+    "event_warning",
+  ];
+  return typeof value === "string" && codes.includes(value as AttentionReasonCode) ? value as AttentionReasonCode : null;
+}
+
+function commonObservation(row: ObservationRow): Omit<NormalizedObservation, "kind"> {
+  const facts = row.facts;
+  const rawClassification = factString(facts, "classification");
+  const classification = rawClassification === "attention" || rawClassification === "recovery" ? rawClassification : "change";
+  const rawOwners = facts.ownerReferences;
+  const ownerReferences = Array.isArray(rawOwners) ? rawOwners.flatMap((item) => {
+    if (typeof item !== "object" || item === null) return [];
+    const owner = item as Record<string, unknown>;
+    if (typeof owner.kind !== "string" || typeof owner.name !== "string") return [];
+    return [{ kind: owner.kind, name: owner.name, uid: typeof owner.uid === "string" ? owner.uid : null, controller: owner.controller === true }];
+  }) : [];
+  const rawLabels = facts.labels;
+  const labels: Record<string, string> = {};
+  if (typeof rawLabels === "object" && rawLabels !== null) {
+    for (const [key, value] of Object.entries(rawLabels)) if (typeof value === "string") labels[key] = value;
+  }
   return {
-    kind: "Pod",
     workspaceId: row.workspace_id,
     clusterId: row.cluster_id,
     sourceIdentity: row.source_identity,
@@ -543,34 +612,60 @@ function observationFromRow(row: ObservationRow): NormalizedPodObservation {
     name: row.name,
     namespace: row.namespace,
     resourceVersion: row.resource_version,
-    phase: typeof phase === "string" ? phase : null,
-    ready: typeof ready === "boolean" ? ready : null,
-    reason: typeof reason === "string" ? reason : null,
+    classification,
+    attention: factBoolean(facts, "attention") ?? classification === "attention",
+    attentionReason: factAttentionReason(facts),
+    recoveryOf: factString(facts, "recoveryOf"),
+    reason: factString(facts, "reason"),
+    message: factString(facts, "message"),
+    ownerReferences,
+    revision: factString(facts, "revision"),
+    labels,
     observedAt: timestamp(row.observed_at) ?? new Date(0).toISOString(),
   };
 }
 
+function observationFromRow(row: ObservationRow): NormalizedObservation {
+  const facts = row.facts;
+  const common = commonObservation(row);
+  switch (row.kind) {
+    case "Deployment": return { ...common, kind: row.kind, desiredReplicas: factNumber(facts, "desiredReplicas"), availableReplicas: factNumber(facts, "availableReplicas"), readyReplicas: factNumber(facts, "readyReplicas"), updatedReplicas: factNumber(facts, "updatedReplicas"), unavailableReplicas: factNumber(facts, "unavailableReplicas") };
+    case "StatefulSet": return { ...common, kind: row.kind, desiredReplicas: factNumber(facts, "desiredReplicas"), readyReplicas: factNumber(facts, "readyReplicas"), currentReplicas: factNumber(facts, "currentReplicas"), updatedReplicas: factNumber(facts, "updatedReplicas"), currentRevision: factString(facts, "currentRevision"), updateRevision: factString(facts, "updateRevision") };
+    case "DaemonSet": return { ...common, kind: row.kind, desiredReplicas: factNumber(facts, "desiredReplicas"), currentReplicas: factNumber(facts, "currentReplicas"), readyReplicas: factNumber(facts, "readyReplicas"), updatedReplicas: factNumber(facts, "updatedReplicas"), availableReplicas: factNumber(facts, "availableReplicas"), unavailableReplicas: factNumber(facts, "unavailableReplicas") };
+    case "ReplicaSet": return { ...common, kind: row.kind, desiredReplicas: factNumber(facts, "desiredReplicas"), currentReplicas: factNumber(facts, "currentReplicas"), readyReplicas: factNumber(facts, "readyReplicas"), availableReplicas: factNumber(facts, "availableReplicas") };
+    case "Pod": return { ...common, kind: row.kind, phase: factString(facts, "phase"), ready: factBoolean(facts, "ready") };
+    case "Job": return { ...common, kind: row.kind, desiredCompletions: factNumber(facts, "desiredCompletions"), active: factNumber(facts, "active"), succeeded: factNumber(facts, "succeeded"), failed: factNumber(facts, "failed"), completionTime: factString(facts, "completionTime") };
+    case "CronJob": return { ...common, kind: row.kind, schedule: factString(facts, "schedule"), suspend: factBoolean(facts, "suspend"), active: factNumber(facts, "active"), lastScheduleTime: factString(facts, "lastScheduleTime"), lastSuccessfulTime: factString(facts, "lastSuccessfulTime") };
+    case "Event": return { ...common, kind: row.kind, eventType: factString(facts, "eventType"), count: factNumber(facts, "count"), firstTimestamp: factString(facts, "firstTimestamp"), lastTimestamp: factString(facts, "lastTimestamp"), involvedKind: factString(facts, "involvedKind"), involvedName: factString(facts, "involvedName"), involvedNamespace: factString(facts, "involvedNamespace"), involvedUid: factString(facts, "involvedUid") };
+  }
+}
+
 function timelineEntryFromRow(row: TimelineJoinRow): TimelineEntry {
+  const observation = observationFromRow({
+    id: row.observation_id,
+    workspace_id: row.workspace_id,
+    cluster_id: row.cluster_id,
+    kind: row.kind,
+    source_identity: row.source_identity,
+    source_key: row.source_key,
+    uid: row.uid,
+    name: row.name,
+    namespace: row.namespace,
+    resource_version: row.resource_version,
+    facts: row.facts,
+    observed_at: row.observed_at,
+    ingestion_order: row.ingestion_order,
+  });
   return {
     id: row.entry_id,
     workspaceId: row.entry_workspace_id,
     clusterId: row.entry_cluster_id,
     entryType: "observation",
     occurredAt: timestamp(row.occurred_at) ?? new Date(0).toISOString(),
-    observation: observationFromRow({
-      id: row.observation_id,
-      workspace_id: row.workspace_id,
-      cluster_id: row.cluster_id,
-      kind: row.kind,
-      source_identity: row.source_identity,
-      source_key: row.source_key,
-      uid: row.uid,
-      name: row.name,
-      namespace: row.namespace,
-      resource_version: row.resource_version,
-      facts: row.facts,
-      observed_at: row.observed_at,
-    }),
+    attentionItem: observation.attention,
+    attentionReason: observation.attentionReason,
+    recoveryOf: observation.recoveryOf,
+    observation,
   };
 }
 
@@ -578,28 +673,42 @@ const timelineSelect = `
   SELECT t.id AS entry_id, t.workspace_id AS entry_workspace_id, t.cluster_id AS entry_cluster_id,
          t.entry_type, t.occurred_at, o.id AS observation_id, o.workspace_id, o.cluster_id,
          o.kind, o.source_identity, o.source_key, o.uid, o.name, o.namespace,
-         o.resource_version, o.facts, o.observed_at
+         o.resource_version, o.facts, o.observed_at, o.ingestion_order
     FROM tracegarden_timeline_entries t
     JOIN tracegarden_observations o ON o.id = t.observation_id`;
+
+const observationSelect = `
+  SELECT id, workspace_id, cluster_id, kind, source_identity, source_key, uid, name, namespace,
+         resource_version, facts, observed_at, ingestion_order
+    FROM tracegarden_observations`;
 
 export class PostgresObservationStore implements TimelineStore {
   constructor(private readonly poolProvider: PoolProvider) {}
 
   private async recordObservationInTransaction(
     client: { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[]; rowCount: number }> },
-    observation: NormalizedPodObservation,
+    observation: NormalizedObservation,
   ): Promise<ObservationPersistenceResult> {
+    const previousResult = await client.query<ObservationRow>(
+      `${observationSelect}
+        WHERE workspace_id = $1 AND cluster_id = $2 AND source_identity = $3
+        ORDER BY ingestion_order DESC LIMIT 1`,
+      [observation.workspaceId, observation.clusterId, observation.sourceIdentity],
+    );
+    const previous = previousResult.rows[0] ? observationFromRow(previousResult.rows[0]) : null;
+    const storedObservation = markRecovery(observation, previous);
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO tracegarden_observations
          (id, workspace_id, cluster_id, kind, source_identity, source_key, uid, name, namespace,
-          resource_version, facts, observed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+          resource_version, facts, observed_at, ingestion_order)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12,
+               nextval('tracegarden_observation_ingestion_order_seq'))
        ON CONFLICT (workspace_id, cluster_id, source_key) DO NOTHING
        RETURNING id`,
       [
-        randomUUID(), observation.workspaceId, observation.clusterId, observation.kind,
-        observation.sourceIdentity, observation.sourceKey, observation.uid, observation.name,
-        observation.namespace, observation.resourceVersion, JSON.stringify(normalizedFacts(observation)), observation.observedAt,
+        randomUUID(), storedObservation.workspaceId, storedObservation.clusterId, storedObservation.kind,
+        storedObservation.sourceIdentity, storedObservation.sourceKey, storedObservation.uid, storedObservation.name,
+        storedObservation.namespace, storedObservation.resourceVersion, JSON.stringify(normalizedFacts(storedObservation)), storedObservation.observedAt,
       ],
     );
     const observationId = inserted.rows[0]?.id ?? (await client.query<{ id: string }>(
@@ -614,7 +723,7 @@ export class PostgresObservationStore implements TimelineStore {
          (id, workspace_id, cluster_id, entry_type, observation_id, occurred_at)
        VALUES ($1, $2, $3, 'observation', $4, $5)
        ON CONFLICT (observation_id) DO NOTHING`,
-      [randomUUID(), observation.workspaceId, observation.clusterId, observationId, observation.observedAt],
+      [randomUUID(), observation.workspaceId, observation.clusterId, observationId, storedObservation.observedAt],
     );
     const result = await client.query<TimelineJoinRow>(`${timelineSelect} WHERE t.observation_id = $1`, [observationId]);
     const row = result.rows[0];
@@ -623,19 +732,29 @@ export class PostgresObservationStore implements TimelineStore {
     return { observation: entry.observation, entry, duplicate };
   }
 
-  async recordObservation(observation: NormalizedPodObservation): Promise<ObservationPersistenceResult> {
+  async recordObservation(observation: NormalizedObservation): Promise<ObservationPersistenceResult> {
     const results = await this.recordObservations([observation]);
     const result = results[0];
     if (!result) throw new Error("Observation persistence returned no row");
     return result;
   }
 
-  async recordObservations(observations: readonly NormalizedPodObservation[]): Promise<readonly ObservationPersistenceResult[]> {
+  async recordObservations(observations: readonly NormalizedObservation[]): Promise<readonly ObservationPersistenceResult[]> {
     if (observations.length === 0) return [];
     const pool = await this.poolProvider();
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      const lockTargets = [...new Map(observations.map((observation) => [
+        `${observation.workspaceId}\u0000${observation.clusterId}\u0000${observation.sourceIdentity}`,
+        observation,
+      ]))].sort(([left], [right]) => left.localeCompare(right));
+      for (const [, observation] of lockTargets) {
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2 || ':' || $3))",
+          [observation.workspaceId, observation.clusterId, observation.sourceIdentity],
+        );
+      }
       const results: ObservationPersistenceResult[] = [];
       for (const observation of observations) results.push(await this.recordObservationInTransaction(client, observation));
       await client.query("COMMIT");

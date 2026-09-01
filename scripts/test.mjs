@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
-import { createWebRuntime, renderStatusPage } from "../dist/apps/web/src/server.js";
+import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../dist/apps/web/src/server.js";
 import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
@@ -21,6 +21,7 @@ import {
   DeterministicKubernetesAdapter,
   createKubernetesAdapter,
   hasClusterConfigureCapability,
+  normalizeObservation,
   normalizePodObservation,
   productionKubernetesConfiguration,
   validateClusterScopeInput,
@@ -358,6 +359,155 @@ const normalizedPod = savedScope ? normalizePodObservation(savedScope, scopedRes
 assert.equal(normalizedPod?.sourceIdentity, "lab-cluster:pod-uid-1");
 assert.equal(normalizedPod?.phase, "Running");
 assert.equal(normalizedPod?.ready, true);
+const eventScope = savedScope ? { ...savedScope, resourceKinds: ["Event"] } : null;
+const modernEvent = eventScope ? normalizeObservation(eventScope, {
+  kind: "Event",
+  metadata: { name: "modern-event", namespace: "tracegarden", uid: "event-uid-modern", resourceVersion: "1" },
+  regarding: { apiVersion: "v1", kind: "Pod", name: "api", namespace: "tracegarden", uid: "pod-uid-1" },
+  type: "Warning",
+  reason: "FailedScheduling",
+  note: "the scheduler could not place the Pod",
+  eventTime: "2026-01-01T00:00:00.000Z",
+  series: { count: 3, lastObservedTime: "2026-01-01T00:00:02.000Z" },
+}, "2026-01-01T00:00:02.000Z") : null;
+assert.equal(modernEvent?.message, "the scheduler could not place the Pod");
+assert.equal(modernEvent?.count, 3);
+assert.equal(modernEvent?.involvedKind, "Pod");
+assert.equal(modernEvent?.involvedUid, "pod-uid-1");
+assert.equal(modernEvent?.firstTimestamp, "2026-01-01T00:00:00.000Z");
+assert.equal(modernEvent?.lastTimestamp, "2026-01-01T00:00:02.000Z");
+assert.equal(modernEvent?.reason, "FailedScheduling");
+assert.equal(modernEvent?.attentionReason, "event_warning");
+const legacyEvent = eventScope ? normalizeObservation(eventScope, {
+  kind: "Event",
+  metadata: { name: "legacy-event", namespace: "tracegarden", uid: "event-uid-legacy", resourceVersion: "1" },
+  involvedObject: { kind: "Deployment", name: "api", namespace: "tracegarden", uid: "deployment-uid" },
+  type: "Normal",
+  reason: "ScalingReplicaSet",
+  message: "scaled",
+  count: 2,
+  firstTimestamp: "2026-01-01T00:00:01.000Z",
+  lastTimestamp: "2026-01-01T00:00:03.000Z",
+}, "2026-01-01T00:00:03.000Z") : null;
+assert.equal(legacyEvent?.message, "scaled");
+assert.equal(legacyEvent?.count, 2);
+assert.equal(legacyEvent?.involvedKind, "Deployment");
+assert.equal(legacyEvent?.lastTimestamp, "2026-01-01T00:00:03.000Z");
+const invalidNumbers = savedScope ? normalizeObservation(savedScope, {
+  kind: "Deployment",
+  metadata: { name: "invalid-numbers", namespace: "tracegarden", uid: "invalid-numbers" },
+  spec: { replicas: -1 },
+  status: { availableReplicas: 1.5, readyReplicas: "9007199254740992" },
+}, "2026-01-01T00:00:00.000Z") : null;
+assert.equal(invalidNumbers?.desiredReplicas, null);
+assert.equal(invalidNumbers?.availableReplicas, null);
+assert.equal(invalidNumbers?.readyReplicas, null);
+const upstreamCondition = savedScope ? normalizeObservation(savedScope, {
+  kind: "Deployment",
+  metadata: { name: "upstream-condition", namespace: "tracegarden", uid: "upstream-condition" },
+  spec: { replicas: 2 },
+  status: { availableReplicas: 1, reason: "ProgressDeadlineExceeded", message: "deployment did not progress" },
+}, "2026-01-01T00:00:00.000Z") : null;
+assert.equal(upstreamCondition?.attentionReason, "deployment_replicas_unavailable");
+assert.equal(upstreamCondition?.reason, "ProgressDeadlineExceeded");
+assert.equal(upstreamCondition?.message, "deployment did not progress");
+const deploymentConditionOrders = [
+  [
+    { type: "Available", status: "True" },
+    { type: "Progressing", status: "False", reason: "ProgressDeadlineExceeded" },
+  ],
+  [
+    { type: "Progressing", status: "False", reason: "ProgressDeadlineExceeded" },
+    { type: "Available", status: "True" },
+  ],
+];
+for (const [index, conditions] of deploymentConditionOrders.entries()) {
+  const deployment = savedScope ? normalizeObservation(savedScope, {
+    kind: "Deployment",
+    metadata: { name: `condition-order-${index}`, namespace: "tracegarden", uid: `condition-order-${index}` },
+    spec: { replicas: 2 },
+    status: { availableReplicas: 2, conditions },
+  }, "2026-01-01T00:00:00.000Z") : null;
+  assert.equal(deployment?.attention, true);
+  assert.equal(deployment?.classification, "attention");
+  assert.equal(deployment?.attentionReason, "condition_failed");
+}
+
+// Each supported family gets one behavior partition: meaningful change, attention, then recovery.
+const familyFixtures = [
+  ["Deployment", { spec: { replicas: 2 }, status: { availableReplicas: 2, readyReplicas: 2 } }, { spec: { replicas: 2 }, status: { availableReplicas: 1, readyReplicas: 1 } }, { spec: { replicas: 2 }, status: { availableReplicas: 2, readyReplicas: 2 } }],
+  ["StatefulSet", { spec: { replicas: 2 }, status: { readyReplicas: 2, currentRevision: "r1", updateRevision: "r1" } }, { spec: { replicas: 2 }, status: { readyReplicas: 1, currentRevision: "r1", updateRevision: "r2" } }, { spec: { replicas: 2 }, status: { readyReplicas: 2, currentRevision: "r2", updateRevision: "r2" } }],
+  ["DaemonSet", { status: { desiredNumberScheduled: 2, numberReady: 2, numberAvailable: 2 } }, { status: { desiredNumberScheduled: 2, numberReady: 1, numberAvailable: 1 } }, { status: { desiredNumberScheduled: 2, numberReady: 2, numberAvailable: 2 } }],
+  ["ReplicaSet", { spec: { replicas: 2 }, status: { replicas: 2, readyReplicas: 2, availableReplicas: 2 } }, { spec: { replicas: 2 }, status: { replicas: 2, readyReplicas: 1, availableReplicas: 1 } }, { spec: { replicas: 2 }, status: { replicas: 2, readyReplicas: 2, availableReplicas: 2 } }],
+  ["Pod", { status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] } }, { status: { phase: "Pending", conditions: [{ type: "Ready", status: "False", reason: "ContainerCreating" }] } }, { status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] } }],
+  ["Job", { spec: { completions: 1 }, status: { succeeded: 1, failed: 0 } }, { spec: { completions: 1 }, status: { succeeded: 0, failed: 1, reason: "BackoffLimitExceeded" } }, { spec: { completions: 1 }, status: { succeeded: 1, failed: 0 } }],
+  ["CronJob", { spec: { schedule: "* * * * *", suspend: false }, status: {} }, { spec: { schedule: "* * * * *", suspend: true }, status: {} }, { spec: { schedule: "* * * * *", suspend: false }, status: {} }],
+  ["Event", { type: "Normal", reason: "Scheduled", message: "scheduled" }, { type: "Warning", reason: "FailedScheduling", message: "unschedulable" }, { type: "Normal", reason: "Scheduled", message: "scheduled" }],
+];
+const familyTimeline = new MemoryObservationStore();
+const familyScope = { ...savedScope, resourceKinds: ["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Pod", "Job", "CronJob", "Event"] };
+for (const [kind, normal, abnormal, recovery] of familyFixtures) {
+  const resources = [normal, abnormal, recovery].map((state, index) => ({
+    kind,
+    metadata: {
+      name: `${kind.toLowerCase()}-sample`, namespace: "tracegarden", uid: `${kind}-uid`, resourceVersion: String(index + 1),
+      ownerReferences: [{ kind: "Deployment", name: "owner", uid: "owner-uid", controller: true }],
+      labels: { "app.kubernetes.io/name": "sample", "controller-revision-hash": `revision-${index + 1}` },
+    },
+    ...(kind === "Event" ? { involvedObject: { kind: "Pod", name: "sample-pod", namespace: "tracegarden", uid: "pod-uid" } } : {}),
+    ...state,
+  }));
+  const normalized = resources.map((resource) => normalizeObservation(familyScope, resource, `2026-01-01T00:00:0${Number(resource.metadata.resourceVersion)}.000Z`));
+  assert.equal(normalized[0]?.kind, kind);
+  assert.equal(normalized[0]?.classification, "change");
+  assert.equal(normalized[1]?.attention, true);
+  assert.equal(normalized[1]?.classification, "attention");
+  assert.equal(normalized[2]?.attention, false);
+  assert.equal(normalized[0]?.ownerReferences[0]?.name, "owner");
+  assert.match(normalized[0]?.revision ?? "", /revision-1|r1/);
+  const persisted = await familyTimeline.recordObservations(normalized);
+  assert.deepEqual(persisted.map(({ observation }) => observation.classification), ["change", "attention", "recovery"]);
+  assert.equal(persisted[2]?.entry.recoveryOf, persisted[1]?.observation.sourceKey);
+}
+assert.equal(await familyTimeline.countObservations("workspace-single"), familyFixtures.length * 3);
+const equalTimeResources = [
+  { kind: "Pod", metadata: { name: "equal-time", namespace: "tracegarden", uid: "equal-time-uid", resourceVersion: "1" }, status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] } },
+  { kind: "Pod", metadata: { name: "equal-time", namespace: "tracegarden", uid: "equal-time-uid", resourceVersion: "2" }, status: { phase: "Pending", conditions: [{ type: "Ready", status: "False" }] } },
+  { kind: "Pod", metadata: { name: "equal-time", namespace: "tracegarden", uid: "equal-time-uid", resourceVersion: "3" }, status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] } },
+].map((resource) => normalizeObservation(familyScope, resource, "2026-01-01T00:00:00.000Z"));
+const equalTimePersisted = await new MemoryObservationStore().recordObservations(equalTimeResources);
+assert.deepEqual(equalTimePersisted.map(({ observation }) => observation.classification), ["change", "attention", "recovery"]);
+assert.equal(equalTimePersisted[2]?.entry.recoveryOf, equalTimePersisted[1]?.observation.sourceKey);
+if (ownerAdmission.admitted && savedScope) {
+  const familyEntries = (await familyTimeline.listTimelineEntries("workspace-single", { limit: 100 })).entries;
+  const zhFamilyPage = renderApplicationPage("zh-CN", ownerAdmission.session, savedScope, undefined, familyEntries);
+  assert.match(zhFamilyPage, /待关注项/);
+  assert.match(zhFamilyPage, /副本不可用/);
+  assert.doesNotMatch(zhFamilyPage, /deployment_replicas_unavailable/);
+  assert.match(renderApplicationPage("en", ownerAdmission.session, savedScope, undefined, familyEntries), /Attention Item/);
+  assert.match(renderApplicationPage("en", ownerAdmission.session, savedScope, undefined, familyEntries), /Recovery/);
+  const failedConditionJob = await new MemoryObservationStore().recordObservation(normalizeObservation(familyScope, {
+    kind: "Job",
+    metadata: { name: "failed-condition-job", namespace: "tracegarden", uid: "failed-condition-job-uid", resourceVersion: "1" },
+    spec: { completions: 1 },
+    status: { conditions: [{ type: "Failed", status: "True", reason: "BackoffLimitExceeded" }] },
+  }, "2026-01-01T00:00:01.000Z"));
+  assert.equal(failedConditionJob.observation.failed, null);
+  assert.equal(failedConditionJob.observation.classification, "attention");
+  const failedConditionJobPage = renderApplicationPage("en", ownerAdmission.session, savedScope, undefined, [failedConditionJob.entry]);
+  assert.match(failedConditionJobPage, /Job · Attention Item/);
+  assert.match(failedConditionJobPage, /Attention Item/);
+  const completedJob = await new MemoryObservationStore().recordObservation(normalizeObservation(familyScope, {
+    kind: "Job",
+    metadata: { name: "completed-job", namespace: "tracegarden", uid: "completed-job-uid", resourceVersion: "1" },
+    spec: { completions: 1 },
+    status: { succeeded: 1, failed: 1, completionTime: "2026-01-01T00:00:00.000Z" },
+  }, "2026-01-01T00:00:01.000Z"));
+  const completedJobPage = renderApplicationPage("en", ownerAdmission.session, savedScope, undefined, [completedJob.entry]);
+  assert.match(completedJobPage, /2026-01-01T00:00:00.000Z/);
+  assert.doesNotMatch(completedJobPage, />Recovery<\/h3>/);
+  assert.doesNotMatch(completedJobPage, /Attention Item/);
+}
 const memoryTimeline = new MemoryObservationStore();
 const collectorWithPersistence = await createCollectorRuntime({ port: 43203, host: "127.0.0.1", scope: savedScope ?? undefined, adapter: deterministic, observationStore: memoryTimeline });
 try {

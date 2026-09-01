@@ -62,6 +62,21 @@ export type Messages = Readonly<{
   resourceIdentity: string;
   observedAt: string;
   timelineUnknownState: string;
+  observationChange: string;
+  attentionItem: string;
+  recovery: string;
+  attentionReason: string;
+  attentionReasonLabels: Readonly<Record<string, string>>;
+  ownership: string;
+  revision: string;
+  resourceKindDeployment: string;
+  resourceKindStatefulSet: string;
+  resourceKindDaemonSet: string;
+  resourceKindReplicaSet: string;
+  resourceKindPod: string;
+  resourceKindJob: string;
+  resourceKindCronJob: string;
+  resourceKindEvent: string;
   recentLogsTitle: string;
   recentLogsDescription: string;
   logCluster: string;
@@ -136,10 +151,35 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     timelineTitle: "Timeline",
     timelineDescription: "已提交的 Kubernetes Observation 会出现在这里。",
     noTimelineEntries: "暂无 Timeline Entry。",
-    podObservation: "Pod Observation",
+    podObservation: "Pod 观测",
     resourceIdentity: "资源身份",
     observedAt: "观测时间",
     timelineUnknownState: "状态未知",
+    observationChange: "变更",
+    attentionItem: "待关注项",
+    recovery: "恢复",
+    attentionReason: "需要关注的原因",
+    attentionReasonLabels: {
+      condition_failed: "条件状态异常",
+      pod_not_ready: "Pod 未就绪",
+      deployment_replicas_unavailable: "Deployment 副本不可用",
+      statefulset_replicas_not_ready: "StatefulSet 副本未就绪",
+      daemonset_nodes_not_ready: "DaemonSet 节点未就绪",
+      replicaset_replicas_not_ready: "ReplicaSet 副本未就绪",
+      job_failed: "Job 执行失败",
+      cronjob_suspended: "CronJob 已暂停",
+      event_warning: "警告 Event",
+    },
+    ownership: "所属关系",
+    revision: "修订版本",
+    resourceKindDeployment: "Deployment",
+    resourceKindStatefulSet: "StatefulSet",
+    resourceKindDaemonSet: "DaemonSet",
+    resourceKindReplicaSet: "ReplicaSet",
+    resourceKindPod: "Pod",
+    resourceKindJob: "Job",
+    resourceKindCronJob: "CronJob",
+    resourceKindEvent: "Event",
     recentLogsTitle: "Recent Log Window",
     recentLogsDescription: "Owner 可以通过独立的 Kubernetes 身份查看一个 Pod 容器的有限近期日志。日志不会被 Tracegarden 保存。",
     logCluster: "Cluster ID",
@@ -216,6 +256,31 @@ export const catalogs: Readonly<Record<Language, Messages>> = {
     resourceIdentity: "Resource identity",
     observedAt: "Observed at",
     timelineUnknownState: "State unknown",
+    observationChange: "Change",
+    attentionItem: "Attention Item",
+    recovery: "Recovery",
+    attentionReason: "Review reason",
+    attentionReasonLabels: {
+      condition_failed: "Condition requires review",
+      pod_not_ready: "Pod is not ready",
+      deployment_replicas_unavailable: "Deployment replicas are unavailable",
+      statefulset_replicas_not_ready: "StatefulSet replicas are not ready",
+      daemonset_nodes_not_ready: "DaemonSet nodes are not ready",
+      replicaset_replicas_not_ready: "ReplicaSet replicas are not ready",
+      job_failed: "Job failed",
+      cronjob_suspended: "CronJob is suspended",
+      event_warning: "Warning Event",
+    },
+    ownership: "Ownership",
+    revision: "Revision",
+    resourceKindDeployment: "Deployment",
+    resourceKindStatefulSet: "StatefulSet",
+    resourceKindDaemonSet: "DaemonSet",
+    resourceKindReplicaSet: "ReplicaSet",
+    resourceKindPod: "Pod",
+    resourceKindJob: "Job",
+    resourceKindCronJob: "CronJob",
+    resourceKindEvent: "Event",
     recentLogsTitle: "Recent Log Window",
     recentLogsDescription: "The owner can view a bounded recent window for one Pod container through a separate Kubernetes identity. Tracegarden never saves log bodies.",
     logCluster: "Cluster ID",
