@@ -20,6 +20,7 @@ pnpm test:postgres
 pnpm test:chart
 pnpm chart:render
 pnpm chart:validate
+pnpm acceptance
 ```
 
 Run the status page without a database for a local HTTP smoke run:

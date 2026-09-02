@@ -35,6 +35,8 @@
     "preview:render": "KUBECONFIG=/dev/null helm template tracegarden-preview deploy/preview/chart --namespace preview-pr-1 --kube-version 1.31.0 --values deploy/preview/digests/pr-1.yaml",
     "predelivery:validate": "pnpm build",
     "delivery:validate": "node scripts/delivery-test.mjs",
+    "acceptance": "node scripts/acceptance.mjs",
+    "test:core-loop": "node scripts/core-loop-browser.mjs",
     "prepreview:validate": "pnpm build",
     "preview:validate": "DELIVERY_RENDER=true node scripts/delivery-test.mjs",
     "pretest:chart": "pnpm delivery:schema",

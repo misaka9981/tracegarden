@@ -24,13 +24,25 @@ let collectorProcess;
 function docker(...args) {
   return execFileSync("docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
+function imageAvailable(image) {
+  try {
+    docker("image", "inspect", image);
+    return true;
+  } catch {
+    return false;
+  }
+}
 function removeDatabase() {
   try { docker("rm", "-f", name); } catch { /* already absent */ }
 }
 
+if (!imageAvailable(postgresImage)) {
+  throw new Error(`PostgreSQL smoke requires the pinned PostgreSQL image ${postgresImage}; refusing to pull it`);
+}
+
 removeDatabase();
 try {
-  docker("run", "-d", "--name", name, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", postgresImage);
+  docker("run", "--pull=never", "-d", "--name", name, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", postgresImage);
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT 1");
