@@ -210,11 +210,24 @@ export function googleOAuthConfig(environment: Record<string, string | undefined
   if (!clientId || !clientSecret || !redirectUri) {
     throw new Error("Google OAuth requires GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI");
   }
+  let url: URL;
   try {
-    const url = new URL(redirectUri);
-    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("unsupported protocol");
+    url = new URL(redirectUri);
   } catch {
     throw new Error("GOOGLE_REDIRECT_URI must be an absolute HTTP(S) URL");
+  }
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  if (environment.NODE_ENV === "production" && url.protocol !== "https:") {
+    throw new Error("GOOGLE_REDIRECT_URI must be HTTPS in production");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new Error("GOOGLE_REDIRECT_URI must use HTTPS, except for local loopback URLs");
+  }
+  if (url.username || url.password) {
+    throw new Error("GOOGLE_REDIRECT_URI must not include credentials");
+  }
+  if (redirectUri.includes("#")) {
+    throw new Error("GOOGLE_REDIRECT_URI must not include a fragment");
   }
   return { clientId, clientSecret, redirectUri, issuer: GOOGLE_ISSUER };
 }

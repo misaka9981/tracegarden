@@ -69,12 +69,32 @@ assert.match(renderStatusPage("en", true), /Application status/);
 assert.ok(!renderStatusPage("en", true).includes("DATABASE_URL"));
 
 const identityAdapter = new LocalIdentityAdapter();
-const googleConfig = googleOAuthConfig({
+const googleEnvironment = {
   NODE_ENV: "production",
   GOOGLE_CLIENT_ID: "test-client",
   GOOGLE_CLIENT_SECRET: "test-secret",
   GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google",
+};
+const googleConfig = googleOAuthConfig(googleEnvironment);
+assert.equal(googleConfig.redirectUri, googleEnvironment.GOOGLE_REDIRECT_URI);
+assert.throws(
+  () => googleOAuthConfig({ ...googleEnvironment, GOOGLE_REDIRECT_URI: "http://tracegarden.test/api/auth/callback/google" }),
+  /HTTPS in production/,
+);
+assert.throws(
+  () => googleOAuthConfig({ ...googleEnvironment, GOOGLE_REDIRECT_URI: "https://user:password@tracegarden.test/api/auth/callback/google" }),
+  /credentials/,
+);
+assert.throws(
+  () => googleOAuthConfig({ ...googleEnvironment, GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google#fragment" }),
+  /fragment/,
+);
+const localGoogleConfig = googleOAuthConfig({
+  ...googleEnvironment,
+  NODE_ENV: "test",
+  GOOGLE_REDIRECT_URI: "http://127.0.0.1:43206/api/auth/callback/google",
 });
+assert.equal(localGoogleConfig.redirectUri, "http://127.0.0.1:43206/api/auth/callback/google");
 const googleAdapter = createIdentityAdapter({
   NODE_ENV: "production",
   GOOGLE_CLIENT_ID: googleConfig.clientId,
