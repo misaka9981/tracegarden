@@ -13,6 +13,9 @@ const builds = [
 function docker(args) {
   return execFileSync("docker", args, { encoding: "utf8", stdio: "inherit" });
 }
+function dockerOutput(args) {
+  return execFileSync("docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
 function requireImage(image) {
   try {
     docker(["image", "inspect", image]);
@@ -33,8 +36,26 @@ for (const [service, dockerfile, frozen] of builds) {
   ];
   try {
     docker(args);
+    if (service === "backup") {
+      if (dockerOutput(["image", "inspect", "-f", "{{.Config.User}}", tag]) !== "node") {
+        throw new Error("clean-cache backup image must use the non-root node user");
+      }
+      if (dockerOutput(["image", "inspect", "-f", "{{.Architecture}}", tag]) !== "arm64") {
+        throw new Error("clean-cache backup image must be ARM64");
+      }
+      const runArgs = [
+        "run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "node",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL",
+      ];
+      const uid = dockerOutput([...runArgs, "--entrypoint", "id", tag, "-u"]);
+      if (!/^[1-9]\d*$/.test(uid)) throw new Error("clean-cache backup image must run with a non-root effective UID");
+      for (const binary of ["pg_dump", "pg_restore"]) {
+        const version = dockerOutput([...runArgs, "--entrypoint", binary, tag, "--version"]);
+        if (version !== `${binary} (PostgreSQL) 18.3`) throw new Error(`clean-cache backup image failed ${binary} --version`);
+      }
+    }
   } finally {
     try { docker(["image", "rm", tag]); } catch { /* preserve the build result */ }
   }
 }
-console.log("clean-cache container builds passed: pinned local bases, frozen context, no cache, no network, and pull=false");
+console.log("clean-cache container builds and backup runtime smoke passed: pinned local bases, frozen context, no cache, no network, pull=false, and pull-never");

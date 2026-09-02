@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decryptBackupBuffer, encryptBackupBuffer, runBackup, safePostgresDatabaseUrl, validateBackupConfiguration } from "./backup.mjs";
+import { decryptBackupBuffer, encryptBackupBuffer, runBackup, safePostgresDatabaseUrl, uploadWithAws, validateBackupConfiguration } from "./backup.mjs";
 import {
   assertCleanDatabase,
   checkRestoredDatabase,
@@ -14,6 +14,7 @@ import {
 const directory = await mkdtemp(join(tmpdir(), "tracegarden-backup-test-"));
 const key = Buffer.alloc(32, 7);
 const keyFile = join(directory, "encryption-key");
+const sigV4VectorPath = join(directory, "sigv4-vector.dump.enc");
 await writeFile(keyFile, key.toString("hex"), { mode: 0o600 });
 const environment = {
   DATABASE_URL: "postgresql://tracegarden@database.invalid:5432/tracegarden",
@@ -120,21 +121,63 @@ try {
     nativeUpload = { url: String(url), options };
     return new Response(null, { status: 200 });
   };
+  const signingClock = new Date("2026-01-02T03:04:05.000Z");
   try {
     await runBackup({
       environment: { ...environment, AWS_ACCESS_KEY_ID: "test-access", AWS_SECRET_ACCESS_KEY: "test-secret", AWS_REGION: "us-east-1" },
       dump: async () => plaintext,
-      now: new Date("2026-01-02T03:04:05.000Z"),
+      now: signingClock,
     });
+    assert.ok(nativeUpload);
+    assert.match(nativeUpload.url, /storage\.invalid\/tracegarden-backups\/tracegarden\/20260102T030405Z-/);
+    assert.equal(nativeUpload.options.method, "PUT");
+    assert.match(nativeUpload.options.headers.authorization, /^AWS4-HMAC-SHA256 Credential=test-access\//);
+    assert.equal(nativeUpload.options.headers["x-amz-date"], "20260102T030405Z");
+    assert.equal(Object.hasOwn(nativeUpload.options.headers, "x-amz-security-token"), false);
+    assert.match(nativeUpload.options.headers["x-amz-content-sha256"], /^[a-f0-9]{64}$/);
+    assert.match(nativeUpload.options.headers.authorization, /SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=/);
+    assert.notEqual(Buffer.from(nativeUpload.options.body).includes(plaintext), true, "native uploader must receive encrypted bytes only");
+
+    const vectorBody = Buffer.from("fixture payload\n");
+    await writeFile(sigV4VectorPath, vectorBody, { mode: 0o600 });
+    const vectorEnvironment = {
+      ...environment,
+      AWS_ACCESS_KEY_ID: "AKIDEXAMPLE",
+      AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+      AWS_REGION: "us-east-1",
+      AWS_SESSION_TOKEN: "session-token",
+    };
+    await uploadWithAws({
+      artifactPath: sigV4VectorPath,
+      artifactName: "fixtures/vector.dump.enc",
+      endpoint: environment.BACKUP_ENDPOINT,
+      bucket: environment.BACKUP_BUCKET,
+      environment: vectorEnvironment,
+      now: signingClock,
+    });
+    assert.equal(nativeUpload.url, "https://storage.invalid/tracegarden-backups/fixtures/vector.dump.enc");
+    assert.deepEqual(Buffer.from(nativeUpload.options.body), vectorBody);
+    assert.equal(nativeUpload.options.headers["x-amz-content-sha256"], "565b24bc77ebeee74f70f6c608e099956666c3589ed85146fcea7e77d9f25356");
+    assert.equal(nativeUpload.options.headers["x-amz-date"], "20260102T030405Z");
+    assert.equal(nativeUpload.options.headers["x-amz-security-token"], "session-token");
+    assert.equal(nativeUpload.options.headers.authorization, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260102/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=3c9ed5ee25d7e92ebd224ceea1ad2b2a8a897ee398d453976f14b8cbe5ea748f");
+
+    const vectorAuthorization = nativeUpload.options.headers.authorization;
+    await uploadWithAws({
+      artifactPath: sigV4VectorPath,
+      artifactName: "fixtures/vector-perturbed.dump.enc",
+      endpoint: environment.BACKUP_ENDPOINT,
+      bucket: environment.BACKUP_BUCKET,
+      environment: vectorEnvironment,
+      now: signingClock,
+    });
+    assert.notEqual(nativeUpload.url, "https://storage.invalid/tracegarden-backups/fixtures/vector.dump.enc");
+    assert.notEqual(nativeUpload.options.headers.authorization, vectorAuthorization, "canonical path perturbation must change the signature");
+    assert.equal(nativeUpload.options.headers["x-amz-content-sha256"], "565b24bc77ebeee74f70f6c608e099956666c3589ed85146fcea7e77d9f25356");
+    console.log("offline backup encryption, native SigV4 fixed vector, perturbation, off-VM gate, and credential-free boundary passed");
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.ok(nativeUpload);
-  assert.match(nativeUpload.url, /storage\.invalid\/tracegarden-backups\/tracegarden\/20260102T030405Z-/);
-  assert.equal(nativeUpload.options.method, "PUT");
-  assert.match(nativeUpload.options.headers.authorization, /^AWS4-HMAC-SHA256 Credential=test-access\//);
-  assert.notEqual(Buffer.from(nativeUpload.options.body).includes(plaintext), true, "native uploader must receive encrypted bytes only");
-  console.log("offline backup encryption, native SigV4 upload, off-VM gate, and credential-free boundary passed");
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

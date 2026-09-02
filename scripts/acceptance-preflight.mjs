@@ -10,6 +10,7 @@ const containerSmoke = await readFile("scripts/container-smoke.mjs", "utf8");
 const containerContext = await readFile("scripts/container-context.mjs", "utf8");
 const cleanCachePolicy = await readFile("scripts/container-context-clean-cache.mjs", "utf8");
 const cleanCacheBuild = await readFile("scripts/container-clean-cache.mjs", "utf8");
+const acceptance = await readFile("scripts/acceptance.mjs", "utf8");
 for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Dockerfile", "deploy/docker/migrate.Dockerfile"]) {
   const dockerfile = await readFile(path, "utf8");
   assert.match(dockerfile, /COPY --from=frozen \/dist\//, `${path} must consume the generated frozen build context`);
@@ -28,7 +29,8 @@ assert.match(containerSmoke, /build\", \"--pull=false\"/);
 assert.match(containerSmoke, /up\", \"-d\", \"--pull\", \"never\", \"--no-build\"/);
 assert.match(cleanCachePolicy, /--offline/);
 assert.match(cleanCachePolicy, /unexpectedly succeeded/);
-for (const required of ["--no-cache", "--network", "none", "--pull=false", "container-context.mjs", "--load"]) {
+assert.match(acceptance, /scripts\/container-clean-cache\.mjs/);
+for (const required of ["--no-cache", "--network", "none", "--pull=false", "container-context.mjs", "--load", "--pull=never", "--read-only", "pg_dump", "pg_restore", "id", "--version"]) {
   assert.match(cleanCacheBuild, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `clean-cache build must include ${required}`);
 }
 

@@ -166,7 +166,7 @@ function canonicalPath(path) {
   return path.split("/").map((segment) => encodeURIComponent(segment).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`)).join("/") || "/";
 }
 
-async function uploadWithAws({ artifactPath, endpoint, bucket, artifactName, environment }) {
+async function uploadWithAws({ artifactPath, endpoint, bucket, artifactName, environment, now = new Date() }) {
   const accessKey = environment.AWS_ACCESS_KEY_ID?.trim();
   const secretKey = environment.AWS_SECRET_ACCESS_KEY?.trim();
   if (!accessKey || !secretKey) throw new Error("object-storage credentials are unavailable from the configured Secret");
@@ -174,7 +174,7 @@ async function uploadWithAws({ artifactPath, endpoint, bucket, artifactName, env
   const endpointUrl = new URL(safeObjectStorageEndpoint(endpoint));
   endpointUrl.pathname = `${endpointUrl.pathname.replace(/\/$/, "")}/${bucket}/${artifactName}`;
   const payloadHash = createHash("sha256").update(body).digest("hex");
-  const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
+  const amzDate = now.toISOString().replace(/[-:]|\.\d{3}/g, "");
   const date = amzDate.slice(0, 8);
   const region = environment.AWS_REGION?.trim() || environment.AWS_DEFAULT_REGION?.trim() || "us-east-1";
   const headers = {
@@ -219,7 +219,7 @@ export async function runBackup({ environment = process.env, dump = null, upload
   try {
     await writeFile(path, encrypted, { mode: 0o600 });
     const uploadRequest = { artifactPath: path, artifactName: name, endpoint: configuration.endpoint, bucket: configuration.bucket, retentionDays: configuration.retentionDays };
-    if (upload === uploadWithAws) await uploadWithAws({ ...uploadRequest, environment });
+    if (upload === uploadWithAws) await uploadWithAws({ ...uploadRequest, environment, now });
     else await upload(uploadRequest);
     return { artifactName: name, encryptedBytes: encrypted.length, retentionDays: configuration.retentionDays };
   } finally {
