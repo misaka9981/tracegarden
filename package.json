@@ -23,7 +23,7 @@
     "start": "node dist/apps/web/src/main.js",
     "pretest": "pnpm build",
     "test": "node scripts/test.mjs && node scripts/collector-resilience.mjs && node scripts/delivery-test.mjs",
-    "test:backup": "node scripts/backup-test.mjs"
+    "test:backup": "node scripts/backup-test.mjs",
     "pretest:browser": "pnpm build && pnpm exec playwright install chromium",
     "test:browser": "node scripts/browser-smoke.mjs",
     "test:container": "node scripts/container-smoke.mjs",
