@@ -441,6 +441,9 @@ const callbackAuthRuntime = {
         ],
       });
     }
+    if (request.method === "OPTIONS" && path === "/api/auth/options-probe") {
+      return new Response("better-auth-options", { status: 202, headers: { "x-better-auth": "forwarded" } });
+    }
     return new Response(null, { status: 204 });
   },
   session: async () => callbackSession,
@@ -477,6 +480,10 @@ try {
   const callback = await fetch("http://127.0.0.1:43206/api/auth/callback/google?code=local", { redirect: "manual" });
   assert.equal(callback.status, 302);
   assert.deepEqual(callback.headers.getSetCookie(), ["first=one; Path=/", "second=two; Path=/"]);
+  const callbackAuthOptions = await fetch("http://127.0.0.1:43206/api/auth/options-probe", { method: "OPTIONS" });
+  assert.equal(callbackAuthOptions.status, 202);
+  assert.equal(callbackAuthOptions.headers.get("x-better-auth"), "forwarded");
+  assert.equal(await callbackAuthOptions.text(), "better-auth-options");
   const callbackApiSession = await fetch("http://127.0.0.1:43206/api/session");
   assert.equal(callbackApiSession.status, 200);
   const callbackMember = await callbackApiSession.json();
@@ -721,6 +728,17 @@ try {
   assert.ok(requestStart);
   assert.equal(traceparent, `00-${requestStart.correlation.traceId}-${requestStart.correlation.spanId}-01`);
   assert.doesNotMatch(JSON.stringify(exporterFailureTelemetry.signals()), /protected-request-correlation/);
+  const methodMismatch = await fetch("http://127.0.0.1:43215/health/live", { method: "POST" });
+  assert.equal(methodMismatch.status, 405);
+  assert.deepEqual(await methodMismatch.json(), { error: "method_not_allowed" });
+  const unknownRoute = await fetch("http://127.0.0.1:43215/not-a-route");
+  assert.equal(unknownRoute.status, 404);
+  assert.deepEqual(await unknownRoute.json(), { error: "not_found" });
+  for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+    const unknownMethodRoute = await fetch("http://127.0.0.1:43215/not-a-route", { method });
+    assert.equal(unknownMethodRoute.status, 405, `${method} unknown route must retain the method-not-allowed contract`);
+    assert.deepEqual(await unknownMethodRoute.json(), { error: "method_not_allowed" });
+  }
 } finally {
   await exporterWebRuntime.close();
 }
@@ -1125,12 +1143,26 @@ if (liveObservation) {
   assert.deepEqual([equalTimestampPage.entries[0]?.observation.name, equalTimestampNextPage.entries[0]?.observation.name], expectedEqualNames);
 }
 unsubscribeLiveTimeline();
+const backpressureDatabase = await readyMemoryDatabase();
+let backpressureSubscriptions = 0;
+const originalSubscribeTimeline = backpressureDatabase.timeline?.subscribeTimeline?.bind(backpressureDatabase.timeline);
+if (originalSubscribeTimeline && backpressureDatabase.timeline) {
+  backpressureDatabase.timeline.subscribeTimeline = async (listener) => {
+    backpressureSubscriptions += 1;
+    const unsubscribe = await originalSubscribeTimeline(listener);
+    return () => {
+      backpressureSubscriptions -= 1;
+      unsubscribe();
+    };
+  };
+}
 const backpressureRuntime = await createWebRuntime({
-  database: await readyMemoryDatabase(),
+  database: backpressureDatabase,
   identityAdapter: new LocalIdentityAdapter(),
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
   port: 43209,
 });
+const backpressureBaselineSubscriptions = backpressureSubscriptions;
 const originalResponseWrite = ServerResponse.prototype.write;
 let forceBackpressure = false;
 let backpressureWriteObserved = false;
@@ -1153,8 +1185,29 @@ try {
     headers: { cookie: backpressureLogin.headers.get("set-cookie") ?? "" },
   });
   assert.equal(backpressureStream.status, 200);
-  await backpressureStream.body.cancel();
   assert.equal(backpressureWriteObserved, true);
+  for (let attempt = 0; attempt < 20 && backpressureSubscriptions !== backpressureBaselineSubscriptions; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(backpressureSubscriptions, backpressureBaselineSubscriptions);
+  const backpressureMetrics = await fetch("http://127.0.0.1:43209/metrics");
+  assert.match(await backpressureMetrics.text(), /tracegarden_sse_clients 0/);
+  const backpressureReader = backpressureStream.body?.getReader();
+  assert.ok(backpressureReader);
+  const backpressureBodyClosed = await new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), 1000);
+    const readUntilClosed = async () => {
+      for (;;) {
+        const { done } = await backpressureReader.read();
+        if (done) return true;
+      }
+    };
+    void readUntilClosed().then(
+      (closed) => { clearTimeout(timeout); resolve(closed); },
+      () => { clearTimeout(timeout); resolve(true); },
+    );
+  });
+  assert.equal(backpressureBodyClosed, true, "backpressure must close the response body");
 } finally {
   forceBackpressure = false;
   ServerResponse.prototype.write = originalResponseWrite;

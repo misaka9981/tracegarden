@@ -1,6 +1,8 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, type Server } from "node:http";
 import { randomUUID } from "node:crypto";
-import { URL } from "node:url";
+import { getRequestListener, type HttpBindings } from "@hono/node-server";
+import { Hono, type Context } from "hono";
+import { streamSSE, type SSEStreamingApi } from "hono/streaming";
 import { state, type StatusResponse } from "../../../packages/contracts/src/index.js";
 import {
   createDatabase,
@@ -78,7 +80,7 @@ import {
   type RecentLogTelemetryEvent,
   type RecentLogWindow,
 } from "../../../packages/logs/src/index.js";
-import { createTelemetry, type CorrelationMetadata, type TelemetryRuntime } from "../../../packages/telemetry/src/index.js";
+import { createTelemetry, type CorrelationMetadata, type TelemetryRuntime, type TelemetrySpan } from "../../../packages/telemetry/src/index.js";
 
 type WebOptions = Readonly<{
   database?: DatabaseBoundary;
@@ -848,8 +850,8 @@ export function renderRejectionPage(language: Language, reason: "admission_requi
 </html>`;
 }
 
-function cookies(request: IncomingMessage): Readonly<Record<string, string>> {
-  const header = request.headers?.cookie ?? "";
+function cookies(request: Request): Readonly<Record<string, string>> {
+  const header = request.headers.get("cookie") ?? "";
   return Object.fromEntries(header.split(";").flatMap((part) => {
     const separator = part.indexOf("=");
     if (separator < 0) return [];
@@ -859,33 +861,6 @@ function cookies(request: IncomingMessage): Readonly<Record<string, string>> {
       return [];
     }
   }));
-}
-
-async function requestBody(request: IncomingMessage): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    let body = "";
-    let settled = false;
-    request.on("data", (chunk) => {
-      if (settled) return;
-      body += String(chunk);
-      if (body.length > 8192) {
-        settled = true;
-        reject(new Error("request body too large"));
-      }
-    });
-    request.on("end", () => {
-      if (!settled) {
-        settled = true;
-        resolve(body);
-      }
-    });
-    request.on("error", (error) => {
-      if (!settled) {
-        settled = true;
-        reject(error);
-      }
-    });
-  });
 }
 
 type RequestFields = Readonly<Record<string, string>>;
@@ -907,12 +882,6 @@ function requestFields(body: string, contentType: string | undefined): RequestFi
   }
   const form = new URLSearchParams(body);
   return Object.fromEntries(form.entries());
-}
-
-function jsonResponse(response: ServerResponse, statusCode: number, value: unknown): void {
-  response.statusCode = statusCode;
-  response.setHeader("content-type", "application/json; charset=utf-8");
-  response.end(JSON.stringify(value));
 }
 
 function cookieHeader(token: string, production: boolean): string {
@@ -979,10 +948,10 @@ function retentionMessage(template: string, result: RetentionCleanupResult): str
     .replace("{failures}", String(result.failures));
 }
 
-function retentionCleanupQueryResult(url: URL, policy: RetentionPolicy | null): RetentionCleanupResult | undefined {
-  if (url.searchParams.get("retention") !== "cleanup" || !policy) return undefined;
+function retentionCleanupQueryResult(query: Readonly<Record<string, string>>, policy: RetentionPolicy | null): RetentionCleanupResult | undefined {
+  if (query.retention !== "cleanup" || !policy) return undefined;
   const integer = (name: string): number => {
-    const value = Number(url.searchParams.get(name));
+    const value = Number(query[name]);
     return Number.isSafeInteger(value) && value >= 0 ? value : 0;
   };
   const failures = integer("failures");
@@ -1000,12 +969,11 @@ function retentionCleanupQueryResult(url: URL, policy: RetentionPolicy | null): 
   };
 }
 
-function requestHeaders(request: IncomingMessage): Headers {
+function requestHeaders(request: Request): Headers {
   const headers = new Headers();
-  for (const [name, value] of Object.entries(request.headers ?? {})) {
+  for (const [name, value] of request.headers) {
     if (["x-request-id", "x-trace-id", "traceparent"].includes(name.toLowerCase())) continue;
-    if (typeof value === "string") headers.set(name, value);
-    else if (Array.isArray(value)) headers.set(name, value.join(", "));
+    headers.set(name, value);
   }
   return headers;
 }
@@ -1036,14 +1004,13 @@ function listenForStartup(server: Server, port: number, host: string): Promise<v
   });
 }
 
-function setResponseHeaders(response: ServerResponse, headers: Headers): void {
-  for (const [name, value] of headers) {
-    if (name !== "set-cookie" && name !== "x-request-id" && name !== "x-trace-id" && name !== "traceparent") response.setHeader(name, value);
-  }
-  const headersWithCookies = headers as Headers & { getSetCookie?: () => string[] };
-  const cookies = headersWithCookies.getSetCookie?.() ?? (headers.get("set-cookie") ? [headers.get("set-cookie") as string] : []);
-  if (cookies.length > 0) response.setHeader("set-cookie", cookies);
-}
+type WebBindings = HttpBindings;
+type WebVariables = {
+  correlation: CorrelationMetadata;
+  requestSpan: TelemetrySpan;
+};
+type WebContext = { Bindings: WebBindings; Variables: WebVariables };
+type AppContext = Context<WebContext>;
 
 export async function createWebRuntime(options: WebOptions = {}): Promise<WebRuntime> {
   const environment = options.environment ?? process.env;
@@ -1260,7 +1227,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     rejection?: "admission_required" | "invalid_identity";
   }>;
 
-  const sessionForRequest = async (request: IncomingMessage): Promise<RequestSession> => {
+  const sessionForRequest = async (request: Request): Promise<RequestSession> => {
     if (cloudflareAccess) {
       const identity = cloudflareAccessIdentity(requestHeaders(request), cloudflareAccess);
       if (identity) {
@@ -1426,12 +1393,6 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   const retentionPolicyForSession = async (session: AuthenticatedSession): Promise<RetentionPolicy | null> =>
     retentionStore ? retentionStore.getRetentionPolicy(session.member.workspaceId) : null;
 
-  const sendJson = (response: ServerResponse, statusCode: number, payload: unknown): void => {
-    response.statusCode = statusCode;
-    response.setHeader("content-type", "application/json; charset=utf-8");
-    response.end(JSON.stringify(payload));
-  };
-
   const formScopeInput = (form: URLSearchParams): Record<string, unknown> => {
     const clusterId = form.get("clusterId")?.trim();
     return {
@@ -1451,17 +1412,17 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     tail: Number(form.get("tail") ?? ""),
   });
 
-  const timelineQueryInput = (url: URL, allowInternalFlash = false): Record<string, unknown> => {
-    const attention = url.searchParams.get("attention");
+  const timelineQueryInput = (query: Readonly<Record<string, string>>, allowInternalFlash = false): Record<string, unknown> => {
+    const attention = query.attention;
     return {
-      ...(url.searchParams.get("limit") === null ? {} : { limit: url.searchParams.get("limit") }),
-      ...(url.searchParams.get("cursor") === null ? {} : { cursor: url.searchParams.get("cursor") }),
-      ...(url.searchParams.get("kind") === null ? {} : { kind: url.searchParams.get("kind") }),
-      ...(url.searchParams.get("namespace") === null ? {} : { namespace: url.searchParams.get("namespace") }),
-      ...(url.searchParams.get("name") === null ? {} : { name: url.searchParams.get("name") }),
-      ...(url.searchParams.get("state") !== null ? { state: url.searchParams.get("state") } : url.searchParams.get("phase") === null ? {} : { phase: url.searchParams.get("phase") }),
-      ...(attention === null || attention === "" || (allowInternalFlash && attention === "reviewed") ? {} : { attention: attention === "unread" ? "true" : attention, ...(attention === "unread" ? { unread: "true" } : {}) }),
-      ...(url.searchParams.get("unread") === null ? {} : { unread: url.searchParams.get("unread") }),
+      ...(query.limit === undefined ? {} : { limit: query.limit }),
+      ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
+      ...(query.kind === undefined ? {} : { kind: query.kind }),
+      ...(query.namespace === undefined ? {} : { namespace: query.namespace }),
+      ...(query.name === undefined ? {} : { name: query.name }),
+      ...(query.state !== undefined ? { state: query.state } : query.phase === undefined ? {} : { phase: query.phase }),
+      ...(attention === undefined || attention === "" || (allowInternalFlash && attention === "reviewed") ? {} : { attention: attention === "unread" ? "true" : attention, ...(attention === "unread" ? { unread: "true" } : {}) }),
+      ...(query.unread === undefined ? {} : { unread: query.unread }),
     };
   };
 
@@ -1481,9 +1442,9 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     gitRevision: form.get("gitRevision")?.trim() || null,
   });
 
-  const parseExperimentRequest = async (request: IncomingMessage): Promise<unknown> => {
-    const body = await requestBody(request);
-    if (request.headers?.["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() === "application/json") {
+  const parseExperimentRequest = async (request: Request): Promise<unknown> => {
+    const body = await request.text();
+    if (request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() === "application/json") {
       try {
         return JSON.parse(body) as unknown;
       } catch {
@@ -1493,9 +1454,9 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     return formExperimentInput(new URLSearchParams(body));
   };
 
-  const parseRetentionRequest = async (request: IncomingMessage): Promise<unknown> => {
-    const body = await requestBody(request);
-    if (request.headers?.["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() === "application/json") {
+  const parseRetentionRequest = async (request: Request): Promise<unknown> => {
+    const body = await request.text();
+    if (request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() === "application/json") {
       try {
         return JSON.parse(body) as unknown;
       } catch {
@@ -1506,1226 +1467,760 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     return { retentionDays: form.get("retentionDays") ?? form.get("days") ?? "" };
   };
 
-  const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
-    const correlation = telemetry.correlation();
-    const requestSpan = telemetry.startSpan("http.request", correlation, {
-      method: request.method ?? "GET",
-      path: (request.url ?? "/").split("?", 1)[0],
-    });
-    response.setHeader("x-request-id", requestSpan.correlation.requestId);
-    response.setHeader("x-trace-id", requestSpan.correlation.traceId);
-    response.setHeader("traceparent", `00-${requestSpan.correlation.traceId}-${requestSpan.correlation.spanId}-01`);
-    void (async () => {
-      const requestUrl = new URL(request.url ?? "/", "http://localhost");
-      const method = request.method ?? "GET";
-      const language = parseLanguage(requestUrl.searchParams.get("lang"));
-      const authOrigin = environment.BETTER_AUTH_URL ?? `http://${request.headers?.host ?? "localhost"}`;
-      if (betterAuthRuntime && requestUrl.pathname.startsWith("/api/auth/")) {
-        const body = method === "GET" || method === "HEAD" ? undefined : await requestBody(request);
-        const authRequest = new Request(new URL(request.url ?? "/", authOrigin).toString(), {
-          method,
-          headers: requestHeaders(request),
-          ...(body === undefined ? {} : { body }),
-        });
-        const authResponse = await betterAuthRuntime.handler(authRequest);
-        response.statusCode = authResponse.status;
-        setResponseHeaders(response, authResponse.headers);
-        response.end(await authResponse.text());
-        return;
-      }
-      if ((requestUrl.pathname === "/auth/login" || requestUrl.pathname === "/login") && method === "POST") {
-        if (cloudflareAccess || identityAdapter.kind !== "local") {
-          response.statusCode = 405;
-          response.setHeader("content-type", "application/json; charset=utf-8");
-          response.end(JSON.stringify({ error: cloudflareAccess ? "cloudflare_access_jwt_required" : "google_login_required" }));
-          return;
-        }
-        const form = new URLSearchParams(await requestBody(request));
-        const selected = form.get("identity") ?? "";
-        const selectedLanguage = parseLanguage(form.get("lang"));
-        const identity = identityAdapter.resolve(selected);
-        if (!identity) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderRejectionPage(selectedLanguage, "invalid_identity"));
-          return;
-        }
-        const admission = await admissionStore.admit(identity);
-        if (!admission.admitted) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderRejectionPage(selectedLanguage, admission.reason));
-          return;
-        }
-        response.statusCode = 303;
-        response.setHeader("location", `/app?lang=${selectedLanguage}`);
-        response.setHeader("set-cookie", cookieHeader(admission.session.token, environment.NODE_ENV === "production"));
-        response.end();
-        return;
-      }
-      if (requestUrl.pathname === "/auth/logout" && method === "POST") {
-        if (betterAuthRuntime) {
-          const authResponse = await betterAuthRuntime.handler(new Request(new URL("/api/auth/sign-out", authOrigin).toString(), {
-            method: "POST",
-            headers: requestHeaders(request),
-          }));
-          response.statusCode = 303;
-          response.setHeader("location", `/?lang=${language}`);
-          setResponseHeaders(response, authResponse.headers);
-          response.end();
-          return;
-        }
-        response.statusCode = 303;
-        response.setHeader("location", `/?lang=${language}`);
-        response.setHeader("set-cookie", "tracegarden_session=; Max-Age=0; HttpOnly; Path=/; SameSite=Lax");
-        response.end();
-        return;
-      }
-      if ((requestUrl.pathname === "/auth/login" || requestUrl.pathname === "/login") && method === "GET") {
-        if (cloudflareAccess) {
-          sendJson(response, 401, { error: "cloudflare_access_jwt_required" });
-          return;
-        }
-        const current = await status();
-        response.statusCode = current.status === "ready" ? 200 : 503;
-        response.setHeader("content-type", "text/html; charset=utf-8");
-        response.end(renderLoginPage(language, current.checks.database === "ready", identityAdapter));
-        return;
-      }
-      if (requestUrl.pathname === "/auth/google" && method === "GET" && betterAuthRuntime) {
-        const authResponse = await betterAuthRuntime.handler(new Request(new URL("/api/auth/sign-in/social", authOrigin).toString(), {
-          method: "POST",
-          headers: { "content-type": "application/json", accept: "application/json" },
-          body: JSON.stringify({ provider: "google", callbackURL: `/app?lang=${language}` }),
-        }));
-        if (!authResponse.ok) {
-          response.statusCode = authResponse.status;
-          response.setHeader("content-type", authResponse.headers.get("content-type") ?? "application/json; charset=utf-8");
-          response.end(await authResponse.text());
-          return;
-        }
-        const payload = await authResponse.json() as { url?: unknown };
-        if (typeof payload.url !== "string") throw new Error("Better Auth did not return a Google authorization URL");
-        response.statusCode = 302;
-        response.setHeader("location", payload.url);
-        setResponseHeaders(response, authResponse.headers);
-        response.end();
-        return;
-      }
-      if (requestUrl.pathname === "/api/timeline/stream") {
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
-          sendJson(response, 401, { error: "unauthorized" });
-          return;
-        }
-        if (!hasTimelineAccess(lookup.session)) {
-          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
-          return;
-        }
-        if (method !== "GET") {
-          sendJson(response, 405, { error: "method_not_allowed" });
-          return;
-        }
-        if (!timelineNotifications) {
-          sendJson(response, 503, { error: "timeline_notifications_unavailable" });
-          return;
-        }
-        const clientId = randomUUID();
-        let closed = false;
-        let responseStarted = false;
-        let unsubscribe: (() => void) | undefined;
-        const client: LiveSseClient = {
-          workspaceId: lookup.session.member.workspaceId,
-          memberId: lookup.session.member.id,
-          pendingNotification: null,
-          readySent: false,
-          hintCheckInFlight: false,
-          hintQueued: false,
-          cursorLagEntries: 0,
-          cursorLagSince: null,
-          close: () => {
-            if (closed) return;
-            closed = true;
-            liveSseClients.delete(clientId);
-            unsubscribe?.();
-            if (responseStarted) response.end();
-          },
-        };
-        liveSseClients.set(clientId, client);
-        request.on("close", client.close);
-        response.on("close", client.close);
-        response.on("error", client.close);
-        const writeEvent = (event: string, data: unknown): boolean => {
-          try {
-            const accepted = response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-            if (!accepted) client.close();
-            return accepted;
-          } catch {
-            client.close();
-            return false;
-          }
-        };
-        const sendAuthorizedHint = async (): Promise<void> => {
-          if (client.hintCheckInFlight || closed || !client.readySent) return;
-          client.hintCheckInFlight = true;
-          try {
-            while (!closed && client.pendingNotification) {
-              const notification = client.pendingNotification;
-              client.pendingNotification = null;
-              let entry: TimelineEntry | null = null;
-              try {
-                entry = await timelineStore?.getTimelineEntry(client.workspaceId, notification.entryId) ?? null;
-              } catch {
-                client.close();
-                return;
-              }
-              if (!entry || entry.workspaceId !== client.workspaceId) continue;
-              if (client.hintQueued) continue;
-              client.hintQueued = true;
-              if (!writeEvent("timeline", { entryId: entry.id })) return;
-              void refreshLiveClientLag(client);
-              return;
-            }
-          } finally {
-            client.hintCheckInFlight = false;
-            if (!closed && client.pendingNotification && !client.hintQueued) void sendAuthorizedHint();
-          }
-        };
-        client.sendPendingHint = () => { void sendAuthorizedHint(); };
-        const onNotification = (notification: TimelineNotification): void => {
-          if (closed) return;
-          client.pendingNotification = notification;
-          if (!client.hintQueued) void sendAuthorizedHint();
-        };
-        try {
-          unsubscribe = await timelineNotifications.subscribeTimeline(onNotification);
-          if (closed) {
-            unsubscribe();
-            return;
-          }
-          if (timelineNotifications.timelineNotificationsHealthy?.() === false) throw new Error("Timeline notifications are not healthy");
-          timelineReady = true;
-          responseStarted = true;
-          response.writeHead(200, {
-            "cache-control": "no-store",
-            "connection": "keep-alive",
-            "content-type": "text/event-stream; charset=utf-8",
-            "x-accel-buffering": "no",
-          });
-          if (!writeEvent("ready", { clientId })) return;
-          client.readySent = true;
-          void sendAuthorizedHint();
-          // The ready marker is emitted only after LISTEN is active; the browser now recovers durably.
-        } catch {
-          timelineReady = false;
-          client.close();
-          if (!responseStarted) sendJson(response, 503, { error: "timeline_notifications_unavailable" });
-        }
-        return;
-      }
-      if (requestUrl.pathname === "/api/timeline" || requestUrl.pathname === "/api/timeline/entries") {
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
-          sendJson(response, 401, { error: "unauthorized" });
-          return;
-        }
-        if (!hasTimelineAccess(lookup.session)) {
-          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
-          return;
-        }
-        if (method !== "GET") {
-          sendJson(response, 405, { error: "method_not_allowed" });
-          return;
-        }
-        if (!timelineStore) {
-          sendJson(response, 503, { error: "timeline_store_unavailable" });
-          return;
-        }
-        try {
-          const query = parseTimelineQuery(timelineQueryInput(requestUrl));
-          const page = await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, query, lookup.session.member.id);
-          const sseClientId = requestUrl.searchParams.get("sseClientId");
-          const liveClient = sseClientId ? liveSseClients.get(sseClientId) : undefined;
-          if (liveClient && liveClient.workspaceId === lookup.session.member.workspaceId && liveClient.memberId === lookup.session.member.id) {
-            const cursor = page.nextCursor ?? page.resumeCursor ?? query.cursor;
-            liveClient.query = cursor ? { ...query, cursor } : { ...query };
-            liveClient.hintQueued = false;
-            const pendingNotification = liveClient.pendingNotification;
-            liveClient.pendingNotification = null;
-            if (pendingNotification) {
-              liveClient.pendingNotification = pendingNotification;
-              liveClient.sendPendingHint?.();
-            }
-            void refreshLiveClientLag(liveClient);
-          }
-          sendJson(response, 200, page);
-        } catch (error: unknown) {
-          if (error instanceof TimelineQueryValidationError) {
-            sendJson(response, 400, { error: "invalid_timeline_query", issues: error.issues });
-            return;
-          }
-          throw error;
-        }
-        return;
-      }
-      const attentionReviewMatch = requestUrl.pathname.match(/^\/api\/timeline\/entries\/([^/]+)\/review$/);
-      if (attentionReviewMatch) {
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
-          sendJson(response, 401, { error: "unauthorized" });
-          return;
-        }
-        if (!hasTimelineAccess(lookup.session)) {
-          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
-          return;
-        }
-        if (method !== "POST") {
-          sendJson(response, 405, { error: "method_not_allowed" });
-          return;
-        }
-        if (!timelineStore?.reviewAttentionItem) {
-          sendJson(response, 503, { error: "attention_store_unavailable" });
-          return;
-        }
-        let entryId: string;
-        try {
-          entryId = decodeURIComponent(attentionReviewMatch[1] ?? "");
-        } catch {
-          sendJson(response, 400, { error: "invalid_attention_review" });
-          return;
-        }
-        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(entryId)) {
-          sendJson(response, 400, { error: "invalid_attention_review" });
-          return;
-        }
-        const result = await timelineStore.reviewAttentionItem(lookup.session.member.workspaceId, lookup.session.member.id, entryId);
-        if (!result) {
-          sendJson(response, 404, { error: "attention_item_not_found" });
-          return;
-        }
-        sendJson(response, 200, result);
-        return;
-      }
-      const retentionPolicyPath = requestUrl.pathname === "/api/retention" || requestUrl.pathname === "/api/retention/policy";
-      const retentionCleanupPath = requestUrl.pathname === "/api/retention/cleanup" || requestUrl.pathname === "/api/retention/run";
-      if (retentionPolicyPath || retentionCleanupPath) {
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
-          sendJson(response, 401, { error: "unauthorized" });
-          return;
-        }
-        if (!retentionStore) {
-          sendJson(response, 503, { error: "retention_store_unavailable" });
-          return;
-        }
-        if (retentionPolicyPath && method === "GET") {
-          sendJson(response, 200, { policy: await retentionStore.getRetentionPolicy(lookup.session.member.workspaceId) });
-          return;
-        }
-        if ((retentionPolicyPath && (method === "PUT" || method === "PATCH" || method === "POST")) || (retentionCleanupPath && method === "POST")) {
-          if (!hasRetentionManagement(lookup.session.member)) {
-            sendJson(response, 403, { error: "missing_capability", capability: capabilities.retentionManage });
-            return;
-          }
-          try {
-            if (retentionCleanupPath) {
-              sendJson(response, 200, { result: await runRetentionCleanup(lookup.session.member, retentionStore) });
-            } else {
-              const policy = await updateRetentionPolicy(lookup.session.member, retentionStore, await parseRetentionRequest(request));
-              sendJson(response, 200, { policy });
-            }
-          } catch (error: unknown) {
-            if (error instanceof RetentionValidationError) {
-              sendJson(response, 400, { error: "invalid_retention_policy", issues: error.issues });
-              return;
-            }
-            throw error;
-          }
-          return;
-        }
-        sendJson(response, 405, { error: "method_not_allowed" });
-        return;
-      }
-      const correlationDecisionMatch = requestUrl.pathname.match(/^\/api\/correlations\/suggestions\/([^/]+)\/(confirm|reject)$/);
-      const correlationGetMatch = requestUrl.pathname.match(/^\/api\/correlations\/suggestions\/([^/]+)$/);
-      if (requestUrl.pathname === "/api/correlations/suggestions" || correlationDecisionMatch || correlationGetMatch) {
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
-          sendJson(response, 401, { error: "unauthorized" });
-          return;
-        }
-        if (!hasTimelineAccess(lookup.session)) {
-          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
-          return;
-        }
-        if (!hasCorrelationStore(timelineStore)) {
-          sendJson(response, 503, { error: "correlation_store_unavailable" });
-          return;
-        }
-        if (method === "GET" && requestUrl.pathname === "/api/correlations/suggestions") {
-          sendJson(response, 200, { suggestions: await timelineStore.listCorrelationSuggestions(lookup.session.member.workspaceId) });
-          return;
-        }
-        if (method === "GET" && correlationGetMatch) {
-          const suggestion = await timelineStore.getCorrelationSuggestion(lookup.session.member.workspaceId, correlationGetMatch[1] ?? "");
-          if (!suggestion) {
-            sendJson(response, 404, { error: "correlation_suggestion_not_found" });
-            return;
-          }
-          sendJson(response, 200, { suggestion });
-          return;
-        }
-        if (method !== "POST" || !correlationDecisionMatch) {
-          sendJson(response, 405, { error: "method_not_allowed" });
-          return;
-        }
-        if (!hasCorrelationReview(lookup.session.member)) {
-          sendJson(response, 403, { error: "missing_capability", capability: capabilities.correlationReview });
-          return;
-        }
-        let suggestionId = "";
-        try { suggestionId = decodeURIComponent(correlationDecisionMatch[1] ?? ""); } catch { /* invalid id handled below */ }
-        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(suggestionId)) {
-          sendJson(response, 400, { error: "invalid_correlation_suggestion" });
-          return;
-        }
-        try {
-          const result = correlationDecisionMatch[2] === "confirm"
-            ? await confirmCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId)
-            : await rejectCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId);
-          if (!result) {
-            sendJson(response, 404, { error: "correlation_suggestion_not_found" });
-            return;
-          }
-          sendJson(response, 200, result);
-        } catch (error: unknown) {
-          if (error instanceof CorrelationDecisionConflictError) {
-            sendJson(response, 409, { error: "correlation_suggestion_already_decided", status: error.status });
-            return;
-          }
-          throw error;
-        }
-        return;
-      }
-      const experimentMatch = requestUrl.pathname.match(/^\/api\/experiments\/([^/]+)$/);
-      if (requestUrl.pathname === "/api/experiments" || experimentMatch) {
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
-          sendJson(response, 401, { error: "unauthorized" });
-          return;
-        }
-        if (!hasTimelineAccess(lookup.session)) {
-          sendJson(response, 403, { error: "missing_capability", capability: capabilities.timelineRead });
-          return;
-        }
-        if (!experimentStore) {
-          sendJson(response, 503, { error: "experiment_store_unavailable" });
-          return;
-        }
-        if (method === "GET") {
-          if (experimentMatch) {
-            const experiment = await experimentStore.getExperiment(lookup.session.member.workspaceId, experimentMatch[1] ?? "");
-            if (!experiment) {
-              sendJson(response, 404, { error: "experiment_not_found" });
-              return;
-            }
-            sendJson(response, 200, { experiment });
-          } else {
-            sendJson(response, 200, { experiments: await experimentStore.listExperiments(lookup.session.member.workspaceId) });
-          }
-          return;
-        }
-        const creating = requestUrl.pathname === "/api/experiments" && method === "POST";
-        const updating = Boolean(experimentMatch) && (method === "PATCH" || method === "PUT");
-        if (!creating && !updating) {
-          sendJson(response, 405, { error: "method_not_allowed" });
-          return;
-        }
-        if (!hasExperimentWrite(lookup.session.member)) {
-          sendJson(response, 403, { error: "missing_capability", capability: capabilities.experimentWrite });
-          return;
-        }
-        const input = await parseExperimentRequest(request);
-        try {
-          if (creating) {
-            const experiment = await experimentStore.createExperiment(lookup.session.member.workspaceId, lookup.session.member.id, input);
-            sendJson(response, 201, { experiment });
-          } else {
-            const experiment = await experimentStore.updateExperiment(lookup.session.member.workspaceId, experimentMatch?.[1] ?? "", input);
-            if (!experiment) {
-              sendJson(response, 404, { error: "experiment_not_found" });
-              return;
-            }
-            sendJson(response, 200, { experiment });
-          }
-        } catch (error: unknown) {
-          if (error instanceof ExperimentValidationError) {
-            sendJson(response, 400, { error: "invalid_experiment", issues: error.issues });
-            return;
-          }
-          if (error instanceof ExperimentLifecycleError) {
-            sendJson(response, 409, { error: "invalid_experiment_lifecycle", from: error.from, to: error.to });
-            return;
-          }
-          throw error;
-        }
-        return;
-      }
-      if (requestUrl.pathname === "/api/logs/recent") {
-        response.setHeader("cache-control", "no-store");
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
-          sendJson(response, 401, { error: "unauthorized" });
-          return;
-        }
-        if (!hasLogReadCapability(lookup.session.member)) {
-          sendJson(response, 403, { error: "missing_capability", capability: capabilities.logsRead });
-          return;
-        }
-        if (!logAuditStore) {
-          sendJson(response, 503, { error: "recent_log_window_unavailable" });
-          return;
-        }
-        if (method !== "POST") {
-          sendJson(response, 405, { error: "method_not_allowed" });
-          return;
-        }
-        let input: unknown;
-        try {
-          input = JSON.parse(await requestBody(request)) as unknown;
-        } catch {
-          sendJson(response, 400, { error: "invalid_json" });
-          return;
-        }
-        try {
-          const recentLogs = await requestRecentLogWindow({
-            member: lookup.session.member,
-            scope: await scopeForSession(lookup.session),
-            input,
-            adapter: logAdapter,
-            ...(logAuditStore ? { auditStore: logAuditStore } : {}),
-            telemetry: recentLogTelemetry(requestSpan.correlation),
-          });
-          sendJson(response, 200, { window: recentLogs });
-        } catch (error: unknown) {
-          if (error instanceof RecentLogWindowValidationError) {
-            sendJson(response, 400, { error: "invalid_recent_log_window", issues: error.issues });
-            return;
-          }
-          sendJson(response, 503, { error: "recent_log_window_unavailable" });
-        }
-        return;
-      }
-      if (requestUrl.pathname === "/logs/recent" && method === "POST") {
-        response.setHeader("cache-control", "no-store");
-        const lookup = await sessionForRequest(request);
-        const messages = messagesFor(language);
-        if (!lookup.session) {
-          response.statusCode = lookup.rejection ? 403 : 302;
-          if (lookup.rejection) {
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderRejectionPage(language, lookup.rejection));
-          } else {
-            response.setHeader("location", `/?lang=${language}`);
-            response.end();
-          }
-          return;
-        }
-        const scope = await scopeForSession(lookup.session);
-        if (!hasLogReadCapability(lookup.session.member)) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { logError: messages.logsReadDenied }));
-          return;
-        }
-        if (!logAuditStore) {
-          response.statusCode = 503;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { logError: messages.recentLogsUnavailable }));
-          return;
-        }
-        const fields = requestFields(await requestBody(request), request.headers?.["content-type"]);
-        if (!fields) {
-          response.statusCode = 400;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { logError: messages.recentLogsInvalid }));
-          return;
-        }
-        try {
-          const recentLogs = await requestRecentLogWindow({
-            member: lookup.session.member,
-            scope,
-            input: formLogInput(new URLSearchParams(Object.entries(fields))),
-            adapter: logAdapter,
-            ...(logAuditStore ? { auditStore: logAuditStore } : {}),
-            telemetry: recentLogTelemetry(requestSpan.correlation),
-          });
-          response.statusCode = 200;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { logResult: recentLogs }));
-        } catch (error: unknown) {
-          response.statusCode = error instanceof RecentLogWindowValidationError ? 400 : 503;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, {
-            logError: error instanceof RecentLogWindowValidationError ? messages.recentLogsInvalid : messages.recentLogsUnavailable,
-          }));
-        }
-        return;
-      }
-      const attentionReviewPageMatch = requestUrl.pathname.match(/^\/timeline\/entries\/([^/]+)\/review$/);
-      if (attentionReviewPageMatch && method === "POST") {
-        const lookup = await sessionForRequest(request);
-        const messages = messagesFor(language);
-        if (!lookup.session) {
-          response.statusCode = lookup.rejection ? 403 : 302;
-          if (lookup.rejection) {
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderRejectionPage(language, lookup.rejection));
-          } else {
-            response.setHeader("location", `/?lang=${language}`);
-            response.end();
-          }
-          return;
-        }
-        const scope = await scopeForSession(lookup.session);
-        if (!hasTimelineAccess(lookup.session)) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.attentionReviewInvalid }));
-          return;
-        }
-        if (!timelineStore?.reviewAttentionItem) {
-          response.statusCode = 503;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.attentionReviewUnavailable }));
-          return;
-        }
-        let entryId = "";
-        try { entryId = decodeURIComponent(attentionReviewPageMatch[1] ?? ""); } catch { /* invalid id handled below */ }
-        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(entryId)) {
-          response.statusCode = 400;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.attentionReviewInvalid }));
-          return;
-        }
-        const result = await timelineStore.reviewAttentionItem(lookup.session.member.workspaceId, lookup.session.member.id, entryId);
-        if (!result) {
-          response.statusCode = 404;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.attentionNotFound }));
-          return;
-        }
-        response.statusCode = 303;
-        response.setHeader("location", `/app?lang=${language}&attention=reviewed`);
-        response.end();
-        return;
-      }
-      const correlationDecisionPageMatch = requestUrl.pathname.match(/^\/correlations\/suggestions\/([^/]+)\/(confirm|reject)$/);
-      if (correlationDecisionPageMatch && method === "POST") {
-        const lookup = await sessionForRequest(request);
-        const messages = messagesFor(language);
-        if (!lookup.session) {
-          response.statusCode = lookup.rejection ? 403 : 302;
-          if (lookup.rejection) {
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderRejectionPage(language, lookup.rejection));
-          } else {
-            response.setHeader("location", `/?lang=${language}`);
-            response.end();
-          }
-          return;
-        }
-        if (!hasTimelineAccess(lookup.session) || !hasCorrelationStore(timelineStore)) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messages.correlationReviewDenied }));
-          return;
-        }
-        if (!hasCorrelationReview(lookup.session.member)) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messages.correlationReviewDenied }, [], [], undefined, [], await correlationSuggestionsForSession(lookup.session)));
-          return;
-        }
-        let suggestionId = "";
-        try { suggestionId = decodeURIComponent(correlationDecisionPageMatch[1] ?? ""); } catch { /* invalid id handled below */ }
-        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(suggestionId)) {
-          response.statusCode = 400;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messages.noCorrelationSuggestions }));
-          return;
-        }
-        try {
-          const result = correlationDecisionPageMatch[2] === "confirm"
-            ? await confirmCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId)
-            : await rejectCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId);
-          if (!result) {
-            response.statusCode = 404;
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messages.noCorrelationSuggestions }));
-            return;
-          }
-          response.statusCode = 303;
-          response.setHeader("location", `/app?lang=${language}&correlation=${result.suggestion.status}`);
-          response.end();
-        } catch (error: unknown) {
-          if (error instanceof CorrelationDecisionConflictError) {
-            response.statusCode = 409;
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { correlationError: messages.correlationDecisionConflict }));
-            return;
-          }
-          throw error;
-        }
-        return;
-      }
-      const experimentPageMatch = requestUrl.pathname.match(/^\/experiments\/([^/]+)$/);
-      if (requestUrl.pathname === "/experiments" || experimentPageMatch) {
-        const lookup = await sessionForRequest(request);
-        const messages = messagesFor(language);
-        if (!lookup.session) {
-          response.statusCode = lookup.rejection ? 403 : 302;
-          if (lookup.rejection) {
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderRejectionPage(language, lookup.rejection));
-          } else {
-            response.setHeader("location", `/?lang=${language}`);
-            response.end();
-          }
-          return;
-        }
-        if (!hasWorkspaceAccess(lookup.session)) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderRejectionPage(language, "admission_required"));
-          return;
-        }
-        if (!experimentStore) {
-          response.statusCode = 503;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }));
-          return;
-        }
-        const experiments = await experimentStore.listExperiments(lookup.session.member.workspaceId);
-        const correlationSuggestions = hasTimelineAccess(lookup.session)
-          ? await correlationSuggestionsForSession(lookup.session)
-          : [];
-        if (method === "GET") {
-          if (experimentPageMatch && !experiments.some((experiment) => experiment.id === experimentPageMatch[1])) {
-            response.statusCode = 404;
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }, [], experiments));
-            return;
-          }
-          const timelineEntries = timelineStore && hasTimelineAccess(lookup.session)
-            ? (await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, { limit: 100 })).entries
-            : [];
-          response.statusCode = 200;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), undefined, timelineEntries, experiments, undefined, [], correlationSuggestions));
-          return;
-        }
-        const creating = requestUrl.pathname === "/experiments" && method === "POST";
-        const updating = Boolean(experimentPageMatch) && method === "POST";
-        if (!creating && !updating) {
-          response.statusCode = 405;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }, [], experiments));
-          return;
-        }
-        if (!hasExperimentWrite(lookup.session.member)) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentWriteDenied }, [], experiments));
-          return;
-        }
-        try {
-          if (creating) {
-            await experimentStore.createExperiment(lookup.session.member.workspaceId, lookup.session.member.id, await parseExperimentRequest(request));
-            response.statusCode = 303;
-            response.setHeader("location", `/app?lang=${language}&experiment=created`);
-          } else {
-            const updated = await experimentStore.updateExperiment(lookup.session.member.workspaceId, experimentPageMatch?.[1] ?? "", await parseExperimentRequest(request));
-            if (!updated) {
-              response.statusCode = 404;
-              response.setHeader("content-type", "text/html; charset=utf-8");
-              response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }, [], experiments));
-              return;
-            }
-            response.statusCode = 303;
-            response.setHeader("location", `/app?lang=${language}&experiment=updated`);
-          }
-          response.end();
-        } catch (error: unknown) {
-          const message = error instanceof ExperimentValidationError || error instanceof ExperimentLifecycleError
-            ? `${messages.experimentInvalid} ${error.message}`
-            : messages.experimentUnavailable;
-          const latest = await experimentStore.listExperiments(lookup.session.member.workspaceId);
-          response.statusCode = error instanceof ExperimentLifecycleError ? 409 : 400;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: message }, [], latest));
-        }
-        return;
-      }
-      const retentionUpdatePage = requestUrl.pathname === "/retention/update" && method === "POST";
-      const retentionCleanupPage = requestUrl.pathname === "/retention/cleanup" && method === "POST";
-      if (retentionUpdatePage || retentionCleanupPage) {
-        const lookup = await sessionForRequest(request);
-        const messages = messagesFor(language);
-        if (!lookup.session) {
-          response.statusCode = lookup.rejection ? 403 : 302;
-          if (lookup.rejection) {
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderRejectionPage(language, lookup.rejection));
-          } else {
-            response.setHeader("location", `/?lang=${language}`);
-            response.end();
-          }
-          return;
-        }
-        const scope = await scopeForSession(lookup.session);
-        const policy = await retentionPolicyForSession(lookup.session);
-        if (!retentionStore) {
-          response.statusCode = 503;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { retentionError: messages.retentionUnavailable }, [], [], undefined, [], [], policy));
-          return;
-        }
-        if (!hasRetentionManagement(lookup.session.member)) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { retentionError: messages.retentionManageDenied }, [], [], undefined, [], [], policy));
-          return;
-        }
-        try {
-          if (retentionCleanupPage) {
-            const result = await runRetentionCleanup(lookup.session.member, retentionStore);
-            response.statusCode = 303;
-            const cleanupQuery = new URLSearchParams({
-              lang: language,
-              retention: "cleanup",
-              eligible: String(result.eligibleObservations),
-              protected: String(result.protectedObservations),
-              deleted: String(result.deletedObservations),
-              entries: String(result.deletedTimelineEntries),
-              failures: String(result.failures),
-            });
-            response.setHeader("location", `/app?${cleanupQuery.toString()}`);
-          } else {
-            const fields = requestFields(await requestBody(request), request.headers?.["content-type"]);
-            if (!fields) throw new RetentionValidationError([{ field: "retentionDays", message: "must be a valid request" }]);
-            await updateRetentionPolicy(lookup.session.member, retentionStore, fields);
-            response.statusCode = 303;
-            response.setHeader("location", `/app?lang=${language}&retention=updated`);
-          }
-          response.end();
-        } catch (error: unknown) {
-          response.statusCode = error instanceof RetentionValidationError ? 400 : 503;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, {
-            retentionError: error instanceof RetentionValidationError ? messages.retentionInvalid : messages.retentionUnavailable,
-          }, [], [], undefined, [], [], policy));
-        }
-        return;
-      }
-      if (requestUrl.pathname === "/api/cluster" || requestUrl.pathname === "/api/cluster/scope") {
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
-          sendJson(response, 401, { error: "unauthorized" });
-          return;
-        }
-        if (method === "GET") {
-          sendJson(response, 200, { scope: await scopeForSession(lookup.session) });
-          return;
-        }
-        if (method !== "POST" && method !== "PUT") {
-          sendJson(response, 405, { error: "method_not_allowed" });
-          return;
-        }
-        if (!hasClusterConfigureCapability(lookup.session.member)) {
-          sendJson(response, 403, { error: "missing_capability", capability: capabilities.clusterConfigure });
-          return;
-        }
-        let input: unknown;
-        try {
-          input = JSON.parse(await requestBody(request)) as unknown;
-        } catch {
-          sendJson(response, 400, { error: "invalid_json" });
-          return;
-        }
-        try {
-          const scope = await configureClusterScope(lookup.session.member, clusterScopeStore, input);
-          sendJson(response, 200, { scope });
-        } catch (error: unknown) {
-          if (error instanceof ClusterScopeValidationError) {
-            sendJson(response, 400, { error: "invalid_cluster_scope", issues: error.issues });
-            return;
-          }
-          throw error;
-        }
-        return;
-      }
-      if (requestUrl.pathname === "/cluster/configure" && method === "POST") {
-        const lookup = await sessionForRequest(request);
-        const messages = messagesFor(language);
-        if (!lookup.session) {
-          response.statusCode = lookup.rejection ? 403 : 302;
-          if (lookup.rejection) {
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderRejectionPage(language, lookup.rejection));
-          } else {
-            response.setHeader("location", `/?lang=${language}`);
-            response.end();
-          }
-          return;
-        }
-        const scope = await scopeForSession(lookup.session);
-        if (!hasClusterConfigureCapability(lookup.session.member)) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, scope, { error: messages.clusterConfigurationDenied }));
-          return;
-        }
-        const form = new URLSearchParams(await requestBody(request));
-        try {
-          await configureClusterScope(lookup.session.member, clusterScopeStore, formScopeInput(form));
-          response.statusCode = 303;
-          response.setHeader("location", `/app?lang=${language}&cluster=saved`);
-          response.end();
-        } catch (error: unknown) {
-          response.statusCode = 400;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          const errorMessage = error instanceof ClusterScopeValidationError
-            ? `${messages.clusterConfigurationInvalid} ${error.issues.map((issue) => issue.message).join(" ")}`
-            : messages.clusterConfigurationUnavailable;
-          response.end(renderApplicationPage(language, lookup.session, scope, { error: errorMessage }));
-        }
-        return;
-      }
+  const requestText = async (context: AppContext): Promise<string> => {
+    const body = await context.req.text();
+    if (body.length > 8192) throw new Error("request body too large");
+    return body;
+  };
+  const languageFor = (context: AppContext): Language => parseLanguage(context.req.query("lang"));
+  const json = (context: AppContext, status: 200 | 201 | 400 | 401 | 403 | 404 | 405 | 409 | 503, payload: unknown): Response => context.json(payload, status);
+  const html = (context: AppContext, status: 200 | 400 | 403 | 404 | 405 | 409 | 503, body: string): Response => context.html(body, status);
+  const empty = (context: AppContext, status: 302 | 303): Response => context.body(null, status);
+  const redirect = (context: AppContext, location: string, status: 302 | 303 = 303, headers?: HeadersInit): Response => {
+    context.header("location", location);
+    if (headers) for (const [name, value] of new Headers(headers)) context.header(name, value);
+    return empty(context, status);
+  };
+  const responseFrom = (context: AppContext, source: Response): Response => {
+    const headers = new Headers(source.headers);
+    const requestSpan = context.get("requestSpan");
+    headers.set("x-request-id", requestSpan.correlation.requestId);
+    headers.set("x-trace-id", requestSpan.correlation.traceId);
+    headers.set("traceparent", `00-${requestSpan.correlation.traceId}-${requestSpan.correlation.spanId}-01`);
+    return context.newResponse(source.body, { status: source.status as 200, headers });
+  };
+  const requestForm = async (context: AppContext): Promise<RequestFields | null> => requestFields(await requestText(context), context.req.header("content-type"));
+  const requestJson = async (context: AppContext): Promise<unknown> => {
+    try {
+      return JSON.parse(await requestText(context)) as unknown;
+    } catch {
+      return null;
+    }
+  };
+  const authOrigin = (context: AppContext): string => environment.BETTER_AUTH_URL ?? new URL(context.req.url).origin;
 
-      const isMembershipPage = requestUrl.pathname === "/members"
-        || requestUrl.pathname === "/members/invite"
-        || requestUrl.pathname === "/members/revoke"
-        || requestUrl.pathname === "/members/role";
-      const invitationMatch = requestUrl.pathname.match(/^\/api\/invitations\/([^/]+)(?:\/revoke)?$/);
-      const memberRoleMatch = requestUrl.pathname.match(/^\/api\/members\/([^/]+)\/role$/);
-      const isMembershipApi = requestUrl.pathname === "/api/members"
-        || requestUrl.pathname === "/api/invitations"
-        || requestUrl.pathname === "/api/audit"
-        || Boolean(invitationMatch)
-        || Boolean(memberRoleMatch);
-      if (isMembershipPage || isMembershipApi) {
-        const lookup = await sessionForRequest(request);
-        const isApi = isMembershipApi;
-        if (!lookup.session) {
-          if (isApi) jsonResponse(response, lookup.rejection ? 403 : 401, { error: lookup.rejection ?? "unauthorized" });
-          else {
-            response.statusCode = 302;
-            response.setHeader("location", `/?lang=${language}`);
-            response.end();
-          }
-          return;
-        }
-        if (!hasWorkspaceAccess(lookup.session) || !hasCapability(lookup.session.member, capabilities.membershipManage)) {
-          if (isApi) jsonResponse(response, 403, { error: "forbidden", capability: capabilities.membershipManage });
-          else {
-            response.statusCode = 403;
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderMembershipDeniedPage(language));
-          }
-          return;
-        }
-        if (!membershipStore) {
-          jsonResponse(response, 503, { error: "membership_store_unavailable" });
-          return;
-        }
-        if (isApi && method === "GET") {
-          if (requestUrl.pathname === "/api/members") jsonResponse(response, 200, { members: await membershipStore.listMembers() });
-          else if (requestUrl.pathname === "/api/invitations") jsonResponse(response, 200, { invitations: await membershipStore.listInvitations() });
-          else if (requestUrl.pathname === "/api/audit") jsonResponse(response, 200, { records: await membershipStore.listAuditRecords() });
-          else jsonResponse(response, 404, { error: "not_found" });
-          return;
-        }
-        if (isApi && method !== "POST" && method !== "PATCH" && method !== "DELETE") {
-          jsonResponse(response, 405, { error: "method_not_allowed" });
-          return;
-        }
-        const body = method === "GET" || method === "HEAD" ? "" : await requestBody(request);
-        const fields = requestFields(body, request.headers?.["content-type"]);
-        const responseLanguage = !isApi && fields?.lang ? parseLanguage(fields.lang) : language;
-        const actor = lookup.session.member;
-        try {
-          if (requestUrl.pathname === "/api/invitations" && method === "POST") {
-            if (!fields?.email) {
-              jsonResponse(response, 400, { error: "invalid_request" });
-              return;
-            }
-            const invitation = await membershipStore.createInvitation(fields.email, actor);
-            jsonResponse(response, 201, { invitation });
-            return;
-          }
-          if (invitationMatch && (method === "DELETE" || (method === "POST" && requestUrl.pathname.endsWith("/revoke")))) {
-            const invitation = await membershipStore.revokeInvitation(invitationMatch[1] ?? "", actor);
-            if (!invitation) {
-              jsonResponse(response, 404, { error: "invitation_not_found_or_unusable" });
-              return;
-            }
-            jsonResponse(response, 200, { invitation });
-            return;
-          }
-          if (memberRoleMatch && (method === "PATCH" || method === "POST")) {
-            const role = fields?.role;
-            if (!role || !isRole(role)) {
-              jsonResponse(response, 400, { error: "invalid_role" });
-              return;
-            }
-            const member = await membershipStore.assignMemberRole(memberRoleMatch[1] ?? "", role, actor);
-            if (!member) {
-              jsonResponse(response, 404, { error: "member_not_found" });
-              return;
-            }
-            jsonResponse(response, 200, { member });
-            return;
-          }
-          if (isApi) {
-            jsonResponse(response, 404, { error: "not_found" });
-            return;
-          }
-          if (requestUrl.pathname === "/members" && method === "GET") {
-            response.statusCode = 200;
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            const notice = requestUrl.searchParams.get("notice");
-            const messages = messagesFor(language);
-            const noticeText = notice === "created" ? messages.invitationCreated : notice === "revoked" ? messages.invitationRevoked : notice === "role" ? messages.roleChanged : undefined;
-            response.end(renderMembersPage(language, lookup.session, await membershipStore.listMembers(), await membershipStore.listInvitations(), noticeText));
-            return;
-          }
-          if (!fields) {
-            response.statusCode = 400;
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderMembershipDeniedPage(responseLanguage));
-            return;
-          }
-          if (requestUrl.pathname === "/members/invite" && method === "POST") {
-            if (!fields.email) throw new Error("invalid request");
-            await membershipStore.createInvitation(fields.email, actor);
-            response.statusCode = 303;
-            response.setHeader("location", `/members?lang=${responseLanguage}&notice=created`);
-            response.end();
-            return;
-          }
-          if (requestUrl.pathname === "/members/revoke" && method === "POST") {
-            if (!fields.invitationId || !await membershipStore.revokeInvitation(fields.invitationId, actor)) throw new Error("invitation unavailable");
-            response.statusCode = 303;
-            response.setHeader("location", `/members?lang=${responseLanguage}&notice=revoked`);
-            response.end();
-            return;
-          }
-          if (requestUrl.pathname === "/members/role" && method === "POST") {
-            if (!fields.memberId || !fields.role || !isRole(fields.role) || !await membershipStore.assignMemberRole(fields.memberId, fields.role as Role, actor)) throw new Error("member unavailable");
-            response.statusCode = 303;
-            response.setHeader("location", `/members?lang=${responseLanguage}&notice=role`);
-            response.end();
-            return;
-          }
-          response.statusCode = 404;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderMembershipDeniedPage(responseLanguage));
-        } catch (error) {
-          const rootError = error instanceof Error && error.cause instanceof Error ? error.cause : error;
-          if (isApi && rootError instanceof LastWorkspaceOwnerError) {
-            jsonResponse(response, 409, { error: "last_workspace_owner" });
-            return;
-          }
-          const message = error instanceof Error && /valid email|invalid request|unavailable/.test(error.message) ? error.message : "membership operation failed";
-          if (isApi) jsonResponse(response, 400, { error: message });
-          else {
-            response.statusCode = 400;
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderMembershipDeniedPage(responseLanguage));
-          }
-        }
-        return;
-      }
-      if (method !== "GET") {
-        response.statusCode = 405;
-        response.setHeader("content-type", "application/json; charset=utf-8");
-        response.end(JSON.stringify({ error: "method_not_allowed" }));
-        return;
-      }
-      if (requestUrl.pathname === "/metrics") {
-        await status();
-        syncWebMetrics();
-        response.statusCode = 200;
-        response.setHeader("content-type", "text/plain; version=0.0.4; charset=utf-8");
-        response.end(telemetry.metricsText());
-        return;
-      }
-      if (requestUrl.pathname === "/health/live") {
-        response.statusCode = 200;
-        response.setHeader("content-type", "application/json; charset=utf-8");
-        response.end(JSON.stringify({ service: "tracegarden-web", status: stopping ? "stopping" : "alive", liveness: stopping ? "stopping" : "alive" }));
-        return;
-      }
-      if (requestUrl.pathname === "/health/startup" || requestUrl.pathname === "/health/readiness" || requestUrl.pathname === "/api/status") {
-        const current = await status();
-        const healthy = requestUrl.pathname === "/health/startup"
-          ? current.startup === "ready"
-          : current.readiness === "ready";
-        response.statusCode = healthy ? 200 : 503;
-        response.setHeader("content-type", "application/json; charset=utf-8");
-        response.end(JSON.stringify(requestUrl.pathname === "/health/startup" ? { ...current, status: healthy ? "ready" : "not-ready" } : current));
-        return;
-      }
-      if (requestUrl.pathname === "/api/session") {
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session || !hasWorkspaceAccess(lookup.session)) {
-          response.statusCode = 401;
-          response.setHeader("content-type", "application/json; charset=utf-8");
-          response.end(JSON.stringify({ error: "unauthorized" }));
-          return;
-        }
-        response.statusCode = 200;
-        response.setHeader("content-type", "application/json; charset=utf-8");
-        response.end(JSON.stringify({ member: lookup.session.member }));
-        return;
-      }
-      if (requestUrl.pathname === "/app" || requestUrl.pathname === "/timeline") {
-        const lookup = await sessionForRequest(request);
-        if (!lookup.session) {
-          if (lookup.rejection) {
-            response.statusCode = 403;
-            response.setHeader("content-type", "text/html; charset=utf-8");
-            response.end(renderRejectionPage(language, lookup.rejection));
-          } else {
-            response.statusCode = 302;
-            response.setHeader("location", `/?lang=${language}`);
-            response.end();
-          }
-          return;
-        }
-        if (!hasWorkspaceAccess(lookup.session)) {
-          response.statusCode = 403;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderRejectionPage(language, "admission_required"));
-          return;
-        }
-        let timelineQuery: TimelineQuery;
-        try {
-          timelineQuery = parseTimelineQuery(timelineQueryInput(requestUrl, true));
-        } catch (error: unknown) {
-          if (!(error instanceof TimelineQueryValidationError)) throw error;
-          response.statusCode = 400;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
-          return;
-        }
-        let timelinePage: TimelinePage;
-        try {
-          timelinePage = timelineStore && hasTimelineAccess(lookup.session)
-            ? await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, timelineQuery, lookup.session.member.id)
-            : { entries: [], nextCursor: null };
-        } catch (error: unknown) {
-          if (!(error instanceof TimelineQueryValidationError)) throw error;
-          response.statusCode = 400;
-          response.setHeader("content-type", "text/html; charset=utf-8");
-          response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
-          return;
-        }
-        const experiments = experimentStore && hasTimelineAccess(lookup.session)
-          ? await experimentStore.listExperiments(lookup.session.member.workspaceId)
-          : [];
-        const correlationSuggestions = hasTimelineAccess(lookup.session)
-          ? await correlationSuggestionsForSession(lookup.session)
-          : [];
-        const retentionPolicy = await retentionPolicyForSession(lookup.session);
-        const cleanupResult = retentionCleanupQueryResult(requestUrl, retentionPolicy);
-        const experimentNotice = requestUrl.searchParams.get("experiment");
-        response.statusCode = 200;
-        response.setHeader("content-type", "text/html; charset=utf-8");
-        response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
-          saved: requestUrl.searchParams.get("cluster") === "saved",
-          attentionReviewed: requestUrl.searchParams.get("attention") === "reviewed",
-          ...(experimentNotice === "created" ? { experimentSaved: "created" as const } : {}),
-          ...(experimentNotice === "updated" ? { experimentSaved: "updated" as const } : {}),
-          ...(requestUrl.searchParams.get("correlation") === "confirmed" ? { correlationDecision: "confirmed" as const } : {}),
-          ...(requestUrl.searchParams.get("correlation") === "rejected" ? { correlationDecision: "rejected" as const } : {}),
-          ...(requestUrl.searchParams.get("retention") === "updated" ? { retentionSaved: true } : {}),
-          ...(cleanupResult === undefined ? {} : { retentionResult: cleanupResult }),
-        }, timelinePage.entries, timelinePage, timelineQuery, experiments, correlationSuggestions, retentionPolicy));
-        return;
-      }
-      if (requestUrl.pathname === "/") {
-        const current = await status();
-        const lookup = await sessionForRequest(request);
-        response.statusCode = current.status === "ready" ? 200 : 503;
-        response.setHeader("content-type", "text/html; charset=utf-8");
-        if (lookup.rejection) {
-          response.statusCode = 403;
-          response.end(renderRejectionPage(language, lookup.rejection));
-        } else if (lookup.session && !hasWorkspaceAccess(lookup.session)) {
-          response.statusCode = 403;
-          response.end(renderRejectionPage(language, "admission_required"));
-        } else {
-          if (lookup.session) {
-            let timelineQuery: TimelineQuery;
-            try {
-              timelineQuery = parseTimelineQuery(timelineQueryInput(requestUrl, true));
-            } catch (error: unknown) {
-              if (!(error instanceof TimelineQueryValidationError)) throw error;
-              response.statusCode = 400;
-              response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
-              return;
-            }
-            let timelinePage: TimelinePage;
-            try {
-              timelinePage = timelineStore && hasTimelineAccess(lookup.session)
-                ? await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, timelineQuery, lookup.session.member.id)
-                : { entries: [], nextCursor: null };
-            } catch (error: unknown) {
-              if (!(error instanceof TimelineQueryValidationError)) throw error;
-              response.statusCode = 400;
-              response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
-              return;
-            }
-            const experiments = experimentStore && hasTimelineAccess(lookup.session)
-              ? await experimentStore.listExperiments(lookup.session.member.workspaceId)
-              : [];
-            const correlationSuggestions = hasTimelineAccess(lookup.session)
-              ? await correlationSuggestionsForSession(lookup.session)
-              : [];
-            const retentionPolicy = await retentionPolicyForSession(lookup.session);
-            const cleanupResult = retentionCleanupQueryResult(requestUrl, retentionPolicy);
-            response.end(renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
-              attentionReviewed: requestUrl.searchParams.get("attention") === "reviewed",
-              ...(requestUrl.searchParams.get("correlation") === "confirmed" ? { correlationDecision: "confirmed" as const } : {}),
-              ...(requestUrl.searchParams.get("correlation") === "rejected" ? { correlationDecision: "rejected" as const } : {}),
-              ...(requestUrl.searchParams.get("retention") === "updated" ? { retentionSaved: true } : {}),
-              ...(cleanupResult === undefined ? {} : { retentionResult: cleanupResult }),
-            }, timelinePage.entries, timelinePage, timelineQuery, experiments, correlationSuggestions, retentionPolicy));
-          } else if (cloudflareAccess) {
-            sendJson(response, 401, { error: "cloudflare_access_jwt_required" });
-          } else {
-            response.end(renderLoginPage(language, current.checks.database === "ready", identityAdapter));
-          }
-        }
-        return;
-      }
-      response.statusCode = 404;
-      response.setHeader("content-type", "application/json; charset=utf-8");
-      response.end(JSON.stringify({ error: "not_found" }));
-    })().catch((error: unknown) => {
-      response.statusCode = 503;
-      response.setHeader("content-type", "application/json; charset=utf-8");
-      response.end(JSON.stringify({ error: "service_unavailable" }));
-      telemetry.log("error", "web.request.failure", correlation, { error_type: error instanceof Error ? error.name : "unknown", status_code: response.statusCode });
-      requestSpan.fail(error);
-    }).finally(() => {
-      requestSpan.end({ status_code: response.statusCode });
+  const betterAuth = async (context: AppContext): Promise<Response> => {
+    if (!betterAuthRuntime) return context.req.method === "GET" ? context.notFound() : json(context, 405, { error: "method_not_allowed" });
+    const body = context.req.method === "GET" || context.req.method === "HEAD" ? undefined : await requestText(context);
+    const authRequest = new Request(new URL(context.req.url).toString(), {
+      method: context.req.method,
+      headers: requestHeaders(context.req.raw),
+      ...(body === undefined ? {} : { body }),
     });
+    return responseFrom(context, await betterAuthRuntime.handler(authRequest));
+  };
+  const login = async (context: AppContext): Promise<Response> => {
+    const language = languageFor(context);
+    if (context.req.method === "GET") {
+      if (cloudflareAccess) return json(context, 401, { error: "cloudflare_access_jwt_required" });
+      const current = await status();
+      return html(context, current.status === "ready" ? 200 : 503, renderLoginPage(language, current.checks.database === "ready", identityAdapter));
+    }
+    if (cloudflareAccess || identityAdapter.kind !== "local") {
+      return json(context, 405, { error: cloudflareAccess ? "cloudflare_access_jwt_required" : "google_login_required" });
+    }
+    const form = new URLSearchParams(await requestText(context));
+    const selected = form.get("identity") ?? "";
+    const selectedLanguage = parseLanguage(form.get("lang"));
+    const identity = identityAdapter.resolve(selected);
+    if (!identity) return html(context, 403, renderRejectionPage(selectedLanguage, "invalid_identity"));
+    const admission = await admissionStore.admit(identity);
+    if (!admission.admitted) return html(context, 403, renderRejectionPage(selectedLanguage, admission.reason));
+    context.header("set-cookie", cookieHeader(admission.session.token, environment.NODE_ENV === "production"));
+    return redirect(context, `/app?lang=${selectedLanguage}`);
+  };
+  const logout = async (context: AppContext): Promise<Response> => {
+    const language = languageFor(context);
+    if (betterAuthRuntime) {
+      const authResponse = await betterAuthRuntime.handler(new Request(new URL("/api/auth/sign-out", authOrigin(context)).toString(), {
+        method: "POST",
+        headers: requestHeaders(context.req.raw),
+      }));
+      const headers = new Headers(authResponse.headers);
+      headers.set("location", `/?lang=${language}`);
+      headers.set("x-request-id", context.get("requestSpan").correlation.requestId);
+      headers.set("x-trace-id", context.get("requestSpan").correlation.traceId);
+      headers.set("traceparent", `00-${context.get("requestSpan").correlation.traceId}-${context.get("requestSpan").correlation.spanId}-01`);
+      return context.newResponse(null, { status: 303, headers });
+    }
+    context.header("set-cookie", "tracegarden_session=; Max-Age=0; HttpOnly; Path=/; SameSite=Lax");
+    return redirect(context, `/?lang=${language}`);
+  };
+  const googleLogin = async (context: AppContext): Promise<Response> => {
+    if (!betterAuthRuntime) return context.notFound();
+    const language = languageFor(context);
+    const authResponse = await betterAuthRuntime.handler(new Request(new URL("/api/auth/sign-in/social", authOrigin(context)).toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ provider: "google", callbackURL: `/app?lang=${language}` }),
+    }));
+    if (!authResponse.ok) return responseFrom(context, authResponse);
+    const payload = await authResponse.json() as { url?: unknown };
+    if (typeof payload.url !== "string") throw new Error("Better Auth did not return a Google authorization URL");
+    const headers = new Headers(authResponse.headers);
+    headers.set("location", payload.url);
+    return responseFrom(context, new Response(null, { status: 302, headers }));
   };
 
-  const server = createServer(requestHandler);
+  const unauthorized = (context: AppContext): Response => json(context, 401, { error: "unauthorized" });
+  const workspaceSession = async (context: AppContext): Promise<RequestSession> => sessionForRequest(context.req.raw);
+  const requireWorkspace = async (context: AppContext): Promise<AuthenticatedSession | Response> => {
+    const lookup = await workspaceSession(context);
+    if (!lookup.session || !hasWorkspaceAccess(lookup.session)) return unauthorized(context);
+    return lookup.session;
+  };
+  const requireTimeline = async (context: AppContext): Promise<AuthenticatedSession | Response> => {
+    const session = await requireWorkspace(context);
+    if (session instanceof Response) return session;
+    if (!hasTimelineAccess(session)) return json(context, 403, { error: "missing_capability", capability: capabilities.timelineRead });
+    return session;
+  };
+
+  const timelineStream = async (context: AppContext): Promise<Response> => {
+    const session = await requireTimeline(context);
+    if (session instanceof Response) return session;
+    if (!timelineNotifications) return json(context, 503, { error: "timeline_notifications_unavailable" });
+    const clientId = randomUUID();
+    let closed = false;
+    let unsubscribe: (() => void) | undefined;
+    let stream: SSEStreamingApi | undefined;
+    let finishStream = (): void => {};
+    let restoreOutgoingWrite = (): void => {};
+    const outgoing = context.env.outgoing;
+    const originalWrite = outgoing.write;
+    let destroyOutgoingOnClose = false;
+    const client: LiveSseClient = {
+      workspaceId: session.member.workspaceId,
+      memberId: session.member.id,
+      pendingNotification: null,
+      readySent: false,
+      hintCheckInFlight: false,
+      hintQueued: false,
+      cursorLagEntries: 0,
+      cursorLagSince: null,
+      close: () => {
+        if (closed) return;
+        closed = true;
+        liveSseClients.delete(clientId);
+        unsubscribe?.();
+        restoreOutgoingWrite();
+        finishStream();
+        if (destroyOutgoingOnClose && !outgoing.destroyed && !outgoing.writableEnded) outgoing.destroy();
+        if (stream && !stream.aborted && !stream.closed) stream.abort();
+      },
+    };
+    const sendAuthorizedHint = async (): Promise<void> => {
+      if (client.hintCheckInFlight || closed || !client.readySent || !stream) return;
+      client.hintCheckInFlight = true;
+      try {
+        while (!closed && client.pendingNotification) {
+          const notification = client.pendingNotification;
+          client.pendingNotification = null;
+          let entry: TimelineEntry | null = null;
+          try {
+            entry = await timelineStore?.getTimelineEntry(client.workspaceId, notification.entryId) ?? null;
+          } catch {
+            client.close();
+            return;
+          }
+          if (!entry || entry.workspaceId !== client.workspaceId) continue;
+          if (client.hintQueued) continue;
+          client.hintQueued = true;
+          await stream.writeSSE({ event: "timeline", data: JSON.stringify({ entryId: entry.id }) });
+          if (stream.aborted) {
+            client.close();
+            return;
+          }
+          void refreshLiveClientLag(client);
+          return;
+        }
+      } finally {
+        client.hintCheckInFlight = false;
+        if (!closed && client.pendingNotification && !client.hintQueued) void sendAuthorizedHint();
+      }
+    };
+    client.sendPendingHint = () => { void sendAuthorizedHint(); };
+    const onNotification = (notification: TimelineNotification): void => {
+      if (closed) return;
+      client.pendingNotification = notification;
+      if (!client.hintQueued) void sendAuthorizedHint();
+    };
+    liveSseClients.set(clientId, client);
+    const invokeOriginalWrite = originalWrite.bind(outgoing) as (chunk: string | Uint8Array, encoding?: BufferEncoding, callback?: () => void) => boolean;
+    const guardedWrite = (chunk: string | Uint8Array, encoding?: BufferEncoding, callback?: () => void): boolean => {
+      const accepted = invokeOriginalWrite(chunk, encoding, callback);
+      if (!accepted) {
+        destroyOutgoingOnClose = true;
+        client.close();
+      }
+      return accepted;
+    };
+    outgoing.write = guardedWrite as typeof outgoing.write;
+    restoreOutgoingWrite = (): void => {
+      if (outgoing.write === guardedWrite) outgoing.write = originalWrite;
+    };
+    const abort = (): void => client.close();
+    context.req.raw.signal.addEventListener("abort", abort, { once: true });
+    try {
+      unsubscribe = await timelineNotifications.subscribeTimeline(onNotification);
+      if (closed) {
+        unsubscribe();
+        return context.body(null, 204);
+      }
+      if (timelineNotifications.timelineNotificationsHealthy?.() === false) throw new Error("Timeline notifications are not healthy");
+    } catch {
+      timelineReady = false;
+      client.close();
+      return json(context, 503, { error: "timeline_notifications_unavailable" });
+    }
+    timelineReady = true;
+    context.header("cache-control", "no-store");
+    context.header("connection", "keep-alive");
+    context.header("x-accel-buffering", "no");
+    const response = streamSSE(context, async (nextStream) => {
+      stream = nextStream;
+      nextStream.onAbort(client.close);
+      await nextStream.writeSSE({ event: "ready", data: JSON.stringify({ clientId }) });
+      if (nextStream.aborted) {
+        client.close();
+        return;
+      }
+      client.readySent = true;
+      void sendAuthorizedHint();
+      // The ready marker is emitted only after LISTEN is active; the browser now recovers durably.
+      await new Promise<void>((resolve) => {
+        finishStream = resolve;
+        if (closed) resolve();
+      });
+    });
+    response.headers.set("content-type", "text/event-stream; charset=utf-8");
+    return response;
+  };
+  const timelineApi = async (context: AppContext): Promise<Response> => {
+    const session = await requireTimeline(context);
+    if (session instanceof Response) return session;
+    if (!timelineStore) return json(context, 503, { error: "timeline_store_unavailable" });
+    try {
+      const query = parseTimelineQuery(timelineQueryInput(context.req.query()));
+      const page = await timelineStore.listTimelineEntries(session.member.workspaceId, query, session.member.id);
+      const sseClientId = context.req.query("sseClientId");
+      const liveClient = sseClientId ? liveSseClients.get(sseClientId) : undefined;
+      if (liveClient && liveClient.workspaceId === session.member.workspaceId && liveClient.memberId === session.member.id) {
+        const cursor = page.nextCursor ?? page.resumeCursor ?? query.cursor;
+        liveClient.query = cursor ? { ...query, cursor } : { ...query };
+        liveClient.hintQueued = false;
+        const pendingNotification = liveClient.pendingNotification;
+        liveClient.pendingNotification = null;
+        if (pendingNotification) {
+          liveClient.pendingNotification = pendingNotification;
+          liveClient.sendPendingHint?.();
+        }
+        void refreshLiveClientLag(liveClient);
+      }
+      return json(context, 200, page);
+    } catch (error: unknown) {
+      if (error instanceof TimelineQueryValidationError) return json(context, 400, { error: "invalid_timeline_query", issues: error.issues });
+      throw error;
+    }
+  };
+  const timelineReviewApi = async (context: AppContext): Promise<Response> => {
+    const session = await requireTimeline(context);
+    if (session instanceof Response) return session;
+    if (!timelineStore?.reviewAttentionItem) return json(context, 503, { error: "attention_store_unavailable" });
+    const entryId = context.req.param("entryId") ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(entryId)) return json(context, 400, { error: "invalid_attention_review" });
+    const result = await timelineStore.reviewAttentionItem(session.member.workspaceId, session.member.id, entryId);
+    return result ? json(context, 200, result) : json(context, 404, { error: "attention_item_not_found" });
+  };
+
+  const retentionApi = async (context: AppContext): Promise<Response> => {
+    const session = await requireWorkspace(context);
+    if (session instanceof Response) return session;
+    if (!retentionStore) return json(context, 503, { error: "retention_store_unavailable" });
+    const isCleanup = context.req.path === "/api/retention/cleanup" || context.req.path === "/api/retention/run";
+    if (!isCleanup && context.req.method === "GET") return json(context, 200, { policy: await retentionStore.getRetentionPolicy(session.member.workspaceId) });
+    if (!hasRetentionManagement(session.member)) return json(context, 403, { error: "missing_capability", capability: capabilities.retentionManage });
+    try {
+      if (isCleanup) return json(context, 200, { result: await runRetentionCleanup(session.member, retentionStore) });
+      return json(context, 200, { policy: await updateRetentionPolicy(session.member, retentionStore, await parseRetentionRequest(context.req.raw)) });
+    } catch (error: unknown) {
+      if (error instanceof RetentionValidationError) return json(context, 400, { error: "invalid_retention_policy", issues: error.issues });
+      throw error;
+    }
+  };
+  const correlationApi = async (context: AppContext): Promise<Response> => {
+    const session = await requireTimeline(context);
+    if (session instanceof Response) return session;
+    if (!hasCorrelationStore(timelineStore)) return json(context, 503, { error: "correlation_store_unavailable" });
+    const suggestionId = context.req.param("suggestionId");
+    if (context.req.method === "GET") {
+      if (suggestionId) {
+        const suggestion = await timelineStore.getCorrelationSuggestion(session.member.workspaceId, suggestionId);
+        return suggestion ? json(context, 200, { suggestion }) : json(context, 404, { error: "correlation_suggestion_not_found" });
+      }
+      return json(context, 200, { suggestions: await timelineStore.listCorrelationSuggestions(session.member.workspaceId) });
+    }
+    if (!hasCorrelationReview(session.member)) return json(context, 403, { error: "missing_capability", capability: capabilities.correlationReview });
+    const decision = context.req.param("decision");
+    if (!suggestionId || (decision !== "confirm" && decision !== "reject")) return json(context, 400, { error: "invalid_correlation_suggestion" });
+    try {
+      const result = decision === "confirm"
+        ? await confirmCorrelationSuggestion(session.member, timelineStore, suggestionId)
+        : await rejectCorrelationSuggestion(session.member, timelineStore, suggestionId);
+      return result ? json(context, 200, result) : json(context, 404, { error: "correlation_suggestion_not_found" });
+    } catch (error: unknown) {
+      if (error instanceof CorrelationDecisionConflictError) return json(context, 409, { error: "correlation_suggestion_already_decided", status: error.status });
+      throw error;
+    }
+  };
+  const experimentApi = async (context: AppContext): Promise<Response> => {
+    const session = await requireTimeline(context);
+    if (session instanceof Response) return session;
+    if (!experimentStore) return json(context, 503, { error: "experiment_store_unavailable" });
+    const experimentId = context.req.param("experimentId");
+    if (context.req.method === "GET") {
+      if (experimentId) {
+        const experiment = await experimentStore.getExperiment(session.member.workspaceId, experimentId);
+        return experiment ? json(context, 200, { experiment }) : json(context, 404, { error: "experiment_not_found" });
+      }
+      return json(context, 200, { experiments: await experimentStore.listExperiments(session.member.workspaceId) });
+    }
+    const creating = !experimentId && context.req.method === "POST";
+    const updating = Boolean(experimentId) && (context.req.method === "PATCH" || context.req.method === "PUT");
+    if (!creating && !updating) return json(context, 405, { error: "method_not_allowed" });
+    if (!hasExperimentWrite(session.member)) return json(context, 403, { error: "missing_capability", capability: capabilities.experimentWrite });
+    try {
+      if (creating) return json(context, 201, { experiment: await experimentStore.createExperiment(session.member.workspaceId, session.member.id, await parseExperimentRequest(context.req.raw)) });
+      const experiment = await experimentStore.updateExperiment(session.member.workspaceId, experimentId ?? "", await parseExperimentRequest(context.req.raw));
+      return experiment ? json(context, 200, { experiment }) : json(context, 404, { error: "experiment_not_found" });
+    } catch (error: unknown) {
+      if (error instanceof ExperimentValidationError) return json(context, 400, { error: "invalid_experiment", issues: error.issues });
+      if (error instanceof ExperimentLifecycleError) return json(context, 409, { error: "invalid_experiment_lifecycle", from: error.from, to: error.to });
+      throw error;
+    }
+  };
+  const logApi = async (context: AppContext): Promise<Response> => {
+    context.header("cache-control", "no-store");
+    const session = await requireWorkspace(context);
+    if (session instanceof Response) return session;
+    if (!hasLogReadCapability(session.member)) return json(context, 403, { error: "missing_capability", capability: capabilities.logsRead });
+    if (!logAuditStore) return json(context, 503, { error: "recent_log_window_unavailable" });
+    let input: unknown;
+    try {
+      input = JSON.parse(await requestText(context)) as unknown;
+    } catch {
+      return json(context, 400, { error: "invalid_json" });
+    }
+    try {
+      const recentLogs = await requestRecentLogWindow({ member: session.member, scope: await scopeForSession(session), input, adapter: logAdapter, auditStore: logAuditStore, telemetry: recentLogTelemetry(context.get("requestSpan").correlation) });
+      return json(context, 200, { window: recentLogs });
+    } catch (error: unknown) {
+      if (error instanceof RecentLogWindowValidationError) return json(context, 400, { error: "invalid_recent_log_window", issues: error.issues });
+      return json(context, 503, { error: "recent_log_window_unavailable" });
+    }
+  };
+
+  const htmlUnauthenticated = (context: AppContext, lookup: RequestSession, language: Language): Response => lookup.rejection
+    ? html(context, 403, renderRejectionPage(language, lookup.rejection))
+    : redirect(context, `/?lang=${language}`, 302);
+  const logPage = async (context: AppContext): Promise<Response> => {
+    context.header("cache-control", "no-store");
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return htmlUnauthenticated(context, lookup, language);
+    const scope = await scopeForSession(lookup.session);
+    const messages = messagesFor(language);
+    if (!hasLogReadCapability(lookup.session.member)) return html(context, 403, renderApplicationPage(language, lookup.session, scope, { logError: messages.logsReadDenied }));
+    if (!logAuditStore) return html(context, 503, renderApplicationPage(language, lookup.session, scope, { logError: messages.recentLogsUnavailable }));
+    const fields = await requestForm(context);
+    if (!fields) return html(context, 400, renderApplicationPage(language, lookup.session, scope, { logError: messages.recentLogsInvalid }));
+    try {
+      const recentLogs = await requestRecentLogWindow({ member: lookup.session.member, scope, input: formLogInput(new URLSearchParams(Object.entries(fields))), adapter: logAdapter, auditStore: logAuditStore, telemetry: recentLogTelemetry(context.get("requestSpan").correlation) });
+      return html(context, 200, renderApplicationPage(language, lookup.session, scope, { logResult: recentLogs }));
+    } catch (error: unknown) {
+      return html(context, error instanceof RecentLogWindowValidationError ? 400 : 503, renderApplicationPage(language, lookup.session, scope, { logError: error instanceof RecentLogWindowValidationError ? messages.recentLogsInvalid : messages.recentLogsUnavailable }));
+    }
+  };
+  const timelineReviewPage = async (context: AppContext): Promise<Response> => {
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return htmlUnauthenticated(context, lookup, language);
+    const scope = await scopeForSession(lookup.session);
+    const messages = messagesFor(language);
+    if (!hasTimelineAccess(lookup.session)) return html(context, 403, renderApplicationPage(language, lookup.session, scope, { error: messages.attentionReviewInvalid }));
+    if (!timelineStore?.reviewAttentionItem) return html(context, 503, renderApplicationPage(language, lookup.session, scope, { error: messages.attentionReviewUnavailable }));
+    const entryId = context.req.param("entryId") ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(entryId)) return html(context, 400, renderApplicationPage(language, lookup.session, scope, { error: messages.attentionReviewInvalid }));
+    const result = await timelineStore.reviewAttentionItem(lookup.session.member.workspaceId, lookup.session.member.id, entryId);
+    return result ? redirect(context, `/app?lang=${language}&attention=reviewed`) : html(context, 404, renderApplicationPage(language, lookup.session, scope, { error: messages.attentionNotFound }));
+  };
+  const correlationPage = async (context: AppContext): Promise<Response> => {
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return htmlUnauthenticated(context, lookup, language);
+    const messages = messagesFor(language);
+    const scope = await scopeForSession(lookup.session);
+    if (!hasTimelineAccess(lookup.session) || !hasCorrelationStore(timelineStore)) return html(context, 403, renderApplicationPage(language, lookup.session, scope, { error: messages.correlationReviewDenied }));
+    if (!hasCorrelationReview(lookup.session.member)) return html(context, 403, renderApplicationPage(language, lookup.session, scope, { error: messages.correlationReviewDenied }, [], [], undefined, [], await correlationSuggestionsForSession(lookup.session)));
+    const suggestionId = context.req.param("suggestionId") ?? "";
+    const decision = context.req.param("decision");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(suggestionId) || (decision !== "confirm" && decision !== "reject")) return html(context, 400, renderApplicationPage(language, lookup.session, scope, { error: messages.noCorrelationSuggestions }));
+    try {
+      const result = decision === "confirm" ? await confirmCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId) : await rejectCorrelationSuggestion(lookup.session.member, timelineStore, suggestionId);
+      return result ? redirect(context, `/app?lang=${language}&correlation=${result.suggestion.status}`) : html(context, 404, renderApplicationPage(language, lookup.session, scope, { error: messages.noCorrelationSuggestions }));
+    } catch (error: unknown) {
+      if (error instanceof CorrelationDecisionConflictError) return html(context, 409, renderApplicationPage(language, lookup.session, scope, { correlationError: messages.correlationDecisionConflict }));
+      throw error;
+    }
+  };
+  const experimentPage = async (context: AppContext): Promise<Response> => {
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return htmlUnauthenticated(context, lookup, language);
+    if (!hasWorkspaceAccess(lookup.session)) return html(context, 403, renderRejectionPage(language, "admission_required"));
+    const messages = messagesFor(language);
+    if (!experimentStore) return html(context, 503, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }));
+    const experimentId = context.req.param("experimentId");
+    const experiments = await experimentStore.listExperiments(lookup.session.member.workspaceId);
+    const suggestions = hasTimelineAccess(lookup.session) ? await correlationSuggestionsForSession(lookup.session) : [];
+    if (context.req.method === "GET") {
+      if (experimentId && !experiments.some((experiment) => experiment.id === experimentId)) return html(context, 404, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }, [], experiments));
+      const timelineEntries = timelineStore && hasTimelineAccess(lookup.session) ? (await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, { limit: 100 })).entries : [];
+      return html(context, 200, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), undefined, timelineEntries, experiments, undefined, [], suggestions));
+    }
+    if ((!experimentId && context.req.path !== "/experiments") || (experimentId && context.req.method !== "POST")) return html(context, 405, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }, [], experiments));
+    if (!hasExperimentWrite(lookup.session.member)) return html(context, 403, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentWriteDenied }, [], experiments));
+    try {
+      if (!experimentId) await experimentStore.createExperiment(lookup.session.member.workspaceId, lookup.session.member.id, await parseExperimentRequest(context.req.raw));
+      else {
+        const updated = await experimentStore.updateExperiment(lookup.session.member.workspaceId, experimentId, await parseExperimentRequest(context.req.raw));
+        if (!updated) return html(context, 404, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: messages.experimentUnavailable }, [], experiments));
+      }
+      return redirect(context, `/app?lang=${language}&experiment=${experimentId ? "updated" : "created"}`);
+    } catch (error: unknown) {
+      const message = error instanceof ExperimentValidationError || error instanceof ExperimentLifecycleError ? `${messages.experimentInvalid} ${error.message}` : messages.experimentUnavailable;
+      const latest = await experimentStore.listExperiments(lookup.session.member.workspaceId);
+      return html(context, error instanceof ExperimentLifecycleError ? 409 : 400, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { experimentError: message }, [], latest));
+    }
+  };
+  const retentionPage = async (context: AppContext): Promise<Response> => {
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return htmlUnauthenticated(context, lookup, language);
+    const scope = await scopeForSession(lookup.session);
+    const policy = await retentionPolicyForSession(lookup.session);
+    const messages = messagesFor(language);
+    if (!retentionStore) return html(context, 503, renderApplicationPage(language, lookup.session, scope, { retentionError: messages.retentionUnavailable }, [], [], undefined, [], [], policy));
+    if (!hasRetentionManagement(lookup.session.member)) return html(context, 403, renderApplicationPage(language, lookup.session, scope, { retentionError: messages.retentionManageDenied }, [], [], undefined, [], [], policy));
+    try {
+      if (context.req.path === "/retention/cleanup") {
+        const result = await runRetentionCleanup(lookup.session.member, retentionStore);
+        const cleanupQuery = new URLSearchParams({ lang: language, retention: "cleanup", eligible: String(result.eligibleObservations), protected: String(result.protectedObservations), deleted: String(result.deletedObservations), entries: String(result.deletedTimelineEntries), failures: String(result.failures) });
+        return redirect(context, `/app?${cleanupQuery.toString()}`);
+      }
+      const fields = await requestForm(context);
+      if (!fields) throw new RetentionValidationError([{ field: "retentionDays", message: "must be a valid request" }]);
+      await updateRetentionPolicy(lookup.session.member, retentionStore, fields);
+      return redirect(context, `/app?lang=${language}&retention=updated`);
+    } catch (error: unknown) {
+      return html(context, error instanceof RetentionValidationError ? 400 : 503, renderApplicationPage(language, lookup.session, scope, { retentionError: error instanceof RetentionValidationError ? messages.retentionInvalid : messages.retentionUnavailable }, [], [], undefined, [], [], policy));
+    }
+  };
+  const clusterApi = async (context: AppContext): Promise<Response> => {
+    const session = await requireWorkspace(context);
+    if (session instanceof Response) return session;
+    if (context.req.method === "GET") return json(context, 200, { scope: await scopeForSession(session) });
+    if (!hasClusterConfigureCapability(session.member)) return json(context, 403, { error: "missing_capability", capability: capabilities.clusterConfigure });
+    const input = await requestJson(context);
+    if (input === null) return json(context, 400, { error: "invalid_json" });
+    try {
+      return json(context, 200, { scope: await configureClusterScope(session.member, clusterScopeStore, input) });
+    } catch (error: unknown) {
+      if (error instanceof ClusterScopeValidationError) return json(context, 400, { error: "invalid_cluster_scope", issues: error.issues });
+      throw error;
+    }
+  };
+  const clusterPage = async (context: AppContext): Promise<Response> => {
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return htmlUnauthenticated(context, lookup, language);
+    const scope = await scopeForSession(lookup.session);
+    const messages = messagesFor(language);
+    if (!hasClusterConfigureCapability(lookup.session.member)) return html(context, 403, renderApplicationPage(language, lookup.session, scope, { error: messages.clusterConfigurationDenied }));
+    try {
+      await configureClusterScope(lookup.session.member, clusterScopeStore, formScopeInput(new URLSearchParams(await requestText(context))));
+      return redirect(context, `/app?lang=${language}&cluster=saved`);
+    } catch (error: unknown) {
+      const errorMessage = error instanceof ClusterScopeValidationError ? `${messages.clusterConfigurationInvalid} ${error.issues.map((issue) => issue.message).join(" ")}` : messages.clusterConfigurationUnavailable;
+      return html(context, 400, renderApplicationPage(language, lookup.session, scope, { error: errorMessage }));
+    }
+  };
+
+  const membershipApiSession = async (context: AppContext): Promise<{ session: AuthenticatedSession; store: AdmissionStore & MembershipStore } | Response> => {
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return json(context, 401, { error: lookup.rejection ?? "unauthorized" });
+    if (!hasWorkspaceAccess(lookup.session) || !hasCapability(lookup.session.member, capabilities.membershipManage)) return json(context, 403, { error: "forbidden", capability: capabilities.membershipManage });
+    if (!membershipStore) return json(context, 503, { error: "membership_store_unavailable" });
+    return { session: lookup.session, store: membershipStore };
+  };
+  const membersApi = async (context: AppContext): Promise<Response> => {
+    const result = await membershipApiSession(context);
+    if (result instanceof Response) return result;
+    return json(context, 200, { members: await result.store.listMembers() });
+  };
+  const invitationsApi = async (context: AppContext): Promise<Response> => {
+    const result = await membershipApiSession(context);
+    if (result instanceof Response) return result;
+    return json(context, 200, { invitations: await result.store.listInvitations() });
+  };
+  const auditApi = async (context: AppContext): Promise<Response> => {
+    const result = await membershipApiSession(context);
+    if (result instanceof Response) return result;
+    return json(context, 200, { records: await result.store.listAuditRecords() });
+  };
+  const inviteApi = async (context: AppContext): Promise<Response> => {
+    const result = await membershipApiSession(context);
+    if (result instanceof Response) return result;
+    const fields = await requestForm(context);
+    if (!fields?.email) return json(context, 400, { error: "invalid_request" });
+    try {
+      return json(context, 201, { invitation: await result.store.createInvitation(fields.email, result.session.member) });
+    } catch (error) {
+      return json(context, 400, { error: error instanceof Error ? error.message : "membership operation failed" });
+    }
+  };
+  const revokeInvitationApi = async (context: AppContext): Promise<Response> => {
+    const result = await membershipApiSession(context);
+    if (result instanceof Response) return result;
+    try {
+      const invitation = await result.store.revokeInvitation(context.req.param("invitationId") ?? "", result.session.member);
+      return invitation ? json(context, 200, { invitation }) : json(context, 404, { error: "invitation_not_found_or_unusable" });
+    } catch (error) {
+      const rootError = error instanceof Error && error.cause instanceof Error ? error.cause : error;
+      if (rootError instanceof LastWorkspaceOwnerError) return json(context, 409, { error: "last_workspace_owner" });
+      return json(context, 400, { error: error instanceof Error ? error.message : "membership operation failed" });
+    }
+  };
+  const roleApi = async (context: AppContext): Promise<Response> => {
+    const result = await membershipApiSession(context);
+    if (result instanceof Response) return result;
+    const fields = await requestForm(context);
+    if (!fields?.role || !isRole(fields.role)) return json(context, 400, { error: "invalid_role" });
+    try {
+      const member = await result.store.assignMemberRole(context.req.param("memberId") ?? "", fields.role, result.session.member);
+      return member ? json(context, 200, { member }) : json(context, 404, { error: "member_not_found" });
+    } catch (error) {
+      const rootError = error instanceof Error && error.cause instanceof Error ? error.cause : error;
+      if (rootError instanceof LastWorkspaceOwnerError) return json(context, 409, { error: "last_workspace_owner" });
+      return json(context, 400, { error: error instanceof Error ? error.message : "membership operation failed" });
+    }
+  };
+  const membersPage = async (context: AppContext): Promise<Response> => {
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return redirect(context, `/?lang=${language}`, 302);
+    if (!hasWorkspaceAccess(lookup.session) || !hasCapability(lookup.session.member, capabilities.membershipManage)) return html(context, 403, renderMembershipDeniedPage(language));
+    if (!membershipStore) return json(context, 503, { error: "membership_store_unavailable" });
+    const query = context.req.query();
+    const notice = query.notice;
+    const messages = messagesFor(language);
+    const noticeText = notice === "created" ? messages.invitationCreated : notice === "revoked" ? messages.invitationRevoked : notice === "role" ? messages.roleChanged : undefined;
+    return html(context, 200, renderMembersPage(language, lookup.session, await membershipStore.listMembers(), await membershipStore.listInvitations(), noticeText));
+  };
+  const membershipForm = async (context: AppContext, operation: "invite" | "revoke" | "role"): Promise<Response> => {
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return redirect(context, `/?lang=${language}`, 302);
+    if (!hasWorkspaceAccess(lookup.session) || !hasCapability(lookup.session.member, capabilities.membershipManage)) return html(context, 403, renderMembershipDeniedPage(language));
+    if (!membershipStore) return html(context, 503, renderMembershipDeniedPage(language));
+    const fields = await requestForm(context);
+    const responseLanguage = fields?.lang ? parseLanguage(fields.lang) : language;
+    try {
+      if (operation === "invite" && fields?.email) await membershipStore.createInvitation(fields.email, lookup.session.member);
+      else if (operation === "revoke" && fields?.invitationId && await membershipStore.revokeInvitation(fields.invitationId, lookup.session.member)) return redirect(context, `/members?lang=${responseLanguage}&notice=revoked`);
+      else if (operation === "role" && fields?.memberId && fields.role && isRole(fields.role) && await membershipStore.assignMemberRole(fields.memberId, fields.role, lookup.session.member)) return redirect(context, `/members?lang=${responseLanguage}&notice=role`);
+      else throw new Error("membership operation failed");
+      return redirect(context, `/members?lang=${responseLanguage}&notice=created`);
+    } catch {
+      return html(context, 400, renderMembershipDeniedPage(responseLanguage));
+    }
+  };
+
+  const operational = async (context: AppContext): Promise<Response> => {
+    const path = context.req.path;
+    if (path === "/metrics") {
+      await status();
+      syncWebMetrics();
+      return context.text(telemetry.metricsText(), 200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
+    }
+    if (path === "/health/live") return json(context, 200, { service: "tracegarden-web", status: stopping ? "stopping" : "alive", liveness: stopping ? "stopping" : "alive" });
+    const current = await status();
+    const healthy: boolean = path === "/health/startup" ? current.startup === "ready" : current.readiness === "ready";
+    const statusCode: 200 | 503 = healthy ? 200 : 503;
+    return json(context, statusCode, path === "/health/startup" ? { ...current, status: healthy ? "ready" : "not-ready" } : current);
+  };
+  const sessionApi = async (context: AppContext): Promise<Response> => {
+    const session = await requireWorkspace(context);
+    return session instanceof Response ? session : json(context, 200, { member: session.member });
+  };
+  const workspacePage = async (context: AppContext): Promise<Response> => {
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (!lookup.session) return htmlUnauthenticated(context, lookup, language);
+    if (!hasWorkspaceAccess(lookup.session)) return html(context, 403, renderRejectionPage(language, "admission_required"));
+    const query = context.req.query();
+    let timelineQuery: TimelineQuery;
+    try {
+      timelineQuery = parseTimelineQuery(timelineQueryInput(query, true));
+    } catch (error: unknown) {
+      if (!(error instanceof TimelineQueryValidationError)) throw error;
+      return html(context, 400, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
+    }
+    let timelinePage: TimelinePage;
+    try {
+      timelinePage = timelineStore && hasTimelineAccess(lookup.session) ? await timelineStore.listTimelineEntries(lookup.session.member.workspaceId, timelineQuery, lookup.session.member.id) : { entries: [], nextCursor: null };
+    } catch (error: unknown) {
+      if (!(error instanceof TimelineQueryValidationError)) throw error;
+      return html(context, 400, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), { error: messagesFor(language).timelineInvalid }));
+    }
+    const experiments = experimentStore && hasTimelineAccess(lookup.session) ? await experimentStore.listExperiments(lookup.session.member.workspaceId) : [];
+    const suggestions = hasTimelineAccess(lookup.session) ? await correlationSuggestionsForSession(lookup.session) : [];
+    const retentionPolicy = await retentionPolicyForSession(lookup.session);
+    const cleanupResult = retentionCleanupQueryResult(query, retentionPolicy);
+    const experimentNotice = query.experiment;
+    return html(context, 200, renderApplicationPage(language, lookup.session, await scopeForSession(lookup.session), {
+      saved: query.cluster === "saved",
+      attentionReviewed: query.attention === "reviewed",
+      ...(experimentNotice === "created" ? { experimentSaved: "created" as const } : {}),
+      ...(experimentNotice === "updated" ? { experimentSaved: "updated" as const } : {}),
+      ...(query.correlation === "confirmed" ? { correlationDecision: "confirmed" as const } : {}),
+      ...(query.correlation === "rejected" ? { correlationDecision: "rejected" as const } : {}),
+      ...(query.retention === "updated" ? { retentionSaved: true } : {}),
+      ...(cleanupResult === undefined ? {} : { retentionResult: cleanupResult }),
+    }, timelinePage.entries, timelinePage, timelineQuery, experiments, suggestions, retentionPolicy));
+  };
+  const rootPage = async (context: AppContext): Promise<Response> => {
+    const current = await status();
+    const language = languageFor(context);
+    const lookup = await workspaceSession(context);
+    if (lookup.rejection) return html(context, 403, renderRejectionPage(language, lookup.rejection));
+    if (lookup.session) {
+      if (!hasWorkspaceAccess(lookup.session)) return html(context, 403, renderRejectionPage(language, "admission_required"));
+      const page = await workspacePage(context);
+      if (current.status === "ready" || page.status !== 200) return page;
+      return context.newResponse(page.body, { status: 503, headers: page.headers });
+    }
+    if (cloudflareAccess) return json(context, 401, { error: "cloudflare_access_jwt_required" });
+    return html(context, current.status === "ready" ? 200 : 503, renderLoginPage(language, current.checks.database === "ready", identityAdapter));
+  };
+
+  const app = new Hono<WebContext>();
+  app.onError((error, context) => {
+    const correlation = context.get("correlation");
+    telemetry.log("error", "web.request.failure", correlation, { error_type: error instanceof Error ? error.name : "unknown", status_code: 503 });
+    context.get("requestSpan").fail(error);
+    return context.json({ error: "service_unavailable" }, 503);
+  });
+  app.use("*", async (context, next) => {
+    const correlation = telemetry.correlation();
+    const requestSpan = telemetry.startSpan("http.request", correlation, { method: context.req.method, path: context.req.path });
+    context.set("correlation", correlation);
+    context.set("requestSpan", requestSpan);
+    context.header("x-request-id", requestSpan.correlation.requestId);
+    context.header("x-trace-id", requestSpan.correlation.traceId);
+    context.header("traceparent", `00-${requestSpan.correlation.traceId}-${requestSpan.correlation.spanId}-01`);
+    try {
+      await next();
+    } catch (error: unknown) {
+      telemetry.log("error", "web.request.failure", correlation, { error_type: error instanceof Error ? error.name : "unknown", status_code: 503 });
+      requestSpan.fail(error);
+      return context.json({ error: "service_unavailable" }, 503);
+    } finally {
+      requestSpan.end({ status_code: context.res.status });
+    }
+  });
+
+  app.get("/api/auth/*", betterAuth);
+  app.post("/api/auth/*", betterAuth);
+  app.put("/api/auth/*", betterAuth);
+  app.patch("/api/auth/*", betterAuth);
+  app.delete("/api/auth/*", betterAuth);
+  app.options("/api/auth/*", betterAuth);
+  app.get("/auth/login", login);
+  app.get("/login", login);
+  app.post("/auth/login", login);
+  app.post("/login", login);
+  app.post("/auth/logout", logout);
+  app.get("/auth/google", googleLogin);
+  app.get("/api/timeline/stream", timelineStream);
+  app.get("/api/timeline", timelineApi);
+  app.get("/api/timeline/entries", timelineApi);
+  app.post("/api/timeline/entries/:entryId/review", timelineReviewApi);
+  app.get("/api/retention", retentionApi);
+  app.get("/api/retention/policy", retentionApi);
+  app.post("/api/retention", retentionApi);
+  app.put("/api/retention", retentionApi);
+  app.patch("/api/retention", retentionApi);
+  app.post("/api/retention/policy", retentionApi);
+  app.put("/api/retention/policy", retentionApi);
+  app.patch("/api/retention/policy", retentionApi);
+  app.post("/api/retention/cleanup", retentionApi);
+  app.post("/api/retention/run", retentionApi);
+  app.get("/api/correlations/suggestions", correlationApi);
+  app.get("/api/correlations/suggestions/:suggestionId", correlationApi);
+  app.post("/api/correlations/suggestions/:suggestionId/:decision", correlationApi);
+  app.get("/api/experiments", experimentApi);
+  app.get("/api/experiments/:experimentId", experimentApi);
+  app.post("/api/experiments", experimentApi);
+  app.patch("/api/experiments/:experimentId", experimentApi);
+  app.put("/api/experiments/:experimentId", experimentApi);
+  app.post("/api/logs/recent", logApi);
+  app.post("/logs/recent", logPage);
+  app.post("/timeline/entries/:entryId/review", timelineReviewPage);
+  app.post("/correlations/suggestions/:suggestionId/:decision", correlationPage);
+  app.get("/experiments", experimentPage);
+  app.get("/experiments/:experimentId", experimentPage);
+  app.post("/experiments", experimentPage);
+  app.post("/experiments/:experimentId", experimentPage);
+  app.post("/retention/update", retentionPage);
+  app.post("/retention/cleanup", retentionPage);
+  app.get("/api/cluster", clusterApi);
+  app.get("/api/cluster/scope", clusterApi);
+  app.post("/api/cluster", clusterApi);
+  app.put("/api/cluster", clusterApi);
+  app.post("/api/cluster/scope", clusterApi);
+  app.put("/api/cluster/scope", clusterApi);
+  app.post("/cluster/configure", clusterPage);
+  app.get("/members", membersPage);
+  app.get("/api/members", membersApi);
+  app.get("/api/invitations", invitationsApi);
+  app.get("/api/audit", auditApi);
+  app.post("/api/invitations", inviteApi);
+  app.delete("/api/invitations/:invitationId", revokeInvitationApi);
+  app.post("/api/invitations/:invitationId/revoke", revokeInvitationApi);
+  app.patch("/api/members/:memberId/role", roleApi);
+  app.post("/api/members/:memberId/role", roleApi);
+  app.post("/members/invite", (context) => membershipForm(context, "invite"));
+  app.post("/members/revoke", (context) => membershipForm(context, "revoke"));
+  app.post("/members/role", (context) => membershipForm(context, "role"));
+  app.get("/metrics", operational);
+  app.get("/health/live", operational);
+  app.get("/health/startup", operational);
+  app.get("/health/readiness", operational);
+  app.get("/api/status", operational);
+  app.get("/api/session", sessionApi);
+  app.get("/app", workspacePage);
+  app.get("/timeline", workspacePage);
+  app.get("/", rootPage);
+  const methodNotAllowed = (context: AppContext): Response => json(context, 405, { error: "method_not_allowed" });
+  app.post("*", methodNotAllowed);
+  app.put("*", methodNotAllowed);
+  app.patch("*", methodNotAllowed);
+  app.delete("*", methodNotAllowed);
+  app.options("*", methodNotAllowed);
+  app.notFound((context) => context.json({ error: "not_found" }, 404));
+
+  const server = createServer(getRequestListener((request, bindings) => app.fetch(request, bindings)));
   const port = options.port ?? Number(environment.PORT ?? "3000");
   const host = options.host ?? environment.HOST ?? "127.0.0.1";
   const drainServer = (): Promise<void> => new Promise((resolve, reject) => {
