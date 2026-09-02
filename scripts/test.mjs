@@ -89,6 +89,62 @@ assert.throws(
   () => googleOAuthConfig({ ...googleEnvironment, GOOGLE_REDIRECT_URI: "https://tracegarden.test/api/auth/callback/google#fragment" }),
   /fragment/,
 );
+assert.throws(
+  () => googleOAuthConfig({ ...googleEnvironment, NODE_ENV: "test", GOOGLE_REDIRECT_URI: "http://tracegarden.test/api/auth/callback/google" }),
+  (error) => error instanceof Error && error.message === "GOOGLE_REDIRECT_URI must use HTTPS, except for local loopback URLs",
+);
+assert.throws(
+  () => googleOAuthConfig({ ...googleEnvironment, GOOGLE_REDIRECT_URI: "not a URL" }),
+  (error) => error instanceof Error && error.message === "GOOGLE_REDIRECT_URI must be an absolute HTTP(S) URL",
+);
+const productionEnvironmentCheck = {
+  NODE_ENV: "production",
+  DATABASE_URL: "configured-database",
+  BETTER_AUTH_SECRET: "better-auth-test-secret",
+  BETTER_AUTH_URL: "https://tracegarden.test",
+  TIMELINE_CURSOR_SECRET: "timeline-test-secret",
+  GOOGLE_CLIENT_ID: "google-client-id",
+  GOOGLE_CLIENT_SECRET: "google-client-secret",
+  TRACEGARDEN_BOOTSTRAP_ISSUER: "https://accounts.google.com",
+  TRACEGARDEN_BOOTSTRAP_SUBJECT: "bootstrap-test-subject",
+};
+const runEnvironmentCheck = (redirectUri) => spawnSync(process.execPath, ["scripts/env-check.mjs"], {
+  encoding: "utf8",
+  env: { ...productionEnvironmentCheck, GOOGLE_REDIRECT_URI: redirectUri },
+});
+const expectedNodeFailure = `Node.js 26.8.x is required (found ${process.version})`;
+const [hostNodeMajor, hostNodeMinor] = process.versions.node.split(".").map(Number);
+const hostNodeIsExpected = hostNodeMajor === 26 && hostNodeMinor === 8;
+const expectedNodeOutcome = hostNodeIsExpected ? `environment valid: Node.js ${process.version}` : expectedNodeFailure;
+const environmentCheckOutput = (result) => `${result.stdout}${result.stderr}`.trim();
+const environmentValues = Object.entries(productionEnvironmentCheck)
+  .filter(([name]) => name !== "NODE_ENV")
+  .map(([, value]) => value);
+const assertEnvironmentCheckHasNoValues = (result, redirectUri) => {
+  const output = `${result.stdout}${result.stderr}`;
+  for (const value of [...environmentValues, redirectUri]) {
+    assert.equal(output.includes(value), false, "environment check output must not contain configured values");
+  }
+  return output;
+};
+const validEnvironmentCheck = runEnvironmentCheck("https://tracegarden.test/api/auth/callback/google");
+assert.equal(validEnvironmentCheck.status, hostNodeIsExpected ? 0 : 1);
+assert.equal(environmentCheckOutput(validEnvironmentCheck), expectedNodeOutcome);
+assertEnvironmentCheckHasNoValues(validEnvironmentCheck, "https://tracegarden.test/api/auth/callback/google");
+for (const [redirectUri, message] of [
+  ["http://tracegarden.test/api/auth/callback/google", "GOOGLE_REDIRECT_URI must be HTTPS in production"],
+  ["https://oauth-user:oauth-passphrase@tracegarden.test/api/auth/callback/google", "GOOGLE_REDIRECT_URI must not include credentials"],
+  ["https://tracegarden.test/api/auth/callback/google#fragment", "GOOGLE_REDIRECT_URI must not include a fragment"],
+  ["not a URL", "GOOGLE_REDIRECT_URI must be an absolute HTTPS URL in production"],
+]) {
+  const invalidEnvironmentCheck = runEnvironmentCheck(redirectUri);
+  assert.equal(invalidEnvironmentCheck.status, 1);
+  assert.equal(environmentCheckOutput(invalidEnvironmentCheck), [
+    ...(hostNodeIsExpected ? [] : [expectedNodeFailure]),
+    message,
+  ].join("\n"));
+  assertEnvironmentCheckHasNoValues(invalidEnvironmentCheck, redirectUri);
+}
 const localGoogleConfig = googleOAuthConfig({
   ...googleEnvironment,
   NODE_ENV: "test",
