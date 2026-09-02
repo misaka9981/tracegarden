@@ -19,6 +19,9 @@ services:
     build:
       context: .
       dockerfile: deploy/docker/migrate.Dockerfile
+      additional_contexts:
+        frozen: ${TRACEGARDEN_CONTAINER_CONTEXT:-.scratch/container-context}
+      network: none
     platform: linux/arm64
     environment:
       DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgresql://tracegarden:local-only@postgres:5432/tracegarden}
@@ -38,6 +41,9 @@ services:
     build:
       context: .
       dockerfile: deploy/docker/web.Dockerfile
+      additional_contexts:
+        frozen: ${TRACEGARDEN_CONTAINER_CONTEXT:-.scratch/container-context}
+      network: none
     platform: linux/arm64
     environment:
       DATABASE_URL: postgresql://tracegarden:local-only@postgres:5432/tracegarden
@@ -72,6 +78,9 @@ services:
     build:
       context: .
       dockerfile: deploy/docker/collector.Dockerfile
+      additional_contexts:
+        frozen: ${TRACEGARDEN_CONTAINER_CONTEXT:-.scratch/container-context}
+      network: none
     platform: linux/arm64
     environment:
       DATABASE_URL: postgresql://tracegarden:local-only@postgres:5432/tracegarden

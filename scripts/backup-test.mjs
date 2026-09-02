@@ -89,11 +89,11 @@ try {
     /schema is incomplete/,
   );
   await assert.rejects(
-    checkRestoredDatabase(makeRestoredClient({ missingForeignKeys: ["tracegarden_confirmed_links_confirmed_by_member_id_fkey"] })),
+    checkRestoredDatabase(makeRestoredClient({ missingForeignKeys: ["tracegarden_confirmed_links_workspace_member_fk"] })),
     /foreign-key constraints/,
   );
   await assert.rejects(
-    checkRestoredDatabase(makeRestoredClient({ invalidForeignKeys: ["tracegarden_confirmed_links_confirmed_by_member_id_fkey"] })),
+    checkRestoredDatabase(makeRestoredClient({ invalidForeignKeys: ["tracegarden_confirmed_links_workspace_member_fk"] })),
     /foreign-key constraints/,
   );
   await assert.rejects(

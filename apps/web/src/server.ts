@@ -36,6 +36,7 @@ import {
   GOOGLE_ISSUER,
   hasCapability,
   isRole,
+  LastWorkspaceOwnerError,
   requireCapability,
   type AdmissionStore,
   type AuthenticatedSession,
@@ -453,14 +454,14 @@ function renderCorrelationSection(
 function renderTimelineSection(language: Language, messages: Messages, page: TimelinePage, query: TimelineQuery, reviewed = false): string {
   const rows = page.entries.map((entry) => {
     if (entry.entryType === "experiment") {
-      return `<article data-entry-id="${escapeHtml(entry.id)}"><h3>${escapeHtml(messages.experimentsTitle)} · ${escapeHtml(experimentStateLabel(messages, entry.experiment.state))}</h3><p>${escapeHtml(entry.experiment.hypothesis)}</p><p>${escapeHtml(entry.occurredAt)}</p>${confirmedLinkDetails(messages, entry.confirmedLinks)}</article>`;
+      return `<article data-entry-id="${escapeHtml(entry.id)}" data-entry-occurred-at="${escapeHtml(entry.occurredAt)}"><h3>${escapeHtml(messages.experimentsTitle)} · ${escapeHtml(experimentStateLabel(messages, entry.experiment.state))}</h3><p>${escapeHtml(entry.experiment.hypothesis)}</p><p>${escapeHtml(entry.occurredAt)}</p>${confirmedLinkDetails(messages, entry.confirmedLinks)}</article>`;
     }
     const observation = entry.observation;
     const owners = (observation.ownerReferences ?? []).map((owner) => `${owner.kind}/${owner.name}`).join(", ");
     const attention = entry.attentionItem
       ? `<p><strong>${escapeHtml(messages.attentionItem)}</strong> ${escapeHtml(attentionReasonLabel(entry, messages))} · ${entry.attentionUnread ? escapeHtml(messages.attentionUnread) : escapeHtml(messages.attentionReviewed)}</p>${entry.attentionUnread ? `<form method="post" action="/timeline/entries/${encodeURIComponent(entry.id)}/review?lang=${language}"><button type="submit">${escapeHtml(messages.reviewAttention)}</button></form>` : ""}`
       : "";
-    return `<article data-entry-id="${escapeHtml(entry.id)}">
+    return `<article data-entry-id="${escapeHtml(entry.id)}" data-entry-occurred-at="${escapeHtml(entry.occurredAt)}">
         <h3>${escapeHtml(resourceKindLabel(observation.kind, messages))} · ${escapeHtml(observationStateLabel(entry, messages))}</h3>
         <p>${escapeHtml(observation.namespace)}/${escapeHtml(observation.name)} · ${escapeHtml(observationDetail(entry, messages))}</p>
         ${attention}
@@ -525,14 +526,24 @@ function renderTimelineSection(language: Language, messages: Messages, page: Tim
           let clientId = null;
           let recovering = false;
           let recoverAgain = false;
+          const compareEntries = (left, right) => {
+            const leftTime = Date.parse(left.occurredAt);
+            const rightTime = Date.parse(right.occurredAt);
+            if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+            return left.id === right.id ? 0 : left.id < right.id ? -1 : 1;
+          };
           const append = (entry) => {
-            if (!entry || typeof entry.id !== 'string' || ids.has(entry.id)) return;
+            if (!entry || typeof entry.id !== 'string' || typeof entry.occurredAt !== 'string' || ids.has(entry.id)) return;
             ids.add(entry.id);
             const article = document.createElement('article');
             article.dataset.entryId = entry.id;
+            article.dataset.entryOccurredAt = entry.occurredAt;
             if (entry.entryType === 'experiment') article.textContent = 'Experiment · ' + (entry.experiment?.state || '');
             else article.textContent = (entry.observation?.kind || 'Observation') + ' · ' + (entry.observation?.name || '');
-            section.append(article);
+            const before = Array.from(section.querySelectorAll('[data-entry-id]')).find((candidate) => compareEntries(entry, {
+              id: candidate.dataset.entryId || '', occurredAt: candidate.dataset.entryOccurredAt || ''
+            }) < 0);
+            section.insertBefore(article, before || section.querySelector('script'));
           };
           const recover = async () => {
             if (recovering) { recoverAgain = true; return; }
@@ -2516,6 +2527,11 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           response.setHeader("content-type", "text/html; charset=utf-8");
           response.end(renderMembershipDeniedPage(responseLanguage));
         } catch (error) {
+          const rootError = error instanceof Error && error.cause instanceof Error ? error.cause : error;
+          if (isApi && rootError instanceof LastWorkspaceOwnerError) {
+            jsonResponse(response, 409, { error: "last_workspace_owner" });
+            return;
+          }
           const message = error instanceof Error && /valid email|invalid request|unavailable/.test(error.message) ? error.message : "membership operation failed";
           if (isApi) jsonResponse(response, 400, { error: message });
           else {

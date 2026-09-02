@@ -210,13 +210,17 @@ try {
   assert.equal(adapter.contacted, false);
   await page.waitForFunction(() => window.__tracegardenTimelineReadyCount > 0);
 
+  const liveDeliveryStartedAt = performance.now();
   const firstResult = await collector.collectObservations();
   assert.equal(firstResult.length, 1);
   assert.equal(firstResult[0].duplicate, false);
   assert.equal(firstResult[0].entry.entryType, "observation");
   assert.equal(firstResult[0].entry.observation.name, firstPod.metadata.name);
   const observationEntryId = firstResult[0].entry.id;
-  await page.locator(`[data-entry-id="${observationEntryId}"]`).waitFor({ state: "attached" });
+  await page.locator(`[data-entry-id="${observationEntryId}"]`).waitFor({ state: "attached", timeout: 5_000 });
+  const liveDeliveryElapsedMs = performance.now() - liveDeliveryStartedAt;
+  assert.ok(liveDeliveryElapsedMs <= 5_000, `Ticket 11 live delivery exceeded five seconds: ${liveDeliveryElapsedMs.toFixed(1)}ms`);
+  console.log(`Ticket 11 live delivery elapsed ${liveDeliveryElapsedMs.toFixed(1)}ms (threshold 5000ms)`);
   assert.match(await page.locator(`[data-entry-id="${observationEntryId}"]`).innerText(), /core-loop-pod/);
   const persistedObservation = await database.timeline.getTimelineEntry(workspaceId, observationEntryId);
   assert.ok(persistedObservation?.entryType === "observation" && persistedObservation.attentionItem);

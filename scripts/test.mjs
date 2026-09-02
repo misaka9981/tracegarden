@@ -3,7 +3,7 @@ import { ServerResponse } from "node:http";
 import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../dist/apps/web/src/server.js";
 import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError, parseTimelineNotification, waitForMigrations } from "../dist/packages/db/src/index.js";
-import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
+import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LastWorkspaceOwnerError, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
 import { confirmCorrelationSuggestion, correlationSignalsBetween, createExperiment, ExperimentLifecycleError, ExperimentValidationError, hasCorrelationReview, hasExperimentWrite, hasRetentionManagement, parseExperimentInput, rejectCorrelationSuggestion, runRetentionCleanup, suggestCorrelationCandidates, updateRetentionPolicy } from "../dist/packages/domain/src/index.js";
 import {
@@ -150,6 +150,34 @@ if (renamedAdmission.admitted && ownerAdmission.admitted) {
   assert.equal(renamedAdmission.session.member.identity.email, "renamed@example.test");
 }
 assert.equal(admissionStore.memberCount(), 2);
+const lastOwnerStore = new MemoryAdmissionStore();
+const lastOwnerAdmission = await lastOwnerStore.admit(ownerIdentity);
+assert.equal(lastOwnerAdmission.admitted, true);
+if (lastOwnerAdmission.admitted) {
+  await assert.rejects(
+    () => lastOwnerStore.assignMemberRole(lastOwnerAdmission.session.member.id, "viewer", lastOwnerAdmission.session.member),
+    (error) => error instanceof LastWorkspaceOwnerError,
+  );
+  assert.equal((await lastOwnerStore.listMembers())[0]?.role, "owner");
+}
+const concurrentOwnerStore = new MemoryAdmissionStore();
+const concurrentOwner = await concurrentOwnerStore.admit(ownerIdentity);
+assert.equal(concurrentOwner.admitted, true);
+if (concurrentOwner.admitted) {
+  await concurrentOwnerStore.createInvitation(invitedIdentity.email, concurrentOwner.session.member);
+  const concurrentInvited = await concurrentOwnerStore.admit(invitedIdentity);
+  assert.equal(concurrentInvited.admitted, true);
+  if (concurrentInvited.admitted) {
+    await concurrentOwnerStore.assignMemberRole(concurrentInvited.session.member.id, "owner", concurrentOwner.session.member);
+    const demotions = await Promise.allSettled([
+      concurrentOwnerStore.assignMemberRole(concurrentOwner.session.member.id, "viewer", concurrentOwner.session.member),
+      concurrentOwnerStore.assignMemberRole(concurrentInvited.session.member.id, "viewer", concurrentOwner.session.member),
+    ]);
+    assert.equal(demotions.filter((result) => result.status === "fulfilled").length, 1);
+    assert.equal(demotions.filter((result) => result.status === "rejected").length, 1);
+    assert.equal((await concurrentOwnerStore.listMembers()).filter((member) => member.role === "owner").length, 1);
+  }
+}
 
 const productionTimeline = new MemoryObservationStore("production-test-cursor-secret");
 const productionRuntime = await createWebRuntime({
@@ -872,11 +900,30 @@ if (liveObservation) {
     }, "2000-01-01T00:00:00.000Z"),
   ];
   const sequenceResults = await sequenceTimeline.recordObservations(sequenceObservations);
-  assert.deepEqual((await sequenceTimeline.listTimelineEntries("workspace-single", { limit: 100 })).entries.map((entry) => entry.observation.name), ["newer-source-time", "older-source-time"]);
+  assert.deepEqual((await sequenceTimeline.listTimelineEntries("workspace-single", { limit: 100 })).entries.map((entry) => entry.observation.name), ["older-source-time", "newer-source-time"]);
   const sequenceFirstPage = await sequenceTimeline.listTimelineEntries("workspace-single", { limit: 1 }, ownerActor.id);
-  assert.equal(sequenceFirstPage.entries[0]?.id, sequenceResults[0]?.entry.id);
+  assert.equal(sequenceFirstPage.entries[0]?.id, sequenceResults[1]?.entry.id);
+  const [historyPayload] = (sequenceFirstPage.nextCursor ?? "").split(".");
+  const decodedHistoryCursor = JSON.parse(Buffer.from(historyPayload ?? "", "base64url").toString("utf8"));
+  assert.equal(decodedHistoryCursor.version, 3);
+  assert.equal(decodedHistoryCursor.occurredAt, sequenceFirstPage.entries[0]?.occurredAt);
+  assert.equal(decodedHistoryCursor.entryId, sequenceFirstPage.entries[0]?.id);
   const sequenceSecondPage = await sequenceTimeline.listTimelineEntries("workspace-single", { limit: 1, cursor: sequenceFirstPage.nextCursor ?? "" }, ownerActor.id);
-  assert.equal(sequenceSecondPage.entries[0]?.id, sequenceResults[1]?.entry.id);
+  assert.equal(sequenceSecondPage.entries[0]?.id, sequenceResults[0]?.entry.id);
+  const equalTimestampTimeline = new MemoryObservationStore();
+  const equalTimestampObservations = ["equal-b", "equal-a"].map((name) => normalizePodObservation(savedScope, {
+    kind: "Pod",
+    metadata: { name, namespace: "tracegarden", uid: `${name}-uid`, resourceVersion: "1" },
+    status: { phase: "Running" },
+  }, "2026-01-03T00:00:00.000Z"));
+  const equalTimestampResults = await equalTimestampTimeline.recordObservations(equalTimestampObservations);
+  const equalTimestampPage = await equalTimestampTimeline.listTimelineEntries("workspace-single", { limit: 1 }, ownerActor.id);
+  const equalTimestampNextPage = await equalTimestampTimeline.listTimelineEntries("workspace-single", { limit: 1, cursor: equalTimestampPage.nextCursor ?? "" }, ownerActor.id);
+  const expectedEqualNames = equalTimestampResults
+    .slice()
+    .sort((left, right) => left.entry.id.localeCompare(right.entry.id))
+    .map((result) => result.observation.name);
+  assert.deepEqual([equalTimestampPage.entries[0]?.observation.name, equalTimestampNextPage.entries[0]?.observation.name], expectedEqualNames);
 }
 unsubscribeLiveTimeline();
 const backpressureRuntime = await createWebRuntime({

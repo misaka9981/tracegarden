@@ -111,15 +111,59 @@ try {
       "SELECT workspace_id, cluster_id, facts->>'payload' AS payload FROM tracegarden_observations WHERE id = 'legacy-mismatched-observation'",
     );
     assert.deepEqual(preserved.rows, [{ workspace_id: "workspace-single", cluster_id: "legacy-cluster", payload: "must survive migration failure" }]);
+    await preservedLegacyClient.query("BEGIN");
     await preservedLegacyClient.query("UPDATE tracegarden_observations SET workspace_id = 'workspace-legacy' WHERE id = 'legacy-mismatched-observation'");
+    const correlationMigration = await readFile(new URL("../dist/packages/db/migrations/0012_correlation_links.sql", import.meta.url), "utf8");
+    await preservedLegacyClient.query(correlationMigration);
+    await preservedLegacyClient.query("INSERT INTO tracegarden_schema_migrations (id) VALUES ('0012_correlation_links')");
+    await preservedLegacyClient.query(
+      `INSERT INTO tracegarden_observations
+         (id, workspace_id, cluster_id, kind, source_identity, source_key, uid, name, namespace, resource_version, facts, observed_at)
+       VALUES
+         ('legacy-correlation-observation-a', 'workspace-legacy', 'legacy-cluster', 'Pod', 'legacy-correlation-a', 'legacy-correlation-a', 'legacy-correlation-a', 'legacy-correlation-a', 'tracegarden', '1', '{"phase":"Running"}'::jsonb, '2026-01-01T00:00:01.000Z'),
+         ('legacy-correlation-observation-b', 'workspace-legacy', 'legacy-cluster', 'Pod', 'legacy-correlation-b', 'legacy-correlation-b', 'legacy-correlation-b', 'legacy-correlation-b', 'tracegarden', '1', '{"phase":"Running"}'::jsonb, '2026-01-01T00:00:02.000Z')`,
+    );
+    await preservedLegacyClient.query(
+      `INSERT INTO tracegarden_timeline_entries
+         (id, workspace_id, cluster_id, entry_type, observation_id, occurred_at)
+       VALUES
+         ('legacy-correlation-entry-a', 'workspace-legacy', 'legacy-cluster', 'observation', 'legacy-correlation-observation-a', '2026-01-01T00:00:01.000Z'),
+         ('legacy-correlation-entry-b', 'workspace-legacy', 'legacy-cluster', 'observation', 'legacy-correlation-observation-b', '2026-01-01T00:00:02.000Z')`,
+    );
+    await preservedLegacyClient.query(
+      `INSERT INTO tracegarden_correlation_suggestions
+         (id, workspace_id, left_entry_id, right_entry_id, signals, status)
+       VALUES ('legacy-mismatched-correlation', 'workspace-single', 'legacy-correlation-entry-a', 'legacy-correlation-entry-b', ARRAY['time'], 'pending')`,
+    );
+    await preservedLegacyClient.query("COMMIT");
   } finally {
     await preservedLegacyClient.end();
+  }
+  await assert.rejects(
+    legacyMigrationDatabase.migrate(),
+    (error) => error instanceof Error
+      && /database migration failed/.test(error.message)
+      && error.cause instanceof Error
+      && /Migration 0015 blocked: 2 legacy correlation Workspace ownership mismatch/.test(error.cause.message),
+  );
+  const repairedCorrelationClient = new pg.Client(databaseUrl);
+  await repairedCorrelationClient.connect();
+  try {
+    const preservedCorrelation = await repairedCorrelationClient.query(
+      "SELECT workspace_id, left_entry_id, right_entry_id FROM tracegarden_correlation_suggestions WHERE id = 'legacy-mismatched-correlation'",
+    );
+    assert.deepEqual(preservedCorrelation.rows, [{ workspace_id: "workspace-single", left_entry_id: "legacy-correlation-entry-a", right_entry_id: "legacy-correlation-entry-b" }]);
+    await repairedCorrelationClient.query("UPDATE tracegarden_correlation_suggestions SET workspace_id = 'workspace-legacy' WHERE id = 'legacy-mismatched-correlation'");
+  } finally {
+    await repairedCorrelationClient.end();
   }
   await legacyMigrationDatabase.migrate();
   const cleanupLegacyClient = new pg.Client(databaseUrl);
   await cleanupLegacyClient.connect();
   try {
-    await cleanupLegacyClient.query("DELETE FROM tracegarden_observations WHERE id = 'legacy-mismatched-observation'");
+    await cleanupLegacyClient.query("DELETE FROM tracegarden_correlation_suggestions WHERE id = 'legacy-mismatched-correlation'");
+    await cleanupLegacyClient.query("DELETE FROM tracegarden_timeline_entries WHERE id IN ('legacy-correlation-entry-a', 'legacy-correlation-entry-b')");
+    await cleanupLegacyClient.query("DELETE FROM tracegarden_observations WHERE id IN ('legacy-mismatched-observation', 'legacy-correlation-observation-a', 'legacy-correlation-observation-b')");
     await cleanupLegacyClient.query("DELETE FROM tracegarden_clusters WHERE id = 'legacy-cluster'");
     await cleanupLegacyClient.query("DELETE FROM tracegarden_workspaces WHERE id = 'workspace-legacy'");
   } finally {
@@ -150,8 +194,8 @@ try {
   const readiness = await response.json();
   assert.equal(readiness.checks.database, "ready");
   assert.equal(readiness.checks.migrations, "ready");
-  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention', '0011_structured_experiments', '0012_correlation_links', '0013_live_timeline', '0014_observation_retention');");
-  assert.equal(migrationCount, "14");
+  const migrationCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_schema_migrations WHERE id IN ('0001_foundation', '0002_workspace_admission', '0003_better_auth', '0004_membership_management', '0005_cluster_scope', '0006_observation_timeline', '0007_recent_logs', '0008_normalized_observations', '0009_observation_checkpoints', '0010_timeline_attention', '0011_structured_experiments', '0012_correlation_links', '0013_live_timeline', '0014_observation_retention', '0015_correlation_ownership');");
+  assert.equal(migrationCount, "15");
   const login = await fetch(`http://127.0.0.1:${webPort}/auth/login`, {
     method: "POST",
     redirect: "manual",
@@ -225,6 +269,26 @@ try {
   assert.ok(refreshedInvitedSessionBody.member.capabilities.includes("experiment:write"));
   assert.ok(!refreshedInvitedSessionBody.member.capabilities.includes("membership:manage"));
   assert.ok(!refreshedInvitedSessionBody.member.capabilities.includes("retention:manage"));
+  const promoteInvitedOwner = await fetch(`http://127.0.0.1:${webPort}/api/members/${invitedSessionBody.member.id}/role`, {
+    method: "PATCH",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ role: "owner" }),
+  });
+  assert.equal(promoteInvitedOwner.status, 200);
+  const demoteInvitedOwner = await fetch(`http://127.0.0.1:${webPort}/api/members/${invitedSessionBody.member.id}/role`, {
+    method: "PATCH",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ role: "viewer" }),
+  });
+  assert.equal(demoteInvitedOwner.status, 200);
+  const demoteLastOwner = await fetch(`http://127.0.0.1:${webPort}/api/members/${sessionBody.member.id}/role`, {
+    method: "PATCH",
+    headers: { cookie: ownerCookie, "content-type": "application/json" },
+    body: JSON.stringify({ role: "viewer" }),
+  });
+  assert.equal(demoteLastOwner.status, 409);
+  assert.deepEqual(await demoteLastOwner.json(), { error: "last_workspace_owner" });
+  assert.equal((await (await fetch(`http://127.0.0.1:${webPort}/api/members`, { headers: { cookie: ownerCookie } })).json()).members.filter((member) => member.role === "owner").length, 1);
   const deniedRetentionUpdate = await fetch(`http://127.0.0.1:${webPort}/api/retention`, {
     method: "PUT",
     headers: { cookie: invitedLogin.headers.get("set-cookie") ?? "", "content-type": "application/json" },
@@ -991,6 +1055,10 @@ try {
   assert.ok(historyCursor);
   if (historyCursor) {
     const [encodedPayload, encodedSignature] = historyCursor.split(".");
+    const historyCursorPayload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"));
+    assert.equal(historyCursorPayload.version, 3);
+    assert.equal(historyCursorPayload.occurredAt, historyPageOne.entries[0].occurredAt);
+    assert.equal(historyCursorPayload.entryId, historyPageOne.entries[0].id);
     assert.ok(encodedPayload && encodedSignature);
     const alteredPayload = `${encodedPayload.slice(0, -1)}${encodedPayload.endsWith("A") ? "B" : "A"}`;
     await assert.rejects(
@@ -1030,7 +1098,7 @@ try {
   }, tieTimestamp);
   const equalResultA = await timelineStore.recordObservation(equalTimestampA);
   const equalResultB = await timelineStore.recordObservation(equalTimestampB);
-  const expectedEqualOrder = ["equal-a", "equal-b"];
+  const expectedEqualOrder = equalResultA.entry.id < equalResultB.entry.id ? ["equal-a", "equal-b"] : ["equal-b", "equal-a"];
   const traversedIds = [];
   const traversedNames = [];
   const traversedTimes = [];
@@ -1123,7 +1191,7 @@ try {
   const memberCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_members;");
   assert.equal(memberCount, raceAdmission.status === 303 ? "3" : "2");
   const auditCount = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT count(*) FROM tracegarden_audit_records;");
-  assert.equal(auditCount, "10");
+  assert.equal(auditCount, "11");
   const auditMetadata = docker("exec", name, "psql", "-At", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT coalesce(string_agg(metadata::text, ' '), '') FROM tracegarden_audit_records;");
   assert.doesNotMatch(auditMetadata, /token/i);
   let auditMutationRejected = false;

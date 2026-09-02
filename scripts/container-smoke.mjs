@@ -37,6 +37,11 @@ if (!imageAvailable(nodeImage) || !imageAvailable(postgresImage)) {
 function compose(args, composeProject = project, extraEnvironment = environment) {
   return docker(["compose", "-p", composeProject, ...args], extraEnvironment);
 }
+
+if (process.env.CONTAINER_SMOKE_NO_BUILD !== "1") {
+  execFileSync(process.execPath, ["scripts/container-context.mjs"], { stdio: "inherit", env: environment });
+  compose(["build", "--pull=false"]);
+}
 async function waitFor(url, ready = (response) => response.ok) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
@@ -65,7 +70,7 @@ async function waitForHealthy(container, extraEnvironment) {
 }
 
 try {
-  compose(["up", "-d", process.env.CONTAINER_SMOKE_NO_BUILD === "1" ? "--no-build" : "--build"]);
+  compose(["up", "-d", "--pull", "never", "--no-build"]);
   const migrationContainer = compose(["ps", "-aq", "migrate"]);
   assert.ok(migrationContainer, "the one-shot migration gate must create a container");
   assert.equal(docker(["inspect", "-f", "{{.State.Status}}", migrationContainer]), "exited");

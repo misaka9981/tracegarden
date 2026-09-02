@@ -13,6 +13,7 @@ import {
   isRole,
   normalizeEmail,
   normalizeInvitationEmail,
+  LastWorkspaceOwnerError,
   requireCapability,
   type AdmissionResult,
   type AdmissionStore,
@@ -128,6 +129,7 @@ export const STRUCTURED_EXPERIMENTS_MIGRATION_ID = "0011_structured_experiments"
 export const CORRELATION_LINKS_MIGRATION_ID = "0012_correlation_links";
 export const LIVE_TIMELINE_MIGRATION_ID = "0013_live_timeline";
 export const OBSERVATION_RETENTION_MIGRATION_ID = "0014_observation_retention";
+export const CORRELATION_OWNERSHIP_MIGRATION_ID = "0015_correlation_ownership";
 
 type Migration = Readonly<{ id: string; path: string }>;
 
@@ -146,6 +148,7 @@ const migrations: readonly Migration[] = [
   { id: CORRELATION_LINKS_MIGRATION_ID, path: "../migrations/0012_correlation_links.sql" },
   { id: LIVE_TIMELINE_MIGRATION_ID, path: "../migrations/0013_live_timeline.sql" },
   { id: OBSERVATION_RETENTION_MIGRATION_ID, path: "../migrations/0014_observation_retention.sql" },
+  { id: CORRELATION_OWNERSHIP_MIGRATION_ID, path: "../migrations/0015_correlation_ownership.sql" },
 ];
 
 function sessionForMember(member: MemberRecord, authSession?: AuthSession): AuthenticatedSession {
@@ -291,6 +294,10 @@ export class MemoryAdmissionStore implements AdmissionStore, MembershipStore, Lo
     if (!entry) return null;
     const [key, current] = entry;
     if (current.member.role === role) return current.member;
+    if (current.member.role === "owner" && role !== "owner"
+      && ![...this.identities.values()].some(({ member }) => member.id !== memberId && member.role === "owner")) {
+      throw new LastWorkspaceOwnerError();
+    }
     const member: MemberRecord = { ...current.member, role, capabilities: capabilitiesForRole(role) };
     this.identities.set(key, { identity: current.identity, member });
     for (const [token, session] of this.sessions) {
@@ -452,12 +459,25 @@ const timelineFilterFields = ["kind", "namespace", "name", "state", "attention",
 const timelineStates = ["Pending", "Running", "Succeeded", "Failed", "Unknown"] as const;
 type TimelineFilterField = (typeof timelineFilterFields)[number];
 
-type TimelineCursor = Readonly<{
+type TimelineHistoryCursor = Readonly<{
+  version: 3;
+  occurredAt: string;
+  entryId: string;
+  memberId: string | null;
+  filters: string;
+}>;
+
+type TimelineLiveCursor = Readonly<{
   version: 2;
   sequence: string;
   memberId: string | null;
   filters: string;
 }>;
+
+type DecodedTimelineCursor = Readonly<
+  | { kind: "history"; occurredAt: string; entryId: string }
+  | { kind: "live"; sequence: string }
+>;
 
 export const DEFAULT_TIMELINE_CURSOR_SECRET = "tracegarden-test-timeline-cursor-secret";
 
@@ -494,18 +514,33 @@ function base64UrlDecode(value: string): Uint8Array {
 
 type StoredTimelineEntry = TimelineEntry & Readonly<{ timelineSequence: string }>;
 
-function encodeTimelineCursor(entry: StoredTimelineEntry, query: TimelineQuery, secret: string, memberId?: string): string {
-  const payload: TimelineCursor = { version: 2, sequence: entry.timelineSequence, memberId: memberId ?? null, filters: timelineFilterKey(query, memberId) };
+function signedTimelineCursor(payload: TimelineHistoryCursor | TimelineLiveCursor, secret: string): string {
   const encodedPayload = base64UrlEncode(JSON.stringify(payload));
   const signature = base64UrlEncode(createHmac("sha256", secret).update(encodedPayload).digest());
   return `${encodedPayload}.${signature}`;
+}
+
+function encodeTimelineCursor(entry: StoredTimelineEntry, query: TimelineQuery, secret: string, memberId?: string): string {
+  const payload: TimelineHistoryCursor = {
+    version: 3,
+    occurredAt: entry.occurredAt,
+    entryId: entry.id,
+    memberId: memberId ?? null,
+    filters: timelineFilterKey(query, memberId),
+  };
+  return signedTimelineCursor(payload, secret);
+}
+
+function encodeLiveTimelineCursor(sequence: string, query: TimelineQuery, secret: string, memberId?: string): string {
+  const payload: TimelineLiveCursor = { version: 2, sequence, memberId: memberId ?? null, filters: timelineFilterKey(query, memberId) };
+  return signedTimelineCursor(payload, secret);
 }
 
 function validTimelineCursorShape(value: string): boolean {
   return value.length <= 2048 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
 }
 
-function decodeTimelineCursor(value: string, query: TimelineQuery, secret: string, memberId?: string): Readonly<{ sequence: string }> {
+function decodeTimelineCursor(value: string, query: TimelineQuery, secret: string, memberId?: string): DecodedTimelineCursor {
   try {
     if (!validTimelineCursorShape(value)) throw new Error("cursor encoding is invalid");
     const separator = value.indexOf(".");
@@ -519,11 +554,18 @@ function decodeTimelineCursor(value: string, query: TimelineQuery, secret: strin
     const decoded: unknown = JSON.parse(new TextDecoder().decode(base64UrlDecode(encodedPayload)));
     if (typeof decoded !== "object" || decoded === null) throw new Error("cursor object required");
     const record = decoded as Record<string, unknown>;
-    if (record.version !== 2 || typeof record.sequence !== "string" || !/^[1-9]\d*$/.test(record.sequence) || typeof record.filters !== "string" || (typeof record.memberId !== "string" && record.memberId !== null) || (typeof record.memberId === "string" && !record.memberId.trim())) {
+    if (record.memberId !== (memberId ?? null) || record.filters !== timelineFilterKey(query, memberId)) throw new Error("cursor does not match query filters");
+    if (record.version === 2 && typeof record.sequence === "string" && /^[1-9]\d*$/.test(record.sequence)) {
+      if (typeof record.filters !== "string" || (typeof record.memberId !== "string" && record.memberId !== null) || (typeof record.memberId === "string" && !record.memberId.trim())) throw new Error("cursor fields are invalid");
+      return { kind: "live", sequence: record.sequence };
+    }
+    if (record.version !== 3 || typeof record.occurredAt !== "string" || !Number.isFinite(Date.parse(record.occurredAt))
+      || typeof record.entryId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(record.entryId)
+      || typeof record.filters !== "string" || (typeof record.memberId !== "string" && record.memberId !== null)
+      || (typeof record.memberId === "string" && !record.memberId.trim())) {
       throw new Error("cursor fields are invalid");
     }
-    if (record.memberId !== (memberId ?? null) || record.filters !== timelineFilterKey(query, memberId)) throw new Error("cursor does not match query filters");
-    return { sequence: record.sequence };
+    return { kind: "history", occurredAt: record.occurredAt, entryId: record.entryId };
   } catch {
     throw new TimelineQueryValidationError(["cursor must be an opaque valid Timeline cursor for these filters"]);
   }
@@ -740,15 +782,44 @@ function compareTimelineSequences(left: string, right: string): number {
   return leftSequence < rightSequence ? -1 : leftSequence > rightSequence ? 1 : 0;
 }
 
-function pageFromEntries(entries: readonly StoredTimelineEntry[], query: TimelineQuery, cursorSecret: string, memberId?: string): TimelinePage {
-  const sorted = entries.filter((entry) => entryMatchesQuery(entry, query)).sort((left, right) => compareTimelineSequences(left.timelineSequence, right.timelineSequence));
+function compareTimelinePositions(left: Pick<StoredTimelineEntry, "occurredAt" | "id">, right: Pick<StoredTimelineEntry, "occurredAt" | "id">): number {
+  const leftTime = Date.parse(left.occurredAt);
+  const rightTime = Date.parse(right.occurredAt);
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
+    if (leftTime !== rightTime) return leftTime - rightTime;
+  } else if (left.occurredAt !== right.occurredAt) {
+    return left.occurredAt < right.occurredAt ? -1 : 1;
+  }
+  return left.id === right.id ? 0 : left.id < right.id ? -1 : 1;
+}
+
+function pageFromEntries(
+  entries: readonly StoredTimelineEntry[],
+  query: TimelineQuery,
+  cursorSecret: string,
+  memberId?: string,
+  currentSequence = "0",
+): TimelinePage {
   const cursor = query.cursor ? decodeTimelineCursor(query.cursor, query, cursorSecret, memberId) : null;
-  const afterCursor = cursor ? sorted.filter((entry) => compareTimelineSequences(entry.timelineSequence, cursor.sequence) > 0) : sorted;
+  const matching = entries.filter((entry) => entryMatchesQuery(entry, query));
+  const sorted = matching.sort((left, right) => cursor?.kind === "live"
+    ? compareTimelineSequences(left.timelineSequence, right.timelineSequence)
+    : compareTimelinePositions(left, right));
+  const afterCursor = cursor
+    ? cursor.kind === "live"
+      ? sorted.filter((entry) => compareTimelineSequences(entry.timelineSequence, cursor.sequence) > 0)
+      : sorted.filter((entry) => compareTimelinePositions(entry, { occurredAt: cursor.occurredAt, id: cursor.entryId }) > 0)
+    : sorted;
   const page = afterCursor.slice(0, query.limit);
+  const hasMore = afterCursor.length > query.limit && page.length > 0;
   return {
     entries: page.map(cloneEntry),
-    nextCursor: afterCursor.length > query.limit && page.length > 0 ? encodeTimelineCursor(page[page.length - 1] as StoredTimelineEntry, query, cursorSecret, memberId) : null,
-    ...(memberId !== undefined && page.length > 0 ? { resumeCursor: encodeTimelineCursor(page[page.length - 1] as StoredTimelineEntry, query, cursorSecret, memberId) } : {}),
+    nextCursor: hasMore
+      ? cursor?.kind === "live"
+        ? encodeLiveTimelineCursor(page[page.length - 1]?.timelineSequence ?? currentSequence, query, cursorSecret, memberId)
+        : encodeTimelineCursor(page[page.length - 1] as StoredTimelineEntry, query, cursorSecret, memberId)
+      : null,
+    ...(memberId !== undefined && page.length > 0 ? { resumeCursor: encodeLiveTimelineCursor(currentSequence, query, cursorSecret, memberId) } : {}),
   };
 }
 
@@ -1063,7 +1134,7 @@ export class MemoryObservationStore implements TimelineStore, TimelineNotificati
       .map((entry): StoredTimelineEntry => this.entryWithLinks(entry.entryType === "observation"
         ? { ...entry, attentionUnread: memberId !== undefined && entry.attentionItem && !this.attentionReviews.has(`${entry.id}\u0000${memberId}`) }
         : entry));
-    const page = pageFromEntries(entries, query, this.cursorSecret, memberId);
+    const page = pageFromEntries(entries, query, this.cursorSecret, memberId, this.nextTimelineSequence.toString());
     return memberId ? { ...page, unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) } : page;
   }
 
@@ -2354,7 +2425,13 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
       values.push(memberId);
       joins = ` LEFT JOIN tracegarden_attention_reviews ar ON ar.entry_id = ai.entry_id AND ar.member_id = $${values.length}`;
     }
-    if (cursor) {
+    if (cursor?.kind === "history") {
+      values.push(cursor.occurredAt);
+      const occurredAtPlaceholder = values.length;
+      values.push(cursor.entryId);
+      condition += ` AND (t.occurred_at > $${occurredAtPlaceholder}::timestamptz
+        OR (t.occurred_at = $${occurredAtPlaceholder}::timestamptz AND t.id COLLATE "C" > $${values.length}))`;
+    } else if (cursor?.kind === "live") {
       values.push(cursor.sequence);
       condition += ` AND t.timeline_sequence > $${values.length}::bigint`;
     }
@@ -2381,13 +2458,24 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
       ? "false AS attention_unread"
       : "(ai.entry_id IS NOT NULL AND ar.entry_id IS NULL) AS attention_unread";
     const listSelect = timelineSelect.replace("         false AS attention_unread", `         ${attentionUnreadSelect}`) + joins;
-    const result = await pool.query<TimelineJoinRow>(`${listSelect} WHERE ${condition} ORDER BY t.timeline_sequence LIMIT $${values.length}`, values);
+    const order = cursor?.kind === "live" ? "t.timeline_sequence" : "t.occurred_at, t.id COLLATE \"C\"";
+    const result = await pool.query<TimelineJoinRow>(`${listSelect} WHERE ${condition} ORDER BY ${order} LIMIT $${values.length}`, values);
     const rawEntries = result.rows.slice(0, query.limit).map(timelineEntryFromRow);
     const entries = await this.attachConfirmedLinks(workspaceId, rawEntries);
+    const currentSequenceResult = memberId === undefined ? null : await pool.query<{ sequence: string | null }>(
+      "SELECT max(timeline_sequence)::text AS sequence FROM tracegarden_timeline_entries WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    const currentSequence = currentSequenceResult?.rows[0]?.sequence ?? "0";
+    const hasMore = result.rows.length > query.limit && entries.length > 0;
     return {
       entries,
-      nextCursor: result.rows.length > query.limit && entries.length > 0 ? encodeTimelineCursor(entries[entries.length - 1] as StoredTimelineEntry, query, this.cursorSecret, memberId) : null,
-      ...(memberId !== undefined && entries.length > 0 ? { resumeCursor: encodeTimelineCursor(entries[entries.length - 1] as StoredTimelineEntry, query, this.cursorSecret, memberId) } : {}),
+      nextCursor: hasMore
+        ? cursor?.kind === "live"
+          ? encodeLiveTimelineCursor((entries[entries.length - 1] as StoredTimelineEntry).timelineSequence, query, this.cursorSecret, memberId)
+          : encodeTimelineCursor(entries[entries.length - 1] as StoredTimelineEntry, query, this.cursorSecret, memberId)
+        : null,
+      ...(memberId !== undefined && entries.length > 0 ? { resumeCursor: encodeLiveTimelineCursor(currentSequence, query, this.cursorSecret, memberId) } : {}),
       ...(memberId === undefined ? {} : { unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) }),
     };
   }
@@ -2932,6 +3020,11 @@ export class PostgresAdmissionStore implements AdmissionStore, MembershipStore, 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      // Serialize every role mutation in this Workspace so two concurrent demotions cannot both observe two owners.
+      await client.query(
+        "SELECT id FROM tracegarden_members WHERE workspace_id = $1 ORDER BY id FOR UPDATE",
+        [WORKSPACE_ID],
+      );
       const currentResult = await client.query<MemberRow>(
         `SELECT m.id AS member_id, m.workspace_id, m.role,
                 ei.id AS identity_id, ei.issuer, ei.subject, ei.email, ei.display_name
@@ -2949,6 +3042,13 @@ export class PostgresAdmissionStore implements AdmissionStore, MembershipStore, 
       if (currentRow.role === role) {
         await client.query("COMMIT");
         return memberFromRow(currentRow);
+      }
+      if (currentRow.role === "owner" && role !== "owner") {
+        const owners = await client.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM tracegarden_members WHERE workspace_id = $1 AND role = 'owner'",
+          [WORKSPACE_ID],
+        );
+        if (Number(owners.rows[0]?.count ?? "0") <= 1) throw new LastWorkspaceOwnerError();
       }
       await client.query("UPDATE tracegarden_members SET role = $1 WHERE id = $2", [role, memberId]);
       await this.audit(client, "member.role_changed", "member", memberId, actor.id, {

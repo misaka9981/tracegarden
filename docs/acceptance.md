@@ -19,7 +19,7 @@ It runs sequentially so the shared build and Docker resources cannot race:
 
 The focused browser scenario uses the local identity adapter and a fresh PostgreSQL container. It configures the approved Cluster scope, feeds a fixed Pod through `DeterministicKubernetesAdapter`, verifies committed Timeline SSE delivery and cursor recovery after a missed notification, then creates structured Experiments. It rejects one Correlation Suggestion and confirms another, checks their persisted statuses and Confirmed Link, verifies that no suggestion is presented as cause, and reconstructs the history after switching from Simplified Chinese (the default) to English. Duplicate deterministic delivery remains one Timeline Entry.
 
-The workflow does not install browsers, pull images, contact Kubernetes, or invoke an external integration. Before running it, Docker's local image store must contain these exact references (both `docker image inspect` commands must succeed):
+The workflow does not install browsers, pull images, contact Kubernetes, or invoke an external integration. Container acceptance first materializes `.scratch/container-context` from the already frozen local install/store and production build, installs only production dependencies offline, and builds web, collector, and migration images with `network: none`; a missing `dist` or `node_modules` fails closed. Compose starts the services with `--pull never`, and the image smoke never builds from a registry or runs npm/pnpm. Before running it, Docker's local image store must contain these exact references (both `docker image inspect` commands must succeed):
 
 ```sh
 docker image inspect 'postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7'

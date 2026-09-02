@@ -63,6 +63,13 @@ export type MemberRecord = Readonly<{
 
 export type MembershipActor = Pick<MemberRecord, "id" | "capabilities">;
 
+export class LastWorkspaceOwnerError extends Error {
+  constructor() {
+    super("Cannot demote the last Workspace owner");
+    this.name = "LastWorkspaceOwnerError";
+  }
+}
+
 export type InvitationRecord = Readonly<{
   id: string;
   workspaceId: string;

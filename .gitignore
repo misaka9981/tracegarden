@@ -1,6 +1,7 @@
 node_modules/
 .ci/
 dist/
+.scratch/container-context/
 .env
 .env.*
 !.env.example

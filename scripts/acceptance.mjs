@@ -29,6 +29,7 @@ const commands = [
   ["strict typecheck", pnpm, ["typecheck"]],
   ["production build", pnpm, ["build"]],
   ["offline acceptance image preflight policy", process.execPath, ["scripts/acceptance-preflight.mjs"]],
+  ["clean-cache frozen dependency fail-closed policy", process.execPath, ["scripts/container-context-clean-cache.mjs"]],
   ["unit, authorization, telemetry, and domain failure suites", process.execPath, ["scripts/test.mjs"]],
   ["deterministic collector failure and recovery suites", process.execPath, ["scripts/collector-resilience.mjs"]],
   ["real PostgreSQL integration, auth, retention, log-bound, and live timeline suites", process.execPath, ["scripts/postgres-smoke.mjs"]],
