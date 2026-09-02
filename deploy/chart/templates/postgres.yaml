@@ -41,7 +41,7 @@ spec:
         app.kubernetes.io/component: postgres
     spec:
       automountServiceAccountToken: false
-      priorityClassName: tracegarden-production
+      priorityClassName: {{ .Values.priorityClassName | quote }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
@@ -97,7 +97,13 @@ spec:
               mountPath: /var/lib/postgresql
             - name: tmp
               mountPath: /tmp
+            - name: postgres-run
+              mountPath: /run/postgresql
       volumes:
+        - name: postgres-run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
         - name: tmp
           emptyDir:
             medium: Memory

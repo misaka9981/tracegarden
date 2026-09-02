@@ -2,8 +2,9 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["images", "web", "collector", "migration", "backup", "postgres", "config", "secrets", "serviceAccount", "rbac", "service", "ingress", "networkPolicy"],
+  "required": ["priorityClassName", "images", "web", "collector", "migration", "backup", "postgres", "config", "secrets", "serviceAccount", "rbac", "service", "ingress", "networkPolicy"],
   "properties": {
+    "priorityClassName": { "$ref": "#/definitions/kubernetesName" },
     "nameOverride": { "$ref": "#/definitions/kubernetesName" },
     "fullnameOverride": { "$ref": "#/definitions/kubernetesName" },
     "images": {

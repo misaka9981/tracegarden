@@ -42,6 +42,10 @@ The web and collector Dockerfiles use the frozen pnpm lockfile and ARM64-pinned 
 
 The `migrate` service is a one-shot, credential-free (apart from its database connection) gate. Web and collector depend on its successful completion and verify the committed migration state at startup without running migrations themselves. The collector receives no Google or Kubernetes credentials; with no explicit Kubernetes endpoint it reports `clusterContacted: false` and remains not ready.
 
+## Kubernetes API egress
+
+Production NetworkPolicy defaults are mandatory. NetworkPolicy evaluation may occur before or after Service DNAT: a pre-DNAT evaluator sees the Service ClusterIP and Service port, while a post-DNAT evaluator sees the selected endpoint IP and target port. Validate the actual tuple with the named target CNI and record its identity/version, observed evaluation point, and target; do not assume that a ClusterIP/Service-port rule also covers endpoint IP/target-port evaluation. If the evaluation point is ambiguous or the narrow check fails, keep the policy closed and stop; do not disable policies, add `0.0.0.0/0`, use a proxy, or mutate the CNI as a workaround. The profile `kind-host-network-apiserver-validation` proves application and RBAC behavior on kind but does not attest NetworkPolicy portability.
+
 ## Failure handling
 
 - Kubernetes watch disconnects use finite, bounded backoff and resume from the last persisted cursor.

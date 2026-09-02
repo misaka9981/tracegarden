@@ -1,5 +1,7 @@
 # Every application image is pinned by digest. Update these values from the
 # release attestation; image tags are intentionally not supported.
+priorityClassName: tracegarden-production
+
 images:
   web:
     repository: ghcr.io/misaka3389/tracegarden-web

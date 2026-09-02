@@ -25,7 +25,7 @@ spec:
         app.kubernetes.io/component: web
     spec:
       serviceAccountName: {{ include "tracegarden.logsServiceAccount" . }}
-      priorityClassName: tracegarden-production
+      priorityClassName: {{ .Values.priorityClassName | quote }}
       automountServiceAccountToken: true
       terminationGracePeriodSeconds: 30
       securityContext:
@@ -195,7 +195,7 @@ spec:
         app.kubernetes.io/component: collector
     spec:
       serviceAccountName: {{ include "tracegarden.observationServiceAccount" . }}
-      priorityClassName: tracegarden-production
+      priorityClassName: {{ .Values.priorityClassName | quote }}
       automountServiceAccountToken: true
       terminationGracePeriodSeconds: 30
       securityContext:
