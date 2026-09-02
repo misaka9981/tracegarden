@@ -169,9 +169,10 @@ if (!new RegExp(`^[a-f0-9]{64}\\s+${schemaArchive}$`, "m").test(schemaChecksums)
   errors.push("Kubernetes schema bundle must have a matching SHA-256 checksum");
 }
 const chartPackage = JSON.parse(await readFile("package.json", "utf8"));
-if (!chartPackage.scripts["chart:validate"]?.includes("schema-location")) errors.push("chart validation must pass an explicit schema location");
+const kubeconformAdapter = await readFile("scripts/kubeconform.mjs", "utf8");
+if (!chartPackage.scripts["chart:validate"]?.includes("kubeconform.mjs") || !kubeconformAdapter.includes("-schema-location")) errors.push("chart validation must pass an explicit schema location");
 const chartTest = await readFile("scripts/chart-test.mjs", "utf8");
-if (!chartTest.includes("schemaLocation") || !chartTest.includes("-schema-location")) errors.push("chart tests must pass an explicit schema location");
+if (!chartTest.includes("kubeconform.mjs") || !kubeconformAdapter.includes("-schema-location")) errors.push("chart tests must pass an explicit schema location");
 const chartValues = await readFile("deploy/chart/values.yaml", "utf8");
 const chartHelpers = await readFile("deploy/chart/templates/_helpers.tpl", "utf8");
 if (!chartValues.includes("Documentation-only placeholder") || !chartHelpers.includes("images.backup.digest must be replaced with the attested release digest")) {

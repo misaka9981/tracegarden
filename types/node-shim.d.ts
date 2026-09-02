@@ -81,7 +81,13 @@ declare module "pg" {
     rows: T[];
     rowCount: number;
   }
+  export interface QueryConfig {
+    text: string;
+    values?: unknown[];
+    query_timeout?: number;
+  }
   export interface PoolClient {
+    query<T = Record<string, unknown>>(config: QueryConfig): Promise<QueryResult<T>>;
     query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
     on(event: "notification", listener: (message: { channel: string; payload?: string }) => void): this;
     on(event: "error", listener: (error: unknown) => void): this;

@@ -85,22 +85,191 @@ export interface DatabaseBoundary {
   readonly retention?: RetentionStore;
   migrate(): Promise<void>;
   verifyMigrations?(): Promise<void>;
-  ping(): Promise<boolean>;
+  ping(timeoutMs?: number): Promise<boolean>;
   migrationStatus?(): DatabaseMigrationStatus;
   poolState?(): DatabasePoolState;
   close(): Promise<void>;
+}
+
+export type ReadinessWaitOptions = Readonly<{
+  now?: () => number;
+  sleep?: (delayMs: number) => Promise<void>;
+}>;
+
+export type ReadinessProbeOptions = Readonly<{
+  now?: () => number;
+  sleep?: (delayMs: number) => Promise<void>;
+}>;
+
+const POSTGRES_READINESS_PROBE_TIMEOUT_MS = 1_000;
+const defaultReadinessSleep = (delayMs: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, delayMs));
+const pendingReadinessAcquisitions = new WeakMap<object, Promise<void>>();
+
+type ReadinessProbeResult = Readonly<{
+  client?: PoolClient;
+  timedOut?: boolean;
+}>;
+
+type ReadinessDeadline = Readonly<{
+  promise: Promise<void>;
+  cancel(): void;
+}>;
+
+function readinessDeadline(delayMs: number, sleep: (delayMs: number) => Promise<void>): ReadinessDeadline {
+  if (sleep !== defaultReadinessSleep) return { promise: sleep(delayMs), cancel: () => undefined };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const promise = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, delayMs);
+  });
+  return {
+    promise,
+    cancel: () => {
+      if (timer !== undefined) clearTimeout(timer);
+    },
+  };
+}
+
+function releaseReadinessClient(client: PoolClient, error?: Error): void {
+  try {
+    client.release(error);
+  } catch {
+    // A late or already-closed client is no longer usable, regardless of release outcome.
+  }
+}
+
+function trackPendingReadinessAcquisition(pool: object, acquisition: Promise<PoolClient | undefined>): void {
+  const cleanup = acquisition.then(() => undefined, () => undefined);
+  pendingReadinessAcquisitions.set(pool, cleanup);
+  void cleanup.then(() => {
+    if (pendingReadinessAcquisitions.get(pool) === cleanup) pendingReadinessAcquisitions.delete(pool);
+  });
+}
+
+export async function probePostgresReadiness(
+  pool: Pick<Pool, "connect">,
+  timeoutMs: number = POSTGRES_READINESS_PROBE_TIMEOUT_MS,
+  options: ReadinessProbeOptions = {},
+): Promise<boolean> {
+  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? Math.max(1, Math.floor(timeoutMs))
+    : POSTGRES_READINESS_PROBE_TIMEOUT_MS;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? defaultReadinessSleep;
+  const deadline = now() + timeout;
+  if (pendingReadinessAcquisitions.has(pool)) return false;
+
+  let client: PoolClient | undefined;
+  let acquisitionTimedOut = false;
+  let acquisitionPromise: Promise<PoolClient | undefined> | undefined;
+  try {
+    const acquisition = Promise.resolve(pool.connect());
+    acquisitionPromise = acquisition.then((candidate) => {
+      if (acquisitionTimedOut) {
+        releaseReadinessClient(candidate, new Error("PostgreSQL readiness probe timed out"));
+        return undefined;
+      }
+      return candidate;
+    });
+    const acquisitionRemaining = deadline - now();
+    if (acquisitionRemaining <= 0) {
+      acquisitionTimedOut = true;
+      trackPendingReadinessAcquisition(pool, acquisitionPromise);
+      return false;
+    }
+    const acquisitionTimer = readinessDeadline(
+      Math.min(acquisitionRemaining, POSTGRES_POOL_CONNECTION_TIMEOUT_MS),
+      sleep,
+    );
+    let acquisitionResult: ReadinessProbeResult;
+    try {
+      acquisitionResult = await Promise.race([
+        acquisitionPromise.then((candidate) => candidate ? { client: candidate } : { timedOut: true }),
+        acquisitionTimer.promise.then(() => {
+          acquisitionTimedOut = true;
+          return { timedOut: true };
+        }),
+      ]);
+    } finally {
+      acquisitionTimer.cancel();
+    }
+    if (acquisitionResult.timedOut || !acquisitionResult.client) {
+      trackPendingReadinessAcquisition(pool, acquisitionPromise);
+      return false;
+    }
+    client = acquisitionResult.client;
+    const remaining = deadline - now();
+    if (remaining <= 0) {
+      releaseReadinessClient(client, new Error("PostgreSQL readiness probe timed out"));
+      return false;
+    }
+    const query = Promise.resolve(client.query({
+      text: `BEGIN; SET LOCAL statement_timeout = ${Math.max(1, Math.floor(remaining))}; SELECT 1; COMMIT`,
+      query_timeout: Math.max(1, Math.floor(remaining)),
+    }));
+    const queryTimer = readinessDeadline(Math.max(1, Math.floor(remaining)), sleep);
+    try {
+      await Promise.race([
+        query,
+        queryTimer.promise.then(() => {
+          throw new Error("PostgreSQL readiness probe timed out");
+        }),
+      ]);
+    } finally {
+      queryTimer.cancel();
+    }
+    releaseReadinessClient(client);
+    client = undefined;
+    return true;
+  } catch (error: unknown) {
+    if (acquisitionTimedOut && acquisitionPromise && !pendingReadinessAcquisitions.has(pool)) {
+      trackPendingReadinessAcquisition(pool, acquisitionPromise);
+    }
+    if (client) releaseReadinessClient(client, error instanceof Error ? error : new Error("PostgreSQL readiness probe failed"));
+    return false;
+  }
+}
+
+export async function waitForDatabase(
+  database: Pick<DatabaseBoundary, "ping">,
+  timeoutMs: number,
+  retryMs: number,
+  options: ReadinessWaitOptions = {},
+): Promise<void> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isFinite(retryMs) || retryMs <= 0) {
+    throw new Error("Database readiness wait requires positive finite durations");
+  }
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? defaultReadinessSleep;
+  const deadline = now() + timeoutMs;
+  let lastError: unknown;
+  while (true) {
+    const remainingBeforePingMs = deadline - now();
+    if (remainingBeforePingMs <= 0) throw new Error("Tracegarden database readiness timeout", { cause: lastError });
+    try {
+      const pingResult = await database.ping(remainingBeforePingMs);
+      if (pingResult) return;
+    } catch (error: unknown) {
+      lastError = error;
+    }
+    const remainingMs = deadline - now();
+    if (remainingMs <= 0) throw new Error("Tracegarden database readiness timeout", { cause: lastError });
+    await sleep(Math.min(retryMs, remainingMs));
+  }
 }
 
 export async function waitForMigrations(
   database: Pick<DatabaseBoundary, "verifyMigrations">,
   timeoutMs: number,
   retryMs: number,
+  options: ReadinessWaitOptions = {},
 ): Promise<void> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isFinite(retryMs) || retryMs <= 0) {
     throw new Error("Migration readiness wait requires positive finite durations");
   }
   if (!database.verifyMigrations) throw new Error("Migration verification is unavailable");
-  const deadline = Date.now() + timeoutMs;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? defaultReadinessSleep;
+  const deadline = now() + timeoutMs;
   let lastError: unknown;
   while (true) {
     try {
@@ -109,9 +278,9 @@ export async function waitForMigrations(
     } catch (error: unknown) {
       lastError = error;
     }
-    const remainingMs = deadline - Date.now();
+    const remainingMs = deadline - now();
     if (remainingMs <= 0) throw new Error("Tracegarden database migrations readiness timeout", { cause: lastError });
-    await new Promise((resolve) => setTimeout(resolve, Math.min(retryMs, remainingMs)));
+    await sleep(Math.min(retryMs, remainingMs));
   }
 }
 
@@ -3249,11 +3418,9 @@ export class PostgresDatabase implements DatabaseBoundary {
     this.migrationState = "ready";
   }
 
-  async ping(): Promise<boolean> {
+  async ping(timeoutMs?: number): Promise<boolean> {
     try {
-      const pool = await this.getPool();
-      await pool.query("SELECT 1");
-      return true;
+      return await probePostgresReadiness(await this.getPool(), timeoutMs);
     } catch {
       return false;
     }
@@ -3299,7 +3466,7 @@ export class MemoryDatabase implements DatabaseBoundary {
     return { total: 0, idle: 0, waiting: 0 };
   }
 
-  async ping(): Promise<boolean> {
+  async ping(_timeoutMs?: number): Promise<boolean> {
     return this.migrationReady;
   }
 

@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { chromium } from "@playwright/test";
 import { createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { DeterministicKubernetesAdapter } from "../dist/packages/cluster/src/index.js";
-import { PostgresDatabase } from "../dist/packages/db/src/index.js";
+import { PostgresDatabase, waitForDatabase } from "../dist/packages/db/src/index.js";
 
 const webPort = Number(process.env.CORE_LOOP_WEB_PORT ?? "43192");
 const databasePort = Number(process.env.CORE_LOOP_DATABASE_PORT ?? "45435");
@@ -79,18 +79,6 @@ async function stopProcess(child) {
   await waitForExit(child);
 }
 
-async function waitForDatabase() {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    try {
-      docker("exec", databaseName, "pg_isready", "-U", "tracegarden", "-d", "tracegarden");
-      return;
-    } catch {
-      if (attempt === 59) throw new Error("Core-loop PostgreSQL did not become ready");
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
-}
-
 async function waitForWeb(output) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
@@ -162,7 +150,16 @@ let webOutput = "";
 removeDatabase();
 try {
   docker("run", "--pull=never", "-d", "--rm", "--name", databaseName, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", postgresImage);
-  await waitForDatabase();
+  await waitForDatabase({
+    ping: async () => {
+      try {
+        docker("exec", databaseName, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT 1");
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  }, 60_000, 250);
   database = new PostgresDatabase(databaseUrl);
   await database.migrate();
   await database.clusterScope.save({ workspaceId, clusterId: "core-loop-cluster", ...scopeInput });

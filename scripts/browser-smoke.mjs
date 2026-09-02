@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { chromium } from "@playwright/test";
-import { PostgresDatabase } from "../dist/packages/db/src/index.js";
+import { PostgresDatabase, waitForDatabase } from "../dist/packages/db/src/index.js";
 import { normalizePodObservation } from "../dist/packages/cluster/src/index.js";
 
 const port = 43191;
@@ -36,15 +36,16 @@ if (!imageAvailable(postgresImage)) {
 removeDatabase();
 try {
   docker("run", "--pull=never", "-d", "--name", databaseName, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", postgresImage);
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    try {
-      docker("exec", databaseName, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT 1");
-      break;
-    } catch {
-      if (attempt === 39) throw new Error("PostgreSQL did not become ready");
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
+  await waitForDatabase({
+    ping: async () => {
+      try {
+        docker("exec", databaseName, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT 1");
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  }, 10_000, 250);
   timelineDatabase = new PostgresDatabase(databaseUrl);
   await timelineDatabase.migrate();
   child = spawn(process.execPath, ["dist/apps/web/src/main.js"], {

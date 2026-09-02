@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { resolve } from "node:path";
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url)));
 assert.match(packageJson.scripts["chart:render"], /KUBECONFIG=\/dev\/null helm template/);
 assert.match(packageJson.scripts["chart:validate"], /helm template/);
 assert.match(packageJson.scripts["chart:validate"], /kubeconform/);
-assert.match(packageJson.scripts["chart:validate"], /schema-location/);
-assert.match(packageJson.scripts["chart:validate"], /KUBECONFORM_SCHEMA_LOCATION/);
+assert.match(packageJson.scripts["chart:validate"], /scripts\/kubeconform\.mjs/);
+assert.doesNotMatch(packageJson.scripts["chart:validate"], /KUBECONFORM_SCHEMA_LOCATION/);
+assert.doesNotMatch(packageJson.scripts["chart:validate"], /file:\/\//);
 
 const schema = JSON.parse(await readFile(new URL("../deploy/chart/values.schema.json", import.meta.url)));
 const values = await readFile(new URL("../deploy/chart/values.yaml", import.meta.url), "utf8");
@@ -24,8 +25,13 @@ const [deployments, backup, migration, networkPolicies, rbac, serviceAccounts] =
 const webSource = await readFile(new URL("../apps/web/src/server.ts", import.meta.url), "utf8");
 const collectorSource = await readFile(new URL("../apps/collector/src/main.ts", import.meta.url), "utf8");
 const migrationSource = await readFile(new URL("../apps/migrate/src/main.ts", import.meta.url), "utf8");
+const kubeconformAdapter = await readFile(new URL("./kubeconform.mjs", import.meta.url), "utf8");
 const postgres = await readFile(new URL("../deploy/chart/templates/postgres.yaml", import.meta.url), "utf8");
 const helpers = await readFile(new URL("../deploy/chart/templates/_helpers.tpl", import.meta.url), "utf8");
+
+assert.match(kubeconformAdapter, /\.ci\/kubeconform-schemas\/v1\.31\.0-standalone-strict/);
+assert.match(kubeconformAdapter, /-schema-location/);
+assert.match(kubeconformAdapter, /-strict/);
 
 assert.ok(schema.required.includes("rbac"));
 assert.ok(schema.required.includes("backup"));
@@ -98,9 +104,8 @@ assert.match(deployments, /automountServiceAccountToken: true/);
 assert.match(deployments, /serviceAccountName: .*logsServiceAccount/);
 assert.match(deployments, /serviceAccountName: .*observationServiceAccount/);
 
-const schemaDirectory = process.env.KUBECONFORM_SCHEMA_LOCATION?.trim()
-  || `${pathToFileURL(`${process.cwd()}/.ci/kubeconform-schemas/v1.31.0-standalone-strict`).href}/`;
-const schemaLocation = `${schemaDirectory}{{ .ResourceKind }}{{ .KindSuffix }}.json`;
+const schemaDirectory = resolve(process.cwd(), ".ci/kubeconform-schemas/v1.31.0-standalone-strict");
+assert.equal((kubeconformAdapter.match(/"[^"]+": "[^"]+\.json"/g) ?? []).length, 14, "adapter must cover every checked-in schema");
 
 function renderChart(extraArgs = []) {
   return spawnSync("helm", [
@@ -114,7 +119,7 @@ function renderChart(extraArgs = []) {
 function renderAndValidate(extraArgs = []) {
   const render = renderChart(extraArgs);
   assert.equal(render.status, 0, render.stderr || "helm template failed");
-  const validation = spawnSync("kubeconform", ["-schema-location", schemaLocation, "-strict", "-kubernetes-version", "1.31.0", "-summary"], {
+  const validation = spawnSync(process.execPath, ["scripts/kubeconform.mjs", schemaDirectory], {
     encoding: "utf8",
     input: render.stdout,
     env: { ...process.env, KUBECONFIG: "/dev/null" },

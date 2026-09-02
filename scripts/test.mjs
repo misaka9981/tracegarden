@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { ServerResponse } from "node:http";
 import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../dist/apps/web/src/server.js";
-import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError, parseTimelineNotification, waitForMigrations } from "../dist/packages/db/src/index.js";
+import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError, parseTimelineNotification, probePostgresReadiness, waitForDatabase, waitForMigrations } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LastWorkspaceOwnerError, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
 import { confirmCorrelationSuggestion, correlationSignalsBetween, createExperiment, ExperimentLifecycleError, ExperimentValidationError, hasCorrelationReview, hasExperimentWrite, hasRetentionManagement, parseExperimentInput, rejectCorrelationSuggestion, runRetentionCleanup, suggestCorrelationCandidates, updateRetentionPolicy } from "../dist/packages/domain/src/index.js";
@@ -558,16 +558,137 @@ await assert.rejects(database.verifyMigrations(), /migrations are not complete/)
 await database.migrate();
 await database.verifyMigrations();
 assert.equal(await database.ping(), true);
+let databaseReadinessAttempts = 0;
+let databaseReadinessNow = 0;
+const databaseReadinessSleeps = [];
+await waitForDatabase({
+  ping: async () => {
+    databaseReadinessAttempts += 1;
+    if (databaseReadinessAttempts < 3) throw new Error("database connection is delayed");
+    return true;
+  },
+}, 50, 1, {
+  now: () => databaseReadinessNow,
+  sleep: async (delayMs) => {
+    databaseReadinessSleeps.push(delayMs);
+    databaseReadinessNow += delayMs;
+  },
+});
+assert.equal(databaseReadinessAttempts, 3);
+assert.deepEqual(databaseReadinessSleeps, [1, 1]);
+let databaseTimeoutNow = 0;
+await assert.rejects(
+  waitForDatabase({ ping: async () => false }, 20, 1, {
+    now: () => databaseTimeoutNow,
+    sleep: async (delayMs) => { databaseTimeoutNow += delayMs; },
+  }),
+  /database readiness timeout/,
+);
+let delayedConnectResolve;
+let delayedConnectCalls = 0;
+let delayedReleaseError;
+let delayedClientReleased;
+const delayedClientReleasedPromise = new Promise((resolve) => { delayedClientReleased = resolve; });
+let delayedPoolEnded = false;
+const delayedPool = {
+  connect: () => {
+    delayedConnectCalls += 1;
+    return new Promise((resolve) => { delayedConnectResolve = resolve; });
+  },
+  end: async () => {
+    await delayedClientReleasedPromise;
+    delayedPoolEnded = true;
+  },
+};
+let delayedNow = 0;
+let delayedTimeoutResolve;
+const delayedProbe = probePostgresReadiness(delayedPool, 7, {
+  now: () => delayedNow,
+  sleep: (delayMs) => new Promise((resolve) => {
+    delayedTimeoutResolve = () => {
+      delayedNow += delayMs;
+      resolve();
+    };
+  }),
+});
+delayedTimeoutResolve();
+assert.equal(await delayedProbe, false);
+assert.equal(delayedNow, 7);
+assert.equal(await probePostgresReadiness(delayedPool, 7, {
+  now: () => delayedNow,
+  sleep: async (delayMs) => { delayedNow += delayMs; },
+}), false);
+assert.equal(delayedConnectCalls, 1);
+let delayedEndSettled = false;
+const delayedEnd = delayedPool.end().then(() => { delayedEndSettled = true; });
+await Promise.resolve();
+assert.equal(delayedEndSettled, false);
+delayedConnectResolve({
+  query: async () => undefined,
+  release: (error) => {
+    delayedReleaseError = error;
+    delayedClientReleased();
+  },
+});
+await delayedEnd;
+assert.equal(delayedPoolEnded, true);
+assert.equal(delayedEndSettled, true);
+assert.ok(delayedReleaseError instanceof Error);
+assert.equal(delayedReleaseError.message, "PostgreSQL readiness probe timed out");
+
+let readinessQuery;
+let readinessReleaseError;
+let readinessNow = 100;
+const readinessStart = readinessNow;
+const readinessPool = {
+  connect: async () => {
+    readinessNow += 3;
+    return {
+      query: async (config) => {
+        readinessQuery = config;
+        return new Promise(() => {});
+      },
+      release: (error) => { readinessReleaseError = error; },
+    };
+  },
+};
+const readinessTimeoutResolvers = [];
+const readinessProbe = probePostgresReadiness(readinessPool, 10, {
+  now: () => readinessNow,
+  sleep: (delayMs) => new Promise((resolve) => {
+    readinessTimeoutResolvers.push(() => {
+      readinessNow += delayMs;
+      resolve();
+    });
+  }),
+});
+while (!readinessQuery) await Promise.resolve();
+assert.equal(readinessTimeoutResolvers.length, 2);
+readinessTimeoutResolvers.at(-1)();
+assert.equal(await readinessProbe, false);
+assert.equal(readinessNow - readinessStart, 10);
+assert.equal(readinessQuery.query_timeout, 7);
+assert.match(readinessQuery.text, /SET LOCAL statement_timeout = 7; SELECT 1/);
+assert.ok(readinessReleaseError instanceof Error);
+assert.equal(readinessReleaseError.message, "PostgreSQL readiness probe timed out");
 let verificationAttempts = 0;
+let verificationNow = 0;
 await waitForMigrations({
   verifyMigrations: async () => {
     verificationAttempts += 1;
     if (verificationAttempts < 2) throw new Error("schema is pending");
   },
-}, 50, 1);
+}, 50, 1, {
+  now: () => verificationNow,
+  sleep: async (delayMs) => { verificationNow += delayMs; },
+});
 assert.equal(verificationAttempts, 2);
+let migrationTimeoutNow = 0;
 await assert.rejects(
-  waitForMigrations({ verifyMigrations: async () => { throw new Error("schema is pending"); } }, 20, 1),
+  waitForMigrations({ verifyMigrations: async () => { throw new Error("schema is pending"); } }, 20, 1, {
+    now: () => migrationTimeoutNow,
+    sleep: async (delayMs) => { migrationTimeoutNow += delayMs; },
+  }),
   /migrations readiness timeout/,
 );
 const exporterWebRuntime = await createWebRuntime({

@@ -4,7 +4,7 @@ import pg from "pg";
 import { execFileSync, spawn } from "node:child_process";
 import { createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { DeterministicKubernetesAdapter, normalizeObservation, normalizePodObservation } from "../dist/packages/cluster/src/index.js";
-import { PostgresDatabase, PostgresObservationStore, TimelineQueryValidationError } from "../dist/packages/db/src/index.js";
+import { PostgresDatabase, PostgresObservationStore, TimelineQueryValidationError, waitForDatabase } from "../dist/packages/db/src/index.js";
 import { FakeKubernetesLogAdapter, requestRecentLogWindow } from "../dist/packages/logs/src/index.js";
 
 const name = `tracegarden-foundation-pg-${process.pid}`;
@@ -43,15 +43,16 @@ if (!imageAvailable(postgresImage)) {
 removeDatabase();
 try {
   docker("run", "--pull=never", "-d", "--name", name, "-p", `${databasePort}:5432`, "-e", "POSTGRES_DB=tracegarden", "-e", "POSTGRES_USER=tracegarden", "-e", "POSTGRES_PASSWORD=local-only", postgresImage);
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    try {
-      docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT 1");
-      break;
-    } catch {
-      if (attempt === 39) throw new Error("PostgreSQL did not become ready");
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
+  await waitForDatabase({
+    ping: async () => {
+      try {
+        docker("exec", name, "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", "SELECT 1");
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  }, 10_000, 250);
 
   // Apply the legacy schema first so migration 0013 is tested against pre-existing data.
   const legacyClient = new pg.Client(databaseUrl);

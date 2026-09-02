@@ -543,13 +543,8 @@ if (process.env.DELIVERY_RENDER === "true") {
     env: { ...process.env, KUBECONFIG: "/dev/null" },
   });
   assert.equal(render.status, 0, render.stderr || "preview Helm render failed");
-  const schemaDirectory = process.env.KUBECONFORM_SCHEMA_LOCATION?.trim()
-    || `file://${process.cwd()}/.ci/kubeconform-schemas/v1.31.0-standalone-strict/`;
-  const schemaLocation = `${schemaDirectory.replace(/\/?$/, "/")}{{ .ResourceKind }}{{ .KindSuffix }}.json`;
-  const validation = spawnSync("kubeconform", [
-    "-schema-location", schemaLocation,
-    "-strict", "-kubernetes-version", "1.31.0", "-summary",
-  ], {
+  const schemaDirectory = join(process.cwd(), ".ci/kubeconform-schemas/v1.31.0-standalone-strict");
+  const validation = spawnSync(process.execPath, ["scripts/kubeconform.mjs", schemaDirectory], {
     encoding: "utf8",
     input: render.stdout,
     env: { ...process.env, KUBECONFIG: "/dev/null" },

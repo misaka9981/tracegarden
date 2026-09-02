@@ -4,6 +4,7 @@ import { URL } from "node:url";
 import { state, type StatusResponse } from "../../../packages/contracts/src/index.js";
 import {
   createDatabase,
+  waitForDatabase,
   MemoryAdmissionStore,
   parseTimelineQuery,
   TimelineQueryValidationError,
@@ -1135,13 +1136,17 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   let databaseReady = false;
   let startupState: "starting" | "ready" | "failed" = "starting";
   try {
+    await waitForDatabase(
+      database,
+      Number(environment.MIGRATION_DATABASE_READY_TIMEOUT_SECONDS ?? 120) * 1000,
+      Number(environment.MIGRATION_DATABASE_READY_RETRY_SECONDS ?? 2) * 1000,
+    );
+    databaseReady = true;
     if (database.verifyMigrations) await database.verifyMigrations();
     else if (database.kind !== "memory" && database.migrationStatus?.() !== "ready") {
       throw new Error("Tracegarden database migration state cannot be verified");
     }
     migrationReady = database.migrationStatus?.() !== "failed";
-    databaseReady = await database.ping();
-    if (!databaseReady) throw new Error("Tracegarden database readiness check failed");
   } catch (error) {
     startupState = "failed";
     telemetry.log("error", "web.startup.failure", startupCorrelation, { error_type: error instanceof Error ? error.name : "unknown" });

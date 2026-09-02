@@ -17,6 +17,7 @@ import {
 } from "../../../packages/cluster/src/index.js";
 import {
   PostgresDatabase,
+  waitForDatabase,
   type DatabaseBoundary,
   type IngestionCheckpoint,
   type IngestionCheckpointInput,
@@ -341,13 +342,17 @@ export async function createCollectorRuntime(options: CollectorOptions = {}): Pr
   }
   if (database) {
     try {
+      await waitForDatabase(
+        database,
+        Number(environment.MIGRATION_DATABASE_READY_TIMEOUT_SECONDS ?? 120) * 1000,
+        Number(environment.MIGRATION_DATABASE_READY_RETRY_SECONDS ?? 2) * 1000,
+      );
+      databaseReady = true;
       if (database.verifyMigrations) await database.verifyMigrations();
       else if (database.kind !== "memory" && database.migrationStatus?.() !== "ready") {
         throw new Error("Tracegarden collector migration state cannot be verified");
       }
       migrationReady = database.migrationStatus?.() !== "failed";
-      databaseReady = await database.ping();
-      if (!databaseReady) throw new Error("Tracegarden collector database readiness check failed");
     } catch (error) {
       startupState = "failed";
       telemetry.log("error", "collector.startup.failure", startupCorrelation, { error_type: error instanceof Error ? error.name : "unknown" });

@@ -31,7 +31,7 @@
     "test:postgres": "node scripts/postgres-smoke.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "chart:render": "KUBECONFIG=/dev/null helm template tracegarden deploy/chart --namespace tracegarden --kube-version 1.31.0",
-    "chart:validate": "SCHEMA_DIR=\"${KUBECONFORM_SCHEMA_LOCATION:-file://$PWD/.ci/kubeconform-schemas/v1.31.0-standalone-strict/}\" && KUBECONFIG=/dev/null helm template tracegarden deploy/chart --namespace tracegarden --kube-version 1.31.0 | kubeconform -schema-location \"${SCHEMA_DIR}{{ .ResourceKind }}{{ .KindSuffix }}.json\" -strict -kubernetes-version 1.31.0 -summary",
+    "chart:validate": "KUBECONFIG=/dev/null helm template tracegarden deploy/chart --namespace tracegarden --kube-version 1.31.0 | node scripts/kubeconform.mjs",
     "preview:render": "KUBECONFIG=/dev/null helm template tracegarden-preview deploy/preview/chart --namespace preview-pr-1 --kube-version 1.31.0 --values deploy/preview/digests/pr-1.yaml",
     "predelivery:validate": "pnpm build",
     "delivery:validate": "node scripts/delivery-test.mjs",
