@@ -113,7 +113,28 @@ try {
   assert.deepEqual(decryptBackupBuffer(uploaded, key), plaintext);
   assert.match(result.artifactName, /^tracegarden\/20260102T030405Z-[a-f0-9]{12}\.dump\.enc$/);
   assert.equal(result.retentionDays, 30);
-  console.log("offline backup encryption, off-VM gate, and credential-free upload boundary passed");
+
+  let nativeUpload;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    nativeUpload = { url: String(url), options };
+    return new Response(null, { status: 200 });
+  };
+  try {
+    await runBackup({
+      environment: { ...environment, AWS_ACCESS_KEY_ID: "test-access", AWS_SECRET_ACCESS_KEY: "test-secret", AWS_REGION: "us-east-1" },
+      dump: async () => plaintext,
+      now: new Date("2026-01-02T03:04:05.000Z"),
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.ok(nativeUpload);
+  assert.match(nativeUpload.url, /storage\.invalid\/tracegarden-backups\/tracegarden\/20260102T030405Z-/);
+  assert.equal(nativeUpload.options.method, "PUT");
+  assert.match(nativeUpload.options.headers.authorization, /^AWS4-HMAC-SHA256 Credential=test-access\//);
+  assert.notEqual(Buffer.from(nativeUpload.options.body).includes(plaintext), true, "native uploader must receive encrypted bytes only");
+  console.log("offline backup encryption, native SigV4 upload, off-VM gate, and credential-free boundary passed");
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

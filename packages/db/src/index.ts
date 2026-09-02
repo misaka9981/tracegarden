@@ -2404,80 +2404,101 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
     return Object.freeze(result.rows.map(confirmedLinkFromRow));
   }
 
-  private async attachConfirmedLinks(workspaceId: string, entries: readonly TimelineEntry[]): Promise<readonly TimelineEntry[]> {
-    const links = await this.listConfirmedLinks(workspaceId);
-    return entries.map((entry) => {
-      const related = links.filter((link) => link.leftEntryId === entry.id || link.rightEntryId === entry.id);
-      return related.length > 0 ? { ...entry, confirmedLinks: related } : entry;
-    });
-  }
-
   async listTimelineEntries(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<TimelinePage> {
     if (query.unread !== undefined && memberId === undefined) {
       throw new TimelineQueryValidationError(["member is required for unread Attention filtering"]);
     }
     const cursor = query.cursor ? decodeTimelineCursor(query.cursor, query, this.cursorSecret, memberId) : null;
     const pool = await this.poolProvider();
-    const values: unknown[] = [workspaceId];
-    let condition = "t.workspace_id = $1";
-    let joins = " LEFT JOIN tracegarden_attention_reviews ar ON false";
-    if (memberId !== undefined) {
-      values.push(memberId);
-      joins = ` LEFT JOIN tracegarden_attention_reviews ar ON ar.entry_id = ai.entry_id AND ar.member_id = $${values.length}`;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      const values: unknown[] = [workspaceId];
+      let condition = "t.workspace_id = $1";
+      let joins = " LEFT JOIN tracegarden_attention_reviews ar ON false";
+      if (memberId !== undefined) {
+        values.push(memberId);
+        joins = ` LEFT JOIN tracegarden_attention_reviews ar ON ar.entry_id = ai.entry_id AND ar.member_id = $${values.length}`;
+      }
+      if (cursor?.kind === "history") {
+        values.push(cursor.occurredAt);
+        const occurredAtPlaceholder = values.length;
+        values.push(cursor.entryId);
+        condition += ` AND (t.occurred_at > $${occurredAtPlaceholder}::timestamptz
+          OR (t.occurred_at = $${occurredAtPlaceholder}::timestamptz AND t.id COLLATE "C" > $${values.length}))`;
+      } else if (cursor?.kind === "live") {
+        values.push(cursor.sequence);
+        condition += ` AND t.timeline_sequence > $${values.length}::bigint`;
+      }
+      if (query.kind) {
+        values.push(query.kind);
+        condition += ` AND o.kind = $${values.length}`;
+      }
+      if (query.namespace) {
+        values.push(query.namespace);
+        condition += ` AND o.namespace = $${values.length}`;
+      }
+      if (query.name) {
+        values.push(query.name);
+        condition += ` AND o.name = $${values.length}`;
+      }
+      if (query.state) {
+        values.push(query.state);
+        condition += ` AND o.facts->>'phase' = $${values.length}`;
+      }
+      if (query.attention !== undefined) condition += query.attention ? " AND ai.entry_id IS NOT NULL" : " AND ai.entry_id IS NULL";
+      if (query.unread !== undefined) condition += query.unread ? " AND ai.entry_id IS NOT NULL AND ar.entry_id IS NULL" : " AND (ai.entry_id IS NULL OR ar.entry_id IS NOT NULL)";
+      values.push(query.limit + 1);
+      const attentionUnreadSelect = memberId === undefined
+        ? "false AS attention_unread"
+        : "(ai.entry_id IS NOT NULL AND ar.entry_id IS NULL) AS attention_unread";
+      const listSelect = timelineSelect.replace("         false AS attention_unread", `         ${attentionUnreadSelect}`) + joins;
+      const order = cursor?.kind === "live" ? "t.timeline_sequence" : "t.occurred_at, t.id COLLATE \"C\"";
+      const result = await client.query<TimelineJoinRow>(`${listSelect} WHERE ${condition} ORDER BY ${order} LIMIT $${values.length}`, values);
+      const rawEntries = result.rows.slice(0, query.limit).map(timelineEntryFromRow);
+      const linksResult = await client.query<ConfirmedLinkRow>(
+        `SELECT id, workspace_id, suggestion_id, left_entry_id, right_entry_id, confirmed_by_member_id, confirmed_at
+           FROM tracegarden_confirmed_links WHERE workspace_id = $1 ORDER BY confirmed_at, id`,
+        [workspaceId],
+      );
+      const links = linksResult.rows.map(confirmedLinkFromRow);
+      const entries = rawEntries.map((entry) => {
+        const related = links.filter((link) => link.leftEntryId === entry.id || link.rightEntryId === entry.id);
+        return related.length > 0 ? { ...entry, confirmedLinks: related } : entry;
+      });
+      const currentSequenceResult = memberId === undefined ? null : await client.query<{ sequence: string | null }>(
+        "SELECT max(timeline_sequence)::text AS sequence FROM tracegarden_timeline_entries WHERE workspace_id = $1",
+        [workspaceId],
+      );
+      const unreadAttentionCountResult = memberId === undefined ? null : await client.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM tracegarden_attention_items ai
+           JOIN tracegarden_timeline_entries t ON t.id = ai.entry_id
+          WHERE ai.workspace_id = $1
+            AND NOT EXISTS (SELECT 1 FROM tracegarden_attention_reviews ar WHERE ar.entry_id = ai.entry_id AND ar.member_id = $2)`,
+        [workspaceId, memberId],
+      );
+      const currentSequence = currentSequenceResult?.rows[0]?.sequence ?? "0";
+      const unreadAttentionCount = unreadAttentionCountResult === null ? undefined : Number(unreadAttentionCountResult.rows[0]?.count ?? "0");
+      const hasMore = result.rows.length > query.limit && entries.length > 0;
+      const page = {
+        entries,
+        nextCursor: hasMore
+          ? cursor?.kind === "live"
+            ? encodeLiveTimelineCursor((entries[entries.length - 1] as StoredTimelineEntry).timelineSequence, query, this.cursorSecret, memberId)
+            : encodeTimelineCursor(entries[entries.length - 1] as StoredTimelineEntry, query, this.cursorSecret, memberId)
+          : null,
+        ...(memberId !== undefined && entries.length > 0 ? { resumeCursor: encodeLiveTimelineCursor(currentSequence, query, this.cursorSecret, memberId) } : {}),
+        ...(unreadAttentionCount === undefined ? {} : { unreadAttentionCount }),
+      };
+      await client.query("COMMIT");
+      return page;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
     }
-    if (cursor?.kind === "history") {
-      values.push(cursor.occurredAt);
-      const occurredAtPlaceholder = values.length;
-      values.push(cursor.entryId);
-      condition += ` AND (t.occurred_at > $${occurredAtPlaceholder}::timestamptz
-        OR (t.occurred_at = $${occurredAtPlaceholder}::timestamptz AND t.id COLLATE "C" > $${values.length}))`;
-    } else if (cursor?.kind === "live") {
-      values.push(cursor.sequence);
-      condition += ` AND t.timeline_sequence > $${values.length}::bigint`;
-    }
-    if (query.kind) {
-      values.push(query.kind);
-      condition += ` AND o.kind = $${values.length}`;
-    }
-    if (query.namespace) {
-      values.push(query.namespace);
-      condition += ` AND o.namespace = $${values.length}`;
-    }
-    if (query.name) {
-      values.push(query.name);
-      condition += ` AND o.name = $${values.length}`;
-    }
-    if (query.state) {
-      values.push(query.state);
-      condition += ` AND o.facts->>'phase' = $${values.length}`;
-    }
-    if (query.attention !== undefined) condition += query.attention ? " AND ai.entry_id IS NOT NULL" : " AND ai.entry_id IS NULL";
-    if (query.unread !== undefined) condition += query.unread ? " AND ai.entry_id IS NOT NULL AND ar.entry_id IS NULL" : " AND (ai.entry_id IS NULL OR ar.entry_id IS NOT NULL)";
-    values.push(query.limit + 1);
-    const attentionUnreadSelect = memberId === undefined
-      ? "false AS attention_unread"
-      : "(ai.entry_id IS NOT NULL AND ar.entry_id IS NULL) AS attention_unread";
-    const listSelect = timelineSelect.replace("         false AS attention_unread", `         ${attentionUnreadSelect}`) + joins;
-    const order = cursor?.kind === "live" ? "t.timeline_sequence" : "t.occurred_at, t.id COLLATE \"C\"";
-    const result = await pool.query<TimelineJoinRow>(`${listSelect} WHERE ${condition} ORDER BY ${order} LIMIT $${values.length}`, values);
-    const rawEntries = result.rows.slice(0, query.limit).map(timelineEntryFromRow);
-    const entries = await this.attachConfirmedLinks(workspaceId, rawEntries);
-    const currentSequenceResult = memberId === undefined ? null : await pool.query<{ sequence: string | null }>(
-      "SELECT max(timeline_sequence)::text AS sequence FROM tracegarden_timeline_entries WHERE workspace_id = $1",
-      [workspaceId],
-    );
-    const currentSequence = currentSequenceResult?.rows[0]?.sequence ?? "0";
-    const hasMore = result.rows.length > query.limit && entries.length > 0;
-    return {
-      entries,
-      nextCursor: hasMore
-        ? cursor?.kind === "live"
-          ? encodeLiveTimelineCursor((entries[entries.length - 1] as StoredTimelineEntry).timelineSequence, query, this.cursorSecret, memberId)
-          : encodeTimelineCursor(entries[entries.length - 1] as StoredTimelineEntry, query, this.cursorSecret, memberId)
-        : null,
-      ...(memberId !== undefined && entries.length > 0 ? { resumeCursor: encodeLiveTimelineCursor(currentSequence, query, this.cursorSecret, memberId) } : {}),
-      ...(memberId === undefined ? {} : { unreadAttentionCount: await this.unreadAttentionCount(workspaceId, memberId) }),
-    };
   }
 
   async countTimelineEntriesAfterCursor(workspaceId: string, query: TimelineQuery, memberId?: string): Promise<number> {

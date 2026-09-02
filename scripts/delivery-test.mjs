@@ -40,7 +40,7 @@ const preGatePublication = publishWorkflow.slice(0, sbomGeneration);
 assert.doesNotMatch(preGatePublication, /--provenance=(?!false\b)|--sbom=(?!false\b)|actions\/attest-(?:sbom|build-provenance)@/, "release publication must not attest before exact-digest gates");
 const releaseBuilds = [...publishWorkflow.matchAll(/docker buildx build[^\n]*/g)].map(([line]) => line);
 assert.equal(releaseBuilds.length, 4, "release must build web, collector, migrate, and backup");
-assert.ok(releaseBuilds.every((line) => line.includes("--provenance=false") && line.includes("--sbom=false")), "all release builds must disable Buildx attestations");
+assert.ok(releaseBuilds.every((line) => line.includes("--provenance=false") && line.includes("--sbom=false") && line.includes("--network none") && line.includes("--pull=false")), "all release builds must disable attestations, network access, and pulls");
 const postGatePublication = publishWorkflow.slice(sbomGeneration);
 assert.equal((postGatePublication.match(/uses: actions\/attest-sbom@[0-9a-f]{40}/g) ?? []).length, 4, "each release image needs an SBOM attestation");
 assert.equal((postGatePublication.match(/uses: actions\/attest-build-provenance@[0-9a-f]{40}/g) ?? []).length, 4, "each release image needs a provenance attestation");

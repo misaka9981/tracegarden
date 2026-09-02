@@ -354,7 +354,7 @@ jobs:
         id: backup
         run: |
           set -eu
-          docker buildx build --platform linux/arm64 --file deploy/docker/backup.Dockerfile --tag "${IMAGE_PREFIX}-backup:${GITHUB_SHA}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/backup.json" .
+          docker buildx build --network none --pull=false --platform linux/arm64 --file deploy/docker/backup.Dockerfile --tag "${IMAGE_PREFIX}-backup:${GITHUB_SHA}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/backup.json" .
           echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/backup.json")" >> "$GITHUB_OUTPUT"
       - name: Pull published digests for exact release smoke
         run: |

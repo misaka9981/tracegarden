@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { access, mkdir, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { ServerResponse } from "node:http";
 import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
 import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../dist/apps/web/src/server.js";
@@ -1819,4 +1821,15 @@ await assert.rejects(
   createWebRuntime({ database: new MemoryDatabase(), environment: { NODE_ENV: "production" }, port: 0 }),
   /Memory database is not allowed in production/,
 );
-console.log("unit, Experiment, Cluster scope, and collector readiness checks passed");
+const staleOutput = "dist/apps/web/src/deleted-output-regression.js";
+await mkdir("dist/apps/web/src", { recursive: true });
+await writeFile(staleOutput, "stale output");
+try {
+  const rebuild = spawnSync("pnpm", ["build"], { stdio: "inherit" });
+  assert.equal(rebuild.status, 0, "clean build regression setup must compile");
+  await assert.rejects(access(staleOutput), /ENOENT/);
+  await access("dist/packages/db/migrations/0001_foundation.sql");
+} finally {
+  await rm(staleOutput, { force: true });
+}
+console.log("unit, Experiment, Cluster scope, collector readiness, and clean-build checks passed");

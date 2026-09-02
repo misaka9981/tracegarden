@@ -88,6 +88,9 @@ const releaseBuilds = [...publishWorkflow.matchAll(/docker buildx build[^\n]*/g)
 if (releaseBuilds.length !== 4 || releaseBuilds.some((line) => !line.includes("--provenance=false") || !line.includes("--sbom=false"))) {
   errors.push("web, collector, migrate, and backup release builds must disable Buildx provenance and SBOM before gates");
 }
+if (releaseBuilds.some((line) => !line.includes("--network none") || !line.includes("--pull=false"))) {
+  errors.push("release builds must disable network access and base-image pulls");
+}
 const releasePostGate = publishWorkflow.slice(Math.max(releaseSbomGeneration, 0));
 const releaseStepBlock = (name) => {
   const start = releasePostGate.indexOf("- name: " + name);
@@ -134,6 +137,14 @@ for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Doc
   const bases = [...source.matchAll(/^FROM\s+(\S+)/gm)].map(([, image]) => image);
   if (!bases.length || bases.some((image) => !immutableDigest.test(image))) errors.push(`${path}: every base image must be digest-pinned`);
 }
+const backupDockerfile = await readFile("deploy/docker/backup.Dockerfile", "utf8");
+const backupScript = await readFile("scripts/backup.mjs", "utf8");
+if (/apt-get|awscli|spawn\(\s*["']aws["']/.test(backupDockerfile) || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_dump") || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_restore")) {
+  errors.push("backup image must use the pinned PostgreSQL runtime and no mutable apt/awscli dependency");
+}
+if (/spawn\(\s*["']aws["']/.test(backupScript) || !backupScript.includes("createHmac") || !backupScript.includes("fetch(endpointUrl")) {
+  errors.push("backup uploader must use the owned native SigV4 fetch path");
+}
 const compose = await readFile("docker-compose.yml", "utf8");
 if (!/DATABASE_URL:\s+\$\{MIGRATION_DATABASE_URL:-/.test(compose)) errors.push("docker-compose migration DATABASE_URL must be parameterized");
 for (const image of [...compose.matchAll(/^\s+image:\s+(\S+)/gm)].map(([, value]) => value)) {
@@ -142,6 +153,9 @@ for (const image of [...compose.matchAll(/^\s+image:\s+(\S+)/gm)].map(([, value]
 const migrationSmoke = await readFile("scripts/container-smoke.mjs", "utf8");
 for (const required of ["not-a-postgresql-url", "tracegarden_schema_migrations", "invalid-URL", "schema-failure"]) {
   if (!migrationSmoke.includes(required)) errors.push(`container smoke is missing migration failure assertion ${required}`);
+}
+if (!migrationSmoke.includes("build\", \"--pull=false\"") || !migrationSmoke.includes("up\", \"-d\", \"--pull\", \"never\", \"--no-build")) {
+  errors.push("migration failure smoke must build offline and start with pull-never/no-build");
 }
 if (/\{\{\.Config\.Image\}\}@\{\{\.Image\}\}/.test(migrationSmoke) || !migrationSmoke.includes("imageIds") || !migrationSmoke.includes("^sha256:[a-f0-9]{64}$") || !migrationSmoke.includes("CONTAINER_SMOKE_IMAGE_FILE")) {
   errors.push("container smoke must keep local image IDs separate from registry digests");

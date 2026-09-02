@@ -121,6 +121,8 @@ try {
     const backupImageId = docker(["inspect", "-f", "{{.Image}}", backupContainer]);
     assert.match(backupImageId, /^sha256:[a-f0-9]{64}$/);
     assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", backupImageId]), "arm64");
+    assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "pg_dump", backupImageId, "--version"]), "pg_dump (PostgreSQL) 18.3");
+    assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "pg_restore", backupImageId, "--version"]), "pg_restore (PostgreSQL) 18.3");
     assert.doesNotMatch(docker(["inspect", "-f", "{{json .Config.Env}}", backupContainer]), /AWS_ACCESS_KEY|AWS_SECRET_ACCESS_KEY|BACKUP_ENCRYPTION/);
     assert.match(docker(["logs", backupContainer]), /missing backup configuration: DATABASE_URL/);
   }
@@ -149,16 +151,18 @@ try {
       MIGRATION_DATABASE_READY_RETRY_SECONDS: "1",
     };
     try {
-      compose(["up", "-d", "postgres"], failureProject, failureEnvironment);
+      compose(["up", "-d", "--pull", "never", "--no-build", "postgres"], failureProject, failureEnvironment);
       const failurePostgres = compose(["ps", "-q", "postgres"], failureProject, failureEnvironment);
       assert.ok(failurePostgres, "the migration failure test must create PostgreSQL");
       await waitForHealthy(failurePostgres, failureEnvironment);
       if (prepareSchema) {
         compose(["exec", "-T", "postgres", "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", prepareSchema], failureProject, failureEnvironment);
       }
-      assert.equal(expectFailure(["compose", "-p", failureProject, "up", "-d", "--build"], failureEnvironment), true);
+      compose(["build", "--pull=false"], failureProject, failureEnvironment);
+      try { compose(["up", "-d", "--pull", "never", "--no-build"], failureProject, failureEnvironment); } catch { /* expected one-shot migration failure */ }
       const failedMigration = compose(["ps", "-aq", "migrate"], failureProject, failureEnvironment);
       assert.ok(failedMigration, "the failed migration gate must create a container");
+      await waitForStopped(failedMigration);
       assert.notEqual(docker(["inspect", "-f", "{{.State.ExitCode}}", failedMigration], failureEnvironment), "0");
       assert.match(compose(["logs", "--no-color", "migrate"], failureProject, failureEnvironment), expectedError);
       for (const service of ["web", "collector"]) {

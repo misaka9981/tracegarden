@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -158,21 +158,48 @@ function runPgDump(databaseUrl, environment) {
   });
 }
 
-function uploadWithAws({ artifactPath, endpoint, bucket, artifactName, environment }) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("aws", [
-      "s3", "cp", artifactPath, `s3://${bucket}/${artifactName}`,
-      "--endpoint-url", safeObjectStorageEndpoint(endpoint),
-      "--only-show-errors",
-      "--no-progress",
-    ], {
-      env: { ...environment, AWS_EC2_METADATA_DISABLED: "true" },
-      stdio: ["ignore", "ignore", "pipe"],
-    });
-    child.stderr.resume();
-    child.once("error", () => reject(new Error("object-storage uploader could not be started")));
-    child.once("close", (code) => code === 0 ? resolve() : reject(new Error("encrypted backup upload failed")));
+function hmac(key, value) {
+  return createHmac("sha256", key).update(value).digest();
+}
+
+function canonicalPath(path) {
+  return path.split("/").map((segment) => encodeURIComponent(segment).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`)).join("/") || "/";
+}
+
+async function uploadWithAws({ artifactPath, endpoint, bucket, artifactName, environment }) {
+  const accessKey = environment.AWS_ACCESS_KEY_ID?.trim();
+  const secretKey = environment.AWS_SECRET_ACCESS_KEY?.trim();
+  if (!accessKey || !secretKey) throw new Error("object-storage credentials are unavailable from the configured Secret");
+  const body = await readFile(artifactPath);
+  const endpointUrl = new URL(safeObjectStorageEndpoint(endpoint));
+  endpointUrl.pathname = `${endpointUrl.pathname.replace(/\/$/, "")}/${bucket}/${artifactName}`;
+  const payloadHash = createHash("sha256").update(body).digest("hex");
+  const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
+  const date = amzDate.slice(0, 8);
+  const region = environment.AWS_REGION?.trim() || environment.AWS_DEFAULT_REGION?.trim() || "us-east-1";
+  const headers = {
+    host: endpointUrl.host,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": amzDate,
+    ...(environment.AWS_SESSION_TOKEN?.trim() ? { "x-amz-security-token": environment.AWS_SESSION_TOKEN.trim() } : {}),
+  };
+  const canonicalHeaders = Object.entries(headers).sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, value]) => `${name}:${value.trim()}`).join("\n");
+  const signedHeaders = Object.keys(headers).sort().join(";");
+  const canonicalRequest = `PUT\n${canonicalPath(endpointUrl.pathname)}\n\n${canonicalHeaders}\n\n${signedHeaders}\n${payloadHash}`;
+  const credentialScope = `${date}/${region}/s3/aws4_request`;
+  const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretKey}`, date), region), "s3"), "aws4_request");
+  const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${createHash("sha256").update(canonicalRequest).digest("hex")}`;
+  const authorization = `AWS4-HMAC-SHA256 Credential=${accessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${createHmac("sha256", signingKey).update(stringToSign).digest("hex")}`;
+  const response = await fetch(endpointUrl, {
+    method: "PUT",
+    headers: { ...headers, authorization },
+    body,
   });
+  if (!response.ok) {
+    if (response.body) await response.body.cancel().catch(() => undefined);
+    throw new Error("encrypted backup upload failed");
+  }
 }
 
 function artifactName(now = new Date()) {

@@ -1,6 +1,8 @@
 import { cp, mkdir, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 
+await rm("dist", { recursive: true, force: true });
+await mkdir("dist", { recursive: true });
 const compiler = spawnSync("tsc", ["-p", "tsconfig.json"], { stdio: "inherit" });
 if (compiler.status !== 0) process.exit(compiler.status ?? 1);
 

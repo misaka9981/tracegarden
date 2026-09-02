@@ -862,6 +862,48 @@ try {
     await concurrencyClient.end();
   }
 
+  const raceClient = new pg.Client(databaseUrl);
+  await raceClient.connect();
+  const raceQuery = raceClient.query.bind(raceClient);
+  let pageReadResolve;
+  const pageRead = new Promise((resolve) => { pageReadResolve = resolve; });
+  let releasePageRead;
+  const pageReadReleased = new Promise((resolve) => { releasePageRead = resolve; });
+  let pageReadPaused = false;
+  raceClient.release = () => {};
+  raceClient.query = async (...args) => {
+    const result = await raceQuery(...args);
+    const sql = typeof args[0] === "string" ? args[0] : args[0]?.text;
+    if (!pageReadPaused && sql?.includes("ORDER BY t.occurred_at, t.id COLLATE") && sql.includes("LIMIT")) {
+      pageReadPaused = true;
+      pageReadResolve();
+      await pageReadReleased;
+    }
+    return result;
+  };
+  const raceStore = new PostgresObservationStore(async () => ({
+    query: (...args) => raceClient.query(...args),
+    connect: async () => raceClient,
+  }), "timeline-race-test-secret");
+  const raceObservation = normalizePodObservation(observationScope, {
+    kind: "Pod",
+    metadata: { name: "watermark-race", namespace: "tracegarden", uid: `watermark-race-${process.pid}`, resourceVersion: "1" },
+    status: { phase: "Running" },
+  }, "2099-12-31T00:00:00.000Z");
+  try {
+    const pagePromise = raceStore.listTimelineEntries("workspace-single", { limit: 1 }, sessionBody.member.id);
+    await pageRead;
+    const raceResult = await timelineStore.recordObservation(raceObservation);
+    releasePageRead();
+    const racePage = await pagePromise;
+    assert.ok(racePage.resumeCursor);
+    const resumedRacePage = await raceStore.listTimelineEntries("workspace-single", { limit: 100, cursor: racePage.resumeCursor }, sessionBody.member.id);
+    assert.deepEqual(resumedRacePage.entries.map((entry) => entry.id), [raceResult.entry.id]);
+  } finally {
+    releasePageRead();
+    await raceClient.end();
+  }
+
   const scopeOrderingObservation = normalizePodObservation(observationScope, {
     kind: "Pod",
     metadata: { name: "scope-ordering", namespace: "tracegarden", uid: `scope-ordering-${process.pid}`, resourceVersion: "scope-ordering-1" },
@@ -1113,7 +1155,7 @@ try {
     traversal = await timelineStore.listTimelineEntries("workspace-single", { limit: 1, namespace: "tracegarden", cursor: traversal.nextCursor }, sessionBody.member.id);
   }
   assert.equal(new Set(traversedIds).size, traversedIds.length);
-  assert.deepEqual(new Set(traversedNames), new Set(["api", "api-deployment", "live-entry", "missed-live-entry", "pending", "running-later", "inserted-newer", "reconnected-live-entry", "concurrency-before", "concurrency-after", "equal-a", "equal-b"]));
+  assert.deepEqual(new Set(traversedNames), new Set(["api", "api-deployment", "live-entry", "missed-live-entry", "pending", "running-later", "inserted-newer", "reconnected-live-entry", "concurrency-before", "concurrency-after", "equal-a", "equal-b", "watermark-race"]));
   const equalIndexes = [traversedNames.indexOf("equal-a"), traversedNames.indexOf("equal-b")].sort((left, right) => left - right);
   assert.equal(equalIndexes[1] - equalIndexes[0], 1);
   assert.deepEqual(traversedNames.slice(equalIndexes[0], equalIndexes[1] + 1), expectedEqualOrder);
