@@ -1,4 +1,4 @@
-{{- if .Values.preview.host }}
+{{- if and .Values.preview.ingress.enabled .Values.preview.host }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

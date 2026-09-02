@@ -87,6 +87,7 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Mi
+{{- if .Values.preview.collector.enabled }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -167,3 +168,5 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Mi
+
+{{- end }}

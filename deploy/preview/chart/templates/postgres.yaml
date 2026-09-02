@@ -47,6 +47,9 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -73,7 +76,13 @@ spec:
               drop: ["ALL"]
           volumeMounts:
             - name: database
-              mountPath: /var/lib/postgresql/data
+              mountPath: /var/lib/postgresql
+            - name: postgres-run
+              mountPath: /run/postgresql
       volumes:
         - name: database
           emptyDir: {}
+        - name: postgres-run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

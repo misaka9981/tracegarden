@@ -6,7 +6,7 @@ export const NAMESPACE_PATTERN = /^preview-pr-([1-9][0-9]{0,8})$/;
 export const PREVIEW_LABEL = "tracegarden.dev/preview";
 export const TARGET_SECRET_NAME = "tracegarden-preview-ghcr";
 export const TARGET_SERVICE_ACCOUNT_NAME = "tracegarden-preview";
-export const SOURCE_NAMESPACE = "argocd";
+export const SOURCE_NAMESPACE = process.env.PREVIEW_SOURCE_NAMESPACE?.trim() || "argocd";
 export const SOURCE_IMAGE_SECRET_NAME = "tracegarden-preview-ghcr";
 export const TRUSTED_GITOPS_OWNER = "MISAKA3389";
 export const TRUSTED_GITOPS_REPOSITORY = "tracegarden-gitops";
@@ -95,6 +95,46 @@ function previewNamespace(number) {
 }
 function encodePart(value) {
   return encodeURIComponent(value);
+}
+export function createBoundedFakeGitHubAdapter({ pullRequests, trustedDigests = [] }) {
+  if (!Array.isArray(pullRequests) || pullRequests.length > 100) throw new Error("bounded fake GitHub state must contain at most 100 pull requests");
+  const records = new Map();
+  for (const record of pullRequests) {
+    if (!Number.isSafeInteger(record?.number) || record.number < 1 || record.number > 999999999 || !["open", "closed"].includes(record.state) || typeof record.draft !== "boolean" || records.has(record.number)) {
+      throw new Error("bounded fake GitHub state contains an invalid pull request");
+    }
+    records.set(record.number, { number: record.number, state: record.state, draft: record.draft });
+  }
+  const digests = new Set(trustedDigests);
+  for (const number of digests) if (!Number.isSafeInteger(number) || number < 1 || number > 999999999) throw new Error("bounded fake GitHub state contains an invalid digest number");
+  return {
+    async listOpenPullRequests() { return [...records.values()].filter(({ state }) => state === "open"); },
+    async getPullRequest(number) { return records.get(number) ?? null; },
+    async hasTrustedDigest(number) { return digests.has(number); },
+    async setPreviewLabel(number, enabled) { console.log(JSON.stringify({ event: "preview-label", number, enabled })); },
+  };
+}
+function parseFakeState(value, fallback) {
+  try {
+    const parsed = JSON.parse(value ?? fallback);
+    return parsed;
+  } catch {
+    throw new Error("bounded fake GitHub state must be valid JSON");
+  }
+}
+export function createRuntimeGitHubAdapter(environment = process.env) {
+  if (environment.PREVIEW_LIFECYCLE_TEST_MODE === "true") {
+    if (environment.NODE_ENV === "production") throw new Error("bounded fake GitHub adapter is disabled in production");
+    return createBoundedFakeGitHubAdapter({
+      pullRequests: parseFakeState(environment.PREVIEW_LIFECYCLE_FAKE_PR_STATE, "[]"),
+      trustedDigests: parseFakeState(environment.PREVIEW_LIFECYCLE_FAKE_TRUSTED_DIGESTS, "[]"),
+    });
+  }
+  return createGitHubAdapter({
+    owner: environment.GITHUB_OWNER,
+    repo: environment.GITHUB_REPO,
+    token: environment.GITHUB_TOKEN,
+  });
 }
 export function createGitHubAdapter({ owner, repo, token, request = fetch, gitOpsOwner = TRUSTED_GITOPS_OWNER, gitOpsRepo = TRUSTED_GITOPS_REPOSITORY }) {
   const configuredOwner = owner?.trim();
@@ -318,16 +358,12 @@ async function runController() {
   const port = Number(process.env.KUBERNETES_SERVICE_PORT_HTTPS ?? "443");
   const token = (await readFile("/var/run/secrets/kubernetes.io/serviceaccount/token", "utf8")).trim();
   const ca = await readFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
-  const github = createGitHubAdapter({
-    owner: process.env.GITHUB_OWNER,
-    repo: process.env.GITHUB_REPO,
-    token: process.env.GITHUB_TOKEN,
-  });
+  const github = createRuntimeGitHubAdapter();
   const kubernetes = createKubernetesAdapter({ host, port, ca, token });
   await reconcilePreviewEnvironments({ github, kubernetes });
 }
 if (process.env.PREVIEW_LIFECYCLE_OFFLINE === "true") {
   console.log("offline lifecycle controller check passed");
-} else if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+} else if (process.env.PREVIEW_LIFECYCLE_RUN === "true" || (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)) {
   await runController();
 }

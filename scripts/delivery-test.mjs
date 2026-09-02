@@ -15,6 +15,8 @@ import {
 } from "../dist/packages/delivery/src/index.js";
 import {
   DEFAULT_PREVIEW_CAPACITY,
+  createBoundedFakeGitHubAdapter,
+  createRuntimeGitHubAdapter,
   reconcilePreviewEnvironments,
 } from "./preview-lifecycle-controller.mjs";
 import {
@@ -27,6 +29,9 @@ import { APPLICATION_SET_CRD_RELEASE, APPLICATION_SET_CRD_SOURCE, readApplicatio
 
 const read = (path) => readFile(path, "utf8");
 
+const previewPostgres = await read("deploy/preview/chart/templates/postgres.yaml");
+const previewMigration = await read("deploy/preview/chart/templates/migration-job.yaml");
+const previewSeed = await read("deploy/preview/chart/templates/seed-job.yaml");
 const ciWorkflow = await read(".github/workflows/ci.yml");
 const publishStart = ciWorkflow.indexOf("\n  publish:");
 const publishEnd = ciWorkflow.indexOf("\n  promotion-proposal:", publishStart);
@@ -220,6 +225,8 @@ assert.match(lifecycleController, /resources: \[namespaces\]/);
 assert.match(lifecycleController, /resources: \[secrets\]/);
 assert.match(lifecycleController, /tracegarden-preview-ghcr/);
 assert.match(lifecycleController, /GITHUB_TOKEN/);
+assert.match(lifecycleController, /PREVIEW_LIFECYCLE_TEST_MODE/);
+assert.match(lifecycleController, /value: production/);
 assert.match(lifecycleController, /secretKeyRef/);
 assert.match(lifecycleController, /setPreviewLabel/);
 assert.match(lifecycleController, /aggregateCpu/);
@@ -269,6 +276,17 @@ assert.match(previewValues, /imagePullSecrets:\n  - name: tracegarden-preview-gh
 assert.match(previewValues, /digest: ""/);
 assert.doesNotMatch(previewDeployments, /secretKeyRef:/);
 assert.match(previewDeployments, /CLOUDFLARE_ACCESS_JWT_PUBLIC_KEY/);
+assert.match(previewPostgres, /runAsUser: 999/);
+assert.match(previewPostgres, /runAsGroup: 999/);
+assert.match(previewPostgres, /fsGroup: 999/);
+assert.match(previewPostgres, /mountPath: \/var\/lib\/postgresql/);
+assert.match(previewPostgres, /mountPath: \/run\/postgresql/);
+assert.match(previewMigration, /runAsUser: 1000/);
+assert.match(previewMigration, /runAsGroup: 1000/);
+assert.match(previewMigration, /fsGroup: 1000/);
+assert.match(previewSeed, /runAsUser: 999/);
+assert.match(previewSeed, /runAsGroup: 999/);
+assert.match(previewSeed, /fsGroup: 999/);
 
 const commit = "a".repeat(40);
 const trustedSource = { repository: TRUSTED_PREVIEW_GITOPS_REPOSITORY, revision: commit };
@@ -531,6 +549,16 @@ const lifecycleCheck = spawnSync(process.execPath, ["scripts/preview-lifecycle-c
 });
 assert.equal(lifecycleCheck.status, 0, lifecycleCheck.stderr || "preview lifecycle offline check failed");
 assert.match(lifecycleCheck.stdout, /offline lifecycle controller check passed/);
+const boundedFakeGithub = createBoundedFakeGitHubAdapter({
+  pullRequests: [{ number: 42, state: "open", draft: false }, { number: 43, state: "closed", draft: false }],
+  trustedDigests: [42],
+});
+assert.deepEqual(await boundedFakeGithub.listOpenPullRequests(), [{ number: 42, state: "open", draft: false }]);
+assert.deepEqual(await boundedFakeGithub.getPullRequest(43), { number: 43, state: "closed", draft: false });
+assert.equal(await boundedFakeGithub.hasTrustedDigest(42), true);
+assert.equal(await boundedFakeGithub.hasTrustedDigest(43), false);
+assert.throws(() => createRuntimeGitHubAdapter({ PREVIEW_LIFECYCLE_TEST_MODE: "true", NODE_ENV: "production", PREVIEW_LIFECYCLE_FAKE_PR_STATE: "[]", PREVIEW_LIFECYCLE_FAKE_TRUSTED_DIGESTS: "[]" }), /disabled in production/);
+assert.deepEqual(await createRuntimeGitHubAdapter({ PREVIEW_LIFECYCLE_TEST_MODE: "true", NODE_ENV: "test", PREVIEW_LIFECYCLE_FAKE_PR_STATE: '[{"number":7,"state":"open","draft":false}]', PREVIEW_LIFECYCLE_FAKE_TRUSTED_DIGESTS: "[7]" }).listOpenPullRequests(), [{ number: 7, state: "open", draft: false }]);
 
 if (process.env.DELIVERY_RENDER === "true") {
   const missingValues = spawnSync("helm", ["template", "tracegarden-preview", "deploy/preview/chart", "--namespace", "preview-pr-999", "--kube-version", "1.31.0", "--values", "deploy/preview/digests/pr-999.yaml"], {

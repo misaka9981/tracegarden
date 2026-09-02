@@ -27,6 +27,8 @@ preview:
   # lookup metadata; images always come from the protected digest file.
   number: 1
   host: preview-pr-1.tracegarden.example
+  ingress:
+    enabled: true
   access:
     issuer: https://preview.tracegarden.cloudflareaccess.com
     audience: replace-with-preview-access-application-audience
@@ -41,6 +43,7 @@ preview:
         cpu: 250m
         memory: 256Mi
   collector:
+    enabled: true
     resources:
       requests:
         cpu: 50m

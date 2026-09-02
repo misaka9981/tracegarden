@@ -135,6 +135,18 @@ const upgradeRender = renderAndValidate(["--set", `images.migrate.digest=${upgra
 const failureRender = renderAndValidate(["--set", "migration.backoffLimit=0"]);
 const isolatedPriorityRender = renderAndValidate(["--set", "priorityClassName=tracegarden-live-validation"]);
 assert.match(isolatedPriorityRender, /priorityClassName: \"tracegarden-live-validation\"/);
+const privatePreviewRender = spawnSync("helm", [
+  "template", "tracegarden-preview", "deploy/preview/chart", "--namespace", "preview-pr-1", "--kube-version", "1.31.0",
+  "--set", "images.web.digest=sha256:" + "1".repeat(64),
+  "--set", "images.collector.digest=sha256:" + "2".repeat(64),
+  "--set", "images.migrate.digest=sha256:" + "3".repeat(64),
+  "--set", "images.postgres.digest=sha256:" + "4".repeat(64),
+  "--set", "preview.ingress.enabled=false",
+  "--set", "preview.collector.enabled=false",
+], { encoding: "utf8", env: { ...process.env, KUBECONFIG: "/dev/null" } });
+assert.equal(privatePreviewRender.status, 0, privatePreviewRender.stderr || "preview helm template failed");
+assert.doesNotMatch(privatePreviewRender.stdout, /^kind: Ingress$/m);
+assert.doesNotMatch(privatePreviewRender.stdout, /name: tracegarden-preview-1-collector/);
 const migrationName = (render) => render.match(/name: ([a-z0-9-]+-migration-[a-f0-9]{12})\n/)?.[1];
 assert.ok(migrationName(freshRender));
 assert.notEqual(migrationName(freshRender), migrationName(upgradeRender));

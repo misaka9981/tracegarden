@@ -39,7 +39,7 @@
     "preview": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["number", "host", "access", "web", "collector", "postgres", "quota"],
+      "required": ["number", "host", "ingress", "access", "web", "collector", "postgres", "quota"],
       "properties": {
         "number": {
           "oneOf": [
@@ -48,6 +48,12 @@
           ]
         },
         "host": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$" },
+        "ingress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": { "enabled": { "type": "boolean" } }
+        },
         "access": {
           "type": "object",
           "additionalProperties": false,
@@ -60,7 +66,15 @@
           }
         },
         "web": { "$ref": "#/definitions/application" },
-        "collector": { "$ref": "#/definitions/application" },
+        "collector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "resources"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "resources": { "$ref": "#/definitions/resources" }
+          }
+        },
         "postgres": { "$ref": "#/definitions/application" },
         "quota": {
           "type": "object",
