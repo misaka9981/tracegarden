@@ -300,6 +300,7 @@ jobs:
       web_digest: ${{ steps.web.outputs.digest }}
       collector_digest: ${{ steps.collector.outputs.digest }}
       migrate_digest: ${{ steps.migrate.outputs.digest }}
+      backup_digest: ${{ steps.backup.outputs.digest }}
     env:
       # Set GHCR_NAMESPACE to the lower-case intended private owner before enabling publication.
       GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
@@ -341,17 +342,27 @@ jobs:
           set -eu
           docker buildx build --platform linux/arm64 --file deploy/docker/migrate.Dockerfile --tag "${IMAGE_PREFIX}-migrate:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/migrate.json" .
           echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/migrate.json")" >> "$GITHUB_OUTPUT"
+      # Backup is built before the shared exact-digest smoke and CVE gates. Its
+      # attestation remains below those gates with the other release images.
+      - name: Publish backup image
+        id: backup
+        run: |
+          set -eu
+          docker buildx build --platform linux/arm64 --file deploy/docker/backup.Dockerfile --tag "${IMAGE_PREFIX}-backup:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/backup.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/backup.json")" >> "$GITHUB_OUTPUT"
       - name: Pull published digests for exact release smoke
         run: |
           set -eu
           web_ref="${IMAGE_PREFIX}-web@${{ steps.web.outputs.digest }}"
           collector_ref="${IMAGE_PREFIX}-collector@${{ steps.collector.outputs.digest }}"
           migrate_ref="${IMAGE_PREFIX}-migrate@${{ steps.migrate.outputs.digest }}"
+          backup_ref="${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}"
           docker pull --platform linux/arm64 "$NODE_IMAGE"
           docker pull --platform linux/arm64 "$POSTGRES_IMAGE"
           docker pull --platform linux/arm64 "$web_ref"
           docker pull --platform linux/arm64 "$collector_ref"
           docker pull --platform linux/arm64 "$migrate_ref"
+          docker pull --platform linux/arm64 "$backup_ref"
           cat > "$RUNNER_TEMP/tracegarden-release-compose.yml" <<EOF
           services:
             web:
@@ -360,11 +371,23 @@ jobs:
               image: $collector_ref
             migrate:
               image: $migrate_ref
+            backup:
+              image: $backup_ref
+              user: node
+              read_only: true
+              tmpfs:
+                - /tmp:rw,noexec,nosuid,size=64m
+              cap_drop:
+                - ALL
+              security_opt:
+                - no-new-privileges:true
+              restart: "no"
           EOF
       - name: Smoke-test exact published digests
         env:
           COMPOSE_FILE: docker-compose.yml:${{ runner.temp }}/tracegarden-release-compose.yml
           CONTAINER_SMOKE_NO_BUILD: "1"
+          CONTAINER_SMOKE_BACKUP: "1"
           CONTAINER_SMOKE_PROJECT: tracegarden-release-${{ github.run_id }}-${{ github.run_attempt }}
         run: pnpm test:container
       - name: Scan exact published digests before attestation
@@ -375,7 +398,8 @@ jobs:
           for service_ref in \
             "${IMAGE_PREFIX}-web@${{ steps.web.outputs.digest }}" \
             "${IMAGE_PREFIX}-collector@${{ steps.collector.outputs.digest }}" \
-            "${IMAGE_PREFIX}-migrate@${{ steps.migrate.outputs.digest }}"; do
+            "${IMAGE_PREFIX}-migrate@${{ steps.migrate.outputs.digest }}" \
+            "${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}"; do
             service="${service_ref##*/}"
             service="${service%%@*}"
             status=0
@@ -403,12 +427,6 @@ jobs:
           subject-name: ${{ env.IMAGE_PREFIX }}-migrate
           subject-digest: ${{ steps.migrate.outputs.digest }}
           push-to-registry: true
-      - name: Publish backup image
-        id: backup
-        run: |
-          set -eu
-          docker buildx build --platform linux/arm64 --file deploy/docker/backup.Dockerfile --tag "${IMAGE_PREFIX}-backup:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/backup.json" .
-          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/backup.json")" >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-backup
@@ -474,13 +492,15 @@ jobs:
           WEB_DIGEST: ${{ needs.publish.outputs.web_digest }}
           COLLECTOR_DIGEST: ${{ needs.publish.outputs.collector_digest }}
           MIGRATE_DIGEST: ${{ needs.publish.outputs.migrate_digest }}
+          BACKUP_DIGEST: ${{ needs.publish.outputs.backup_digest }}
           GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
         run: |
           set -eu
           test "$RELEASE_COMMIT" = "$(git rev-parse HEAD)"
-          for digest in "$WEB_DIGEST" "$COLLECTOR_DIGEST" "$MIGRATE_DIGEST"; do
+          for digest in "$WEB_DIGEST" "$COLLECTOR_DIGEST" "$MIGRATE_DIGEST" "$BACKUP_DIGEST"; do
             printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
           done
+          test "$BACKUP_DIGEST" != sha256:4444444444444444444444444444444444444444444444444444444444444444
           grep -q 'approvalRequired: true' deploy/promotion/promotion.yaml
           grep -q 'pullRequestRequired: true' deploy/promotion/promotion.yaml
           grep -q 'directClusterMutation: false' deploy/promotion/promotion.yaml
@@ -493,6 +513,7 @@ jobs:
             printf '%s\n' "web=$WEB_DIGEST"
             printf '%s\n' "collector=$COLLECTOR_DIGEST"
             printf '%s\n' "migrate=$MIGRATE_DIGEST"
+            printf '%s\n' "backup=$BACKUP_DIGEST"
             printf '%s\n' 'desired-state-update=GitOps pull request only'
           } > "$RUNNER_TEMP/tracegarden-promotion/proposal.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

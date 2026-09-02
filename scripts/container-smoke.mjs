@@ -3,6 +3,7 @@ import { writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 
 const project = process.env.CONTAINER_SMOKE_PROJECT?.trim() || `tracegarden-smoke-${process.pid}`;
+const backupSmoke = process.env.CONTAINER_SMOKE_BACKUP === "1";
 const invalidUrlProject = `${project}-invalid-url`;
 const schemaFailureProject = `${project}-schema-failure`;
 const nodeImage = "node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89";
@@ -101,6 +102,22 @@ try {
     assert.equal(compose(["exec", "-T", service, "sh", "-c", "touch /tmp/.write-test && rm /tmp/.write-test"]), "");
     if (service === "collector") assert.doesNotMatch(docker(["inspect", "-f", "{{json .Config.Env}}", container]), /GOOGLE|KUBERNETES/);
     assert.doesNotMatch(docker(["logs", container]), /local-container-only|local-container-smoke|local-container-timeline/);
+  }
+
+  if (backupSmoke) {
+    const backupContainer = compose(["ps", "-aq", "backup"]);
+    assert.ok(backupContainer, "the exact release backup image must create a container");
+    await waitForStopped(backupContainer);
+    assert.notEqual(docker(["inspect", "-f", "{{.State.ExitCode}}", backupContainer]), "0", "backup must fail closed without backup configuration");
+    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", backupContainer]), "node");
+    assert.equal(docker(["inspect", "-f", "{{.HostConfig.ReadonlyRootfs}}", backupContainer]), "true");
+    assert.match(docker(["inspect", "-f", "{{json .HostConfig.CapDrop}}", backupContainer]), /ALL/);
+    assert.match(docker(["inspect", "-f", "{{json .HostConfig.Tmpfs}}", backupContainer]), /tmp/);
+    const backupImageId = docker(["inspect", "-f", "{{.Image}}", backupContainer]);
+    assert.match(backupImageId, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", backupImageId]), "arm64");
+    assert.doesNotMatch(docker(["inspect", "-f", "{{json .Config.Env}}", backupContainer]), /AWS_ACCESS_KEY|AWS_SECRET_ACCESS_KEY|BACKUP_ENCRYPTION/);
+    assert.match(docker(["logs", backupContainer]), /missing backup configuration: DATABASE_URL/);
   }
 
   const collector = compose(["ps", "-q", "collector"]);

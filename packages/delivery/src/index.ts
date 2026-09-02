@@ -1,4 +1,5 @@
 const SHA256_DIGEST = /^sha256:[a-f0-9]{64}$/;
+const BACKUP_DIGEST_PLACEHOLDER = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
 const GIT_COMMIT = /^[a-f0-9]{40}$/;
 const PREVIEW_NUMBER = /^[1-9][0-9]{0,8}$/;
 export const TRUSTED_PREVIEW_GITOPS_REPOSITORY = "https://github.com/MISAKA3389/tracegarden-gitops.git";
@@ -204,7 +205,7 @@ export function reconcilePreviewEnvironments(
 
 export type PromotionInput = Readonly<{
   releaseCommit: string;
-  images: Readonly<Record<"web" | "collector" | "migrate", Readonly<{ repository: string; digest: string }>>>;
+  images: Readonly<Record<"web" | "collector" | "migrate" | "backup", Readonly<{ repository: string; digest: string }>>>;
   approval: Readonly<{
     environment: "production";
     approved: boolean;
@@ -219,7 +220,7 @@ export type PromotionInput = Readonly<{
 
 export type PromotionProposal = Readonly<{
   releaseCommit: string;
-  desiredState: Readonly<Record<"web" | "collector" | "migrate", string>>;
+  desiredState: Readonly<Record<"web" | "collector" | "migrate" | "backup", string>>;
   review: Readonly<{ environment: "production"; approvedBy: string; mechanism: "gitops-pull-request" }>;
   clusterMutation: false;
 }>;
@@ -232,14 +233,20 @@ export function createPromotionProposal(input: PromotionInput): PromotionProposa
   if (!input.gitOps.pullRequestRequired || !input.gitOps.repository.trim() || !input.gitOps.path.trim()) {
     throw new Error("Promotion requires a reviewable GitOps pull request");
   }
-  for (const [component, reference] of Object.entries(input.images)) {
+  for (const component of ["web", "collector", "migrate", "backup"] as const) {
+    const reference = input.images[component];
+    if (!reference) throw new Error(`images.${component} is required`);
     if (!reference.repository.trim()) throw new Error(`images.${component}.repository is required`);
     assertDigest(reference.digest, `images.${component}.digest`);
+    if (component === "backup" && reference.digest === BACKUP_DIGEST_PLACEHOLDER) {
+      throw new Error("images.backup.digest must be replaced with the attested release digest");
+    }
   }
   const desiredState = {
     web: `${input.images.web.repository}@${input.images.web.digest}`,
     collector: `${input.images.collector.repository}@${input.images.collector.digest}`,
     migrate: `${input.images.migrate.repository}@${input.images.migrate.digest}`,
+    backup: `${input.images.backup.repository}@${input.images.backup.digest}`,
   };
   return {
     releaseCommit: input.releaseCommit,

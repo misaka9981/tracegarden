@@ -57,10 +57,14 @@ proxy headers. `NODE_ENV=preview` fails closed unless the issuer, audience,
 and public key are all configured. The configured issuer and audience are
 operator-managed configuration, not PR values or credentials.
 
-`deploy/promotion/promotion.yaml` records the release commit, digest-pinned
-images, protected production approval requirement, and GitOps pull-request
-requirement. CI emits a complete, reviewable desired-state artifact; remote
-GitOps PR creation remains deferred. `deploy/gitops/production/application.yaml`
+`deploy/promotion/promotion.yaml` records the release commit, digest-pinned web,
+collector, migration, and backup images, protected production approval
+requirement, and GitOps pull-request requirement. CI emits a complete,
+reviewable desired-state artifact with the gated `backup_digest`; remote GitOps
+PR creation remains deferred. The chart values retain a documentation-only
+placeholder while backup is disabled; replace it, and refresh the offline
+promotion/desired-state fixtures, with the attested release digest before
+enabling or promoting backup. `deploy/gitops/production/application.yaml`
 declares Argo CD's pull source. Live GitHub, Cloudflare, Argo CD, registry, and
 Cluster behavior remain **unverified** until authorized infrastructure is
 provided.

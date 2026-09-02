@@ -74,6 +74,14 @@ if (exactReleaseSmoke < 0 || exactReleaseScan < 0 || !workflowText.includes("CON
 if (exactReleaseScan < 0 || releaseAttestation < 0 || exactReleaseScan > releaseAttestation) {
   errors.push("release publication must scan pushed digests before attestation");
 }
+for (const required of [
+  "backup_digest: ${{ steps.backup.outputs.digest }}",
+  "backup_ref=\"${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}\"",
+  "CONTAINER_SMOKE_BACKUP: \"1\"",
+  "test \"$BACKUP_DIGEST\" != sha256:4444444444444444444444444444444444444444444444444444444444444444",
+]) {
+  if (!workflowText.includes(required)) errors.push(`release backup gate is missing ${required}`);
+}
 if (/--platform linux\/arm64/.test(workflowText) && !workflowText.includes("runs-on: ubuntu-24.04-arm")) {
   errors.push("ARM64 builds require a native ARM runner or immutable-pinned QEMU setup");
 }
@@ -109,6 +117,10 @@ if (!chartPackage.scripts["chart:validate"]?.includes("schema-location")) errors
 const chartTest = await readFile("scripts/chart-test.mjs", "utf8");
 if (!chartTest.includes("schemaLocation") || !chartTest.includes("-schema-location")) errors.push("chart tests must pass an explicit schema location");
 const chartValues = await readFile("deploy/chart/values.yaml", "utf8");
+const chartHelpers = await readFile("deploy/chart/templates/_helpers.tpl", "utf8");
+if (!chartValues.includes("Documentation-only placeholder") || !chartHelpers.includes("images.backup.digest must be replaced with the attested release digest")) {
+  errors.push("backup chart values must document and fail closed on the digest placeholder");
+}
 const chartDigests = [...chartValues.matchAll(/^\s+digest:\s+(\S+)/gm)].map(([, digest]) => digest);
 if (!chartDigests.length || !chartDigests.every((digest) => /^sha256:[a-f0-9]{64}$/.test(digest))) {
   errors.push("deploy/chart/values.yaml: every deployment digest must be immutable");

@@ -54,6 +54,7 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- if not (or (regexMatch $ipv4CidrPattern .) (regexMatch $ipv6CidrPattern .)) }}{{ fail "backup.endpointCIDRs must contain valid IPv4 or IPv6 CIDRs" }}{{ end }}
 {{- end }}
 {{- if .Values.backup.enabled }}
+{{- if eq .Values.images.backup.digest "sha256:4444444444444444444444444444444444444444444444444444444444444444" }}{{ fail "images.backup.digest must be replaced with the attested release digest before backup.enabled is true" }}{{ end }}
 {{- $_ := required "backup.endpoint is required when backup.enabled is true" .Values.backup.endpoint }}
 {{- range .Values.backup.endpointCIDRs }}
 {{- $cidr := lower . }}

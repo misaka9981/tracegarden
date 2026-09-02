@@ -1,6 +1,6 @@
 # Backup and restore rehearsal
 
-Tracegarden ships an encrypted PostgreSQL backup path, but it is disabled by default. The Helm CronJob is suspended until all of these values are deliberately configured:
+Tracegarden ships an encrypted PostgreSQL backup path, but it is disabled by default. The Helm CronJob is suspended until the exact attested release image digest and all of these values are deliberately configured:
 
 - an HTTPS object-storage endpoint, its authorized egress CIDR range, and bucket;
 - `aes-256-gcm` as the encryption mechanism and a Kubernetes Secret containing a 32-byte encryption key;
@@ -12,9 +12,13 @@ The backup process runs `pg_dump --format=custom`, encrypts the dump locally wit
 
 ## Configuration gate
 
-Set the following values together; leaving any value empty makes enabling fail closed:
+Set the following values together; leaving any value empty makes enabling fail closed. Before setting `backup.enabled: true`, replace the documentation-only `images.backup.digest` placeholder in `deploy/chart/values.yaml` with the exact `backup_digest` from the gated release supply-chain evidence or promotion artifact. Helm rejects the placeholder while backup is enabled; do not substitute a tag or an unverified digest.
 
 ```yaml
+images:
+  backup:
+    repository: ghcr.io/misaka3389/tracegarden-backup
+    digest: <attested-backup-digest>
 backup:
   enabled: true
   endpoint: https://<authorized-object-storage-endpoint>
@@ -60,4 +64,4 @@ A restore is only a rehearsal when it uses a newly created, clean PostgreSQL dat
    - every application foreign-key constraint is present and validated; and
    - a Workspace/Timeline projection is application-readable.
 
-The repository's offline backup test verifies authenticated encryption and that an uploader receives encrypted bytes only. It uses no database, cloud endpoint, R2 account, Kubernetes context, or credentials. Live upload and restore rehearsal remain **unverified** until authorized storage, restore infrastructure, and credentials are supplied.
+The repository's offline backup test verifies authenticated encryption and that an uploader receives encrypted bytes only. It uses no database, cloud endpoint, R2 account, Kubernetes context, or credentials. Release backup publication, attestation, and live upload/restore rehearsal remain **unverified** until authorized storage, restore infrastructure, and credentials are supplied.

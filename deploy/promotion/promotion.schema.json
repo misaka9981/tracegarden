@@ -24,11 +24,17 @@
         "images": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["web", "collector", "migrate"],
+          "required": ["web", "collector", "migrate", "backup"],
           "properties": {
             "web": { "$ref": "#/definitions/image" },
             "collector": { "$ref": "#/definitions/image" },
-            "migrate": { "$ref": "#/definitions/image" }
+            "migrate": { "$ref": "#/definitions/image" },
+            "backup": {
+              "allOf": [
+                { "$ref": "#/definitions/backupImage" },
+                { "not": { "type": "object", "properties": { "digest": { "const": "sha256:4444444444444444444444444444444444444444444444444444444444444444" } } } }
+              ]
+            }
           }
         },
         "protectedEnvironment": {
@@ -58,6 +64,15 @@
       "required": ["repository", "digest"],
       "properties": {
         "repository": { "type": "string", "pattern": "^ghcr.io/misaka3389/tracegarden-(web|collector|migrate)$" },
+        "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    },
+    "backupImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "digest"],
+      "properties": {
+        "repository": { "const": "ghcr.io/misaka3389/tracegarden-backup" },
         "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
       }
     }

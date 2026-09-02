@@ -40,6 +40,16 @@ function validateSchema(value, schema, path = "$", root = schema, options = {}) 
   }
   if (Object.hasOwn(schema, "const") && value !== schema.const) schemaError(path, `must equal ${JSON.stringify(schema.const)}`);
   if (schema.enum && !schema.enum.includes(value)) schemaError(path, `must be one of ${schema.enum.join(", ")}`);
+  for (const candidate of schema.allOf ?? []) validateSchema(value, candidate, path, root, options);
+  if (schema.not) {
+    let matches = true;
+    try {
+      validateSchema(value, schema.not, path, root, options);
+    } catch {
+      matches = false;
+    }
+    if (matches) schemaError(path, "must not match the excluded schema");
+  }
   for (const keyword of ["oneOf", "anyOf"]) if (schema[keyword] && !schema[keyword].some((candidate) => {
     try {
       validateSchema(value, candidate, path, root, options);
@@ -204,8 +214,19 @@ assert.equal(promotion.spec.releaseCommit.length, 40);
 assert.equal(promotion.spec.protectedEnvironment.approvalRequired, true);
 assert.equal(promotion.spec.gitOps.pullRequestRequired, true);
 assert.equal(promotion.spec.gitOps.directClusterMutation, false);
+assert.equal(promotion.spec.images.backup.repository, "ghcr.io/misaka3389/tracegarden-backup");
+assert.match(promotion.spec.images.backup.digest, /^sha256:[a-f0-9]{64}$/);
+assert.notEqual(promotion.spec.images.backup.digest, "sha256:4444444444444444444444444444444444444444444444444444444444444444");
+const invalidPromotion = structuredClone(promotion);
+invalidPromotion.spec.images.backup.digest = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+const promotionSchema = JSON.parse(await read("deploy/promotion/promotion.schema.json"));
+assert.throws(() => validateSchema(invalidPromotion, promotionSchema), /excluded schema/);
 assert.match(desiredState, /releaseCommit: [a-f0-9]{40}/);
-assert.equal([...desiredState.matchAll(/@sha256:[a-f0-9]{64}/g)].length, 3);
+assert.equal([...desiredState.matchAll(/@sha256:[a-f0-9]{64}/g)].length, 4);
+assert.equal(
+  desiredState.match(/backup: (ghcr\.io\/misaka3389\/tracegarden-backup@sha256:[a-f0-9]{64})/)?.[1],
+  `ghcr.io/misaka3389/tracegarden-backup@${promotion.spec.images.backup.digest}`,
+);
 assert.match(productionApp, /argocd-pull/);
 assert.match(previewValues, /serviceAccount:\n  name: tracegarden-preview/);
 assert.match(previewValues, /imagePullSecrets:\n  - name: tracegarden-preview-ghcr/);
@@ -381,6 +402,7 @@ const images = {
   web: { repository: "example/web", digest: `sha256:${"1".repeat(64)}` },
   collector: { repository: "example/collector", digest: `sha256:${"2".repeat(64)}` },
   migrate: { repository: "example/migrate", digest: `sha256:${"3".repeat(64)}` },
+  backup: { repository: "example/backup", digest: `sha256:${"5".repeat(64)}` },
 };
 const proposal = createPromotionProposal({
   releaseCommit: commit,
@@ -390,6 +412,13 @@ const proposal = createPromotionProposal({
 });
 assert.equal(proposal.clusterMutation, false);
 assert.equal(proposal.review.mechanism, "gitops-pull-request");
+assert.equal(proposal.desiredState.backup, "example/backup@sha256:" + "5".repeat(64));
+assert.throws(() => createPromotionProposal({
+  releaseCommit: commit,
+  images: { ...images, backup: { ...images.backup, digest: "sha256:" + "4".repeat(64) } },
+  approval: { environment: "production", approved: true, reviewer: "maintainer" },
+  gitOps: { repository: "gitops", path: "production/values.yaml", pullRequestRequired: true },
+}), /attested release digest/);
 assert.throws(() => createPromotionProposal({
   releaseCommit: commit,
   images,
@@ -435,6 +464,29 @@ assert.equal(generatedMetadata.spec.handoff.valueFile, "environments/previews/di
 assert.equal(generatedMetadata.spec.handoff.commitRequired, true);
 assert.equal(generatedMetadata.spec.handoff.remoteWrite, false);
 assert.equal("labels" in generatedMetadata.spec.handoff, false);
+const promotionArtifactPath = join(artifactDirectory, "promotion-desired-state.yaml");
+const promotionArtifactEnvironment = {
+  ...process.env,
+  RELEASE_COMMIT: commit,
+  GITHUB_RUN_ID: "12345",
+  GHCR_NAMESPACE: "misaka3389",
+  WEB_DIGEST: `sha256:${"1".repeat(64)}`,
+  COLLECTOR_DIGEST: `sha256:${"2".repeat(64)}`,
+  MIGRATE_DIGEST: `sha256:${"3".repeat(64)}`,
+  BACKUP_DIGEST: `sha256:${"5".repeat(64)}`,
+};
+const promotionArtifact = spawnSync(process.execPath, ["scripts/promotion-artifact.mjs", promotionArtifactPath], {
+  encoding: "utf8",
+  env: promotionArtifactEnvironment,
+});
+assert.equal(promotionArtifact.status, 0, promotionArtifact.stderr || "promotion artifact generation failed");
+const generatedPromotion = await parseYaml(promotionArtifactPath);
+assert.equal(generatedPromotion.spec.images.backup, `ghcr.io/misaka3389/tracegarden-backup@sha256:${"5".repeat(64)}`);
+const invalidPromotionArtifact = spawnSync(process.execPath, ["scripts/promotion-artifact.mjs", join(artifactDirectory, "invalid-promotion.yaml")], {
+  encoding: "utf8",
+  env: { ...promotionArtifactEnvironment, BACKUP_DIGEST: `sha256:${"4".repeat(64)}` },
+});
+assert.notEqual(invalidPromotionArtifact.status, 0, "promotion artifact must reject the backup digest placeholder");
 rmSync(artifactDirectory, { recursive: true, force: true });
 
 const lifecycleCheck = spawnSync(process.execPath, ["scripts/preview-lifecycle-controller.mjs"], {

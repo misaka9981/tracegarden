@@ -12,7 +12,7 @@ images:
     digest: sha256:0ed108dbe1b1ed6e4e20863d050e5a7f1a9ee0e19854138d9405147a8b61019d
   backup:
     repository: ghcr.io/misaka3389/tracegarden-backup
-    # Replace this release placeholder with the published backup image attestation.
+    # Documentation-only placeholder. Replace with the exact attested backup_digest before enabling backup.
     digest: sha256:4444444444444444444444444444444444444444444444444444444444444444
   postgres:
     repository: postgres
