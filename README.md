@@ -35,10 +35,11 @@ For PostgreSQL-backed development, copy `.env.example`, start `postgres:18.3-alp
 
 ## Agreed baseline
 
-- Node.js 26.8.x and TypeScript 7.0.2
-- pnpm workspaces and Turborepo task metadata
-- PostgreSQL 18 with a repository-owned migration boundary
-- TanStack Start, React, tRPC, Zod, Drizzle, and Kubernetes adapters remain subsequent foundation/domain increments; Better Auth now owns production Google identity and sessions.
+- The current implementation uses Node.js 26.8.x, ESM, and TypeScript 7.0.2; Bun is the production-runtime target for a later, per-process migration with Node retained as the rollback runtime.
+- pnpm workspaces and Turborepo task metadata remain the development workspace.
+- The current web uses Node `node:http`, server-rendered HTML, native forms, and a small `fetch`/`EventSource` client. Hono is the target web transport and Hono JSX may structure those views without React or hydration.
+- PostgreSQL 18 and the repository-owned `pg` migration/data boundary remain unchanged.
+- Better Auth and Kubernetes adapters are implemented; React, TanStack Router, TanStack Start, tRPC, Tailwind, Zod, and Drizzle are not part of the current or accepted target stack. See [ADR 0006](docs/adr/0006-choose-hono-and-staged-bun-runtime.md).
 
 ## Safety boundary
 

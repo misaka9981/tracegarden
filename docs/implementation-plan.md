@@ -7,10 +7,10 @@ The local implementation phase is complete only when the core loop works against
 ## Phase 1: foundation
 
 - Initialize the Git repository on `main` without creating a remote.
-- Pin Node.js, pnpm, TypeScript, and exact dependency versions.
-- Create the pnpm/Turborepo workspace and planned packages.
+- Keep the proven Node.js 26.8.x, pnpm, TypeScript 7, PostgreSQL 18, and `pg` baseline while selecting any Hono dependencies for the transport migration.
+- Create and maintain the pnpm/Turborepo workspace and package boundaries.
 - Add shared lint, format, typecheck, test, and environment validation.
-- Prove TanStack Start, tRPC, Zod, Drizzle, and Better Auth compile together on Node 26.
+- Prove Hono route composition and Hono JSX server views on Node 26 before any Bun production switch; retain native `tsc --noEmit` and the Node-based Playwright toolchain.
 
 Exit evidence: frozen install, typecheck, unit test, production web build, and minimal container smoke pass.
 
@@ -29,7 +29,7 @@ Exit evidence: invited and rejected identity tests, capability tests, and Experi
 - Implement list/watch ingestion with checkpoints, projection, idempotency, relist, and bounded reconnect.
 - Persist Observations and Timeline Entries.
 - Implement attention classification and correlation suggestions.
-- Publish committed cursors through PostgreSQL notification and SSE.
+- Publish committed cursors through PostgreSQL notification and SSE, keeping the HTTP JSON cursor route as the client recovery boundary.
 - Build the timeline-first UI and confirmation workflow.
 
 Exit evidence: deterministic failure-path tests and the complete core-loop browser test pass.

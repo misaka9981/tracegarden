@@ -4,24 +4,32 @@
 
 Tracegarden is one product in a monorepo with independently deployed web and collector processes. Deployment separation reflects different lifecycles, not a microservice goal.
 
-Planned layout:
+Current layout and target seam:
 
 ```text
 apps/
-  web/                 TanStack Start UI, Better Auth, tRPC, and SSE
+  web/                 Node `node:http` transport, HTML views, Better Auth, JSON APIs, and SSE
   collector/           Kubernetes list/watch ingestion
+  migrate/             PostgreSQL migration gate
 packages/
+  cluster/             Kubernetes scope, normalization, and stream adapters
+  contracts/           Shared process/status types
+  db/                  PostgreSQL `pg` boundary, migrations, and repositories
+  delivery/            Deployment and delivery policy helpers
   domain/              Timeline, experiment, correlation, and capability rules
-  db/                  Drizzle schema, migrations, and repositories
-  contracts/           Zod schemas and tRPC router contracts
   i18n/                Chinese and English message catalogs
-  observability/       OpenTelemetry and structured logging setup
-  test-support/        Local identity and Kubernetes stream adapters
+  identity/            Better Auth, memberships, invitations, and capabilities
+  logs/                Bounded recent-log access
+  telemetry/           OpenTelemetry-compatible telemetry setup
 deploy/
   chart/               Application Helm chart
-  argocd/              ApplicationSet and example application declarations
+  docker/              Production process images
+  gitops/              Pull-based deployment declarations
+  preview/             Isolated Preview Environment declarations
 docs/
 ```
+
+The current web transport and views remain Node/`node:http` until the modernization steps migrate them. The target seam is Hono route composition with Hono JSX view modules; it does not change the domain or URL contracts. See [ADR 0006](adr/0006-choose-hono-and-staged-bun-runtime.md).
 
 ## Deep modules and seams
 
@@ -51,7 +59,7 @@ This module accepts an authorized Cluster, namespace, Pod, container, and bounde
 
 ### Live timeline
 
-The durable database is authoritative. After a timeline transaction commits, PostgreSQL `NOTIFY` carries only an entry ID or cursor. The web process converts notifications into SSE hints; clients always query missing rows through tRPC. Reconnect and duplicate notification handling are therefore idempotent.
+The durable database is authoritative. After a timeline transaction commits, PostgreSQL `NOTIFY` carries only an entry ID or cursor. The web process converts notifications into SSE hints; clients always query missing rows through the HTTP JSON route. Reconnect and duplicate notification handling are therefore idempotent.
 
 ## Data model
 
@@ -75,7 +83,7 @@ Kubernetes list/watch
   -> NOTIFY(entry cursor)
   -> web LISTEN connection
   -> SSE hint
-  -> tRPC cursor query
+  -> HTTP JSON cursor query
   -> timeline UI
 ```
 
@@ -87,26 +95,27 @@ Recent logs use a second ServiceAccount and the `logs:read` application capabili
 
 ## Runtime and persistence
 
-- Runtime: Node.js 26.8.x, ESM
+- Current runtime: Node.js 26.8.x and ESM; target production runtime: one exact Bun version, adopted per process after compatibility proof
 - Language: TypeScript 7 with explicit strict settings and its native `tsc` as the authoritative compiler
-- Web: TanStack Start, React, TanStack Router, and TanStack Query
-- Transport: tRPC 11 with Zod 4.5 runtime validation
-- Database: PostgreSQL 18 with stable Drizzle ORM 0.45
+- Current web transport: Node `node:http`; target web transport: Hono route composition
+- Views and client: server-rendered HTML strings, native forms, and a small `fetch`/`EventSource` client today; Hono JSX may structure those views without React or hydration
+- Application transport: existing validated HTTP HTML/JSON routes; no tRPC
+- Database: PostgreSQL 18 with the existing `pg` driver and repository boundary
 - Authentication: Better Auth with Google OAuth and database sessions
 - Realtime: PostgreSQL `LISTEN/NOTIFY` plus SSE hints
-- Styling: Tailwind CSS, design tokens, and accessible headless primitives
-- Workspace: pnpm workspaces and Turborepo
+- Styling: existing page styles; no Tailwind
+- Development and validation: pnpm workspaces, native `tsc --noEmit`, and Node-based Playwright
 
-Exact dependency patches are pinned only after an install, build, and compatibility test proves the selected set works together.
+The current Node process images and commands remain the rollback baseline while Hono and Bun are proven. Exact dependency changes for each migration step are selected only in that step and do not change PostgreSQL, `pg`, or the validation toolchain.
 
 ## Verification strategy
 
 - Domain tests exercise observable behavior through module interfaces.
 - Deterministic collector tests cover duplicate events, disconnects, `410 Gone`, missing bookmarks, and persistence failures without sleeps.
 - Repository integration tests run migrations and queries against a real disposable PostgreSQL container.
-- tRPC tests cover authorization and runtime validation.
+- HTTP route tests cover authorization and runtime validation.
 - Playwright covers admitted login, rejected login, timeline browsing, and Experiment creation using the local identity adapter rather than a real Google account.
 - Container smoke tests run as non-root and exercise startup, readiness, graceful shutdown, and migration ordering.
 - Kubernetes manifests are rendered and schema-validated without contacting a cluster.
 
-Live Kubernetes compatibility remains unverified until a personal-cluster context is supplied and explicitly selected.
+Production Kubernetes compatibility and external integrations remain unverified; bounded authorized VM/kind evidence is recorded separately and does not replace production verification.

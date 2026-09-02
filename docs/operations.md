@@ -38,7 +38,7 @@ No complete monitoring stack is installed by this project. Operators choose and 
 
 ## Production containers
 
-The web and collector Dockerfiles use the frozen pnpm lockfile and ARM64-pinned Node.js 26.8 base image. Runtime stages contain only compiled application JavaScript, migration SQL, and production dependencies; source files, development dependencies, and configuration are omitted. Compose runs each application as the non-root `node` user with a read-only root filesystem, `no-new-privileges`, all Linux capabilities dropped, and an explicitly sized `/tmp` tmpfs.
+The current web and collector Dockerfiles use the frozen pnpm lockfile and ARM64-pinned Node.js 26.8 base image. Runtime stages contain only compiled application JavaScript, migration SQL, and production dependencies; source files, development dependencies, and configuration are omitted. Compose runs each application as the non-root `node` user with a read-only root filesystem, `no-new-privileges`, all Linux capabilities dropped, and an explicitly sized `/tmp` tmpfs. These Node images and commands are the rollback baseline while the modernization effort proves Bun per process; they are replaced only after equivalent runtime and behavior evidence passes.
 
 The `migrate` service is a one-shot, credential-free (apart from its database connection) gate. Web and collector depend on its successful completion and verify the committed migration state at startup without running migrations themselves. The collector receives no Google or Kubernetes credentials; with no explicit Kubernetes endpoint it reports `clusterContacted: false` and remains not ready.
 
