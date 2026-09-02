@@ -27,6 +27,42 @@ import { APPLICATION_SET_CRD_RELEASE, APPLICATION_SET_CRD_SOURCE, readApplicatio
 
 const read = (path) => readFile(path, "utf8");
 
+const ciWorkflow = await read(".github/workflows/ci.yml");
+const publishStart = ciWorkflow.indexOf("\n  publish:");
+const publishEnd = ciWorkflow.indexOf("\n  promotion-proposal:", publishStart);
+assert.ok(publishStart >= 0 && publishEnd > publishStart, "release publication job must be declared");
+const publishWorkflow = ciWorkflow.slice(publishStart, publishEnd);
+const smokeGate = publishWorkflow.indexOf("Smoke-test exact published digests");
+const cveGate = publishWorkflow.indexOf("Scan exact published digests before attestation");
+const sbomGeneration = publishWorkflow.indexOf("Generate SBOMs for exact published digests");
+assert.ok(smokeGate >= 0 && cveGate > smokeGate && sbomGeneration > cveGate, "release gates must precede SBOM generation");
+const preGatePublication = publishWorkflow.slice(0, sbomGeneration);
+assert.doesNotMatch(preGatePublication, /--provenance=(?!false\b)|--sbom=(?!false\b)|actions\/attest-(?:sbom|build-provenance)@/, "release publication must not attest before exact-digest gates");
+const releaseBuilds = [...publishWorkflow.matchAll(/docker buildx build[^\n]*/g)].map(([line]) => line);
+assert.equal(releaseBuilds.length, 4, "release must build web, collector, migrate, and backup");
+assert.ok(releaseBuilds.every((line) => line.includes("--provenance=false") && line.includes("--sbom=false")), "all release builds must disable Buildx attestations");
+const postGatePublication = publishWorkflow.slice(sbomGeneration);
+assert.equal((postGatePublication.match(/uses: actions\/attest-sbom@[0-9a-f]{40}/g) ?? []).length, 4, "each release image needs an SBOM attestation");
+assert.equal((postGatePublication.match(/uses: actions\/attest-build-provenance@[0-9a-f]{40}/g) ?? []).length, 4, "each release image needs a provenance attestation");
+const stepBlock = (name) => {
+  const start = postGatePublication.indexOf("- name: " + name);
+  assert.ok(start >= 0, `${name} step is missing`);
+  const end = postGatePublication.indexOf("\n      - ", start + 1);
+  return postGatePublication.slice(start, end < 0 ? postGatePublication.length : end);
+};
+for (const service of ["web", "collector", "migrate", "backup"]) {
+  const subjectName = "subject-name: ${{ env.IMAGE_PREFIX }}-" + service;
+  const subjectDigest = "subject-digest: ${{ steps." + service + ".outputs.digest }}";
+  const sbomStep = stepBlock("Attest " + service + " SBOM");
+  const provenanceStep = stepBlock("Attest " + service + " provenance");
+  assert.match(sbomStep, /uses: actions\/attest-sbom@[0-9a-f]{40}/);
+  assert.match(provenanceStep, /uses: actions\/attest-build-provenance@[0-9a-f]{40}/);
+  assert.ok(sbomStep.includes(subjectName) && sbomStep.includes(subjectDigest), `${service} SBOM must use its exact digest`);
+  assert.ok(provenanceStep.includes(subjectName) && provenanceStep.includes(subjectDigest), `${service} provenance must use its exact digest`);
+  assert.ok(sbomStep.includes("sbom-path: ${{ runner.temp }}/tracegarden-release-sbom/" + service + ".spdx.json"), `${service} SBOM path is missing`);
+  assert.ok(postGatePublication.indexOf("Attest " + service + " SBOM") < postGatePublication.indexOf("Attest " + service + " provenance"), `${service} attestations must have identical ordering`);
+}
+
 function schemaError(path, message) {
   throw new Error(`${path}: ${message}`);
 }

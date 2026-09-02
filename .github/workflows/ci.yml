@@ -328,27 +328,27 @@ jobs:
         id: web
         run: |
           set -eu
-          docker buildx build --platform linux/arm64 --file deploy/docker/web.Dockerfile --tag "${IMAGE_PREFIX}-web:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/web.json" .
+          docker buildx build --platform linux/arm64 --file deploy/docker/web.Dockerfile --tag "${IMAGE_PREFIX}-web:${GITHUB_SHA}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/web.json" .
           echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/web.json")" >> "$GITHUB_OUTPUT"
       - name: Publish collector image
         id: collector
         run: |
           set -eu
-          docker buildx build --platform linux/arm64 --file deploy/docker/collector.Dockerfile --tag "${IMAGE_PREFIX}-collector:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/collector.json" .
+          docker buildx build --platform linux/arm64 --file deploy/docker/collector.Dockerfile --tag "${IMAGE_PREFIX}-collector:${GITHUB_SHA}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/collector.json" .
           echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/collector.json")" >> "$GITHUB_OUTPUT"
       - name: Publish migration image
         id: migrate
         run: |
           set -eu
-          docker buildx build --platform linux/arm64 --file deploy/docker/migrate.Dockerfile --tag "${IMAGE_PREFIX}-migrate:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/migrate.json" .
+          docker buildx build --platform linux/arm64 --file deploy/docker/migrate.Dockerfile --tag "${IMAGE_PREFIX}-migrate:${GITHUB_SHA}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/migrate.json" .
           echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/migrate.json")" >> "$GITHUB_OUTPUT"
-      # Backup is built before the shared exact-digest smoke and CVE gates. Its
-      # attestation remains below those gates with the other release images.
+      # All release image attestations are attached only after the shared exact-digest
+      # smoke and CVE gates.
       - name: Publish backup image
         id: backup
         run: |
           set -eu
-          docker buildx build --platform linux/arm64 --file deploy/docker/backup.Dockerfile --tag "${IMAGE_PREFIX}-backup:${GITHUB_SHA}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/backup.json" .
+          docker buildx build --platform linux/arm64 --file deploy/docker/backup.Dockerfile --tag "${IMAGE_PREFIX}-backup:${GITHUB_SHA}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --metadata-file "$RUNNER_TEMP/backup.json" .
           echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/backup.json")" >> "$GITHUB_OUTPUT"
       - name: Pull published digests for exact release smoke
         run: |
@@ -412,22 +412,72 @@ jobs:
             if [ "$status" -ne 0 ]; then failed=1; fi
           done
           exit "$failed"
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+      - name: Generate SBOMs for exact published digests
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/tracegarden-release-sbom" "$RUNNER_TEMP/trivy-release-cache"
+          for service_ref in \
+            "${IMAGE_PREFIX}-web@${{ steps.web.outputs.digest }}" \
+            "${IMAGE_PREFIX}-collector@${{ steps.collector.outputs.digest }}" \
+            "${IMAGE_PREFIX}-migrate@${{ steps.migrate.outputs.digest }}" \
+            "${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}"; do
+            service="${service_ref##*/}"
+            service="${service%%@*}"
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP/tracegarden-release-sbom:/reports" \
+              -v "$RUNNER_TEMP/trivy-release-cache:/root/.cache" \
+              "$TRIVY_IMAGE" image --format spdx-json --output "/reports/${service}.spdx.json" "$service_ref"
+            test -s "$RUNNER_TEMP/tracegarden-release-sbom/${service}.spdx.json"
+          done
+      - name: Attest web SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-web
+          subject-digest: ${{ steps.web.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/tracegarden-release-sbom/web.spdx.json
+          push-to-registry: true
+      - name: Attest web provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-web
           subject-digest: ${{ steps.web.outputs.digest }}
           push-to-registry: true
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+      - name: Attest collector SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-collector
+          subject-digest: ${{ steps.collector.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/tracegarden-release-sbom/collector.spdx.json
+          push-to-registry: true
+      - name: Attest collector provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-collector
           subject-digest: ${{ steps.collector.outputs.digest }}
           push-to-registry: true
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+      - name: Attest migrate SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-migrate
+          subject-digest: ${{ steps.migrate.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/tracegarden-release-sbom/migrate.spdx.json
+          push-to-registry: true
+      - name: Attest migrate provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-migrate
           subject-digest: ${{ steps.migrate.outputs.digest }}
           push-to-registry: true
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+      - name: Attest backup SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-backup
+          subject-digest: ${{ steps.backup.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/tracegarden-release-sbom/backup.spdx.json
+          push-to-registry: true
+      - name: Attest backup provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-backup
           subject-digest: ${{ steps.backup.outputs.digest }}
@@ -453,12 +503,13 @@ jobs:
           for service in web collector migrate backup; do
             digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/${service}.json")
             test "$digest" != "null" && printf '%s\n' "$digest" > "$evidence/${service}-digest.txt"
+            cp "$RUNNER_TEMP/tracegarden-release-sbom/${service}.spdx.json" "$evidence/${service}-sbom.spdx.json"
             docker buildx imagetools inspect --raw "${IMAGE_PREFIX}-${service}@${digest}" > "$evidence/${service}-manifest.json"
           done
           jq -n \
             --arg commit "$GITHUB_SHA" \
             --arg source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            '{commit: $commit, source: $source, sbom: "buildx --sbom=true", provenance: "buildx --provenance=mode=max", evidence: "image manifests and build metadata"}' \
+            '{commit: $commit, source: $source, sbom: "actions/attest-sbom with Trivy SPDX JSON", provenance: "actions/attest-build-provenance", evidence: "image manifests, SBOMs, and build metadata"}' \
             > "$evidence/attestation-evidence.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

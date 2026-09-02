@@ -48,7 +48,7 @@ for (const command of [
 ]) {
   if (!workflowText.includes(command)) errors.push(`workflow suite is missing ${command}`);
 }
-for (const required of ["GITHUB_SHA", "--sbom=true", "--provenance=mode=max", "packages: write", "attestations: write"]) {
+for (const required of ["GITHUB_SHA", "packages: write", "attestations: write"]) {
   if (!workflowText.includes(required)) errors.push(`workflow suite is missing immutable publication control ${required}`);
 }
 for (const tool of ["HELM_IMAGE", "KUBECONFORM_IMAGE", "TRIVY_IMAGE"]) {
@@ -65,14 +65,56 @@ if (!workflowText.includes("KUBECONFORM_SCHEMA_LOCATION")) {
   errors.push("workflow suite must pass an explicit local schema location");
 }
 if (!workflowText.includes("--exit-code 1") || !workflowText.includes("--severity HIGH,CRITICAL")) errors.push("workflow suite must fail on actionable image CVEs");
-const exactReleaseSmoke = workflowText.indexOf("Smoke-test exact published digests");
-const exactReleaseScan = workflowText.indexOf("Scan exact published digests before attestation");
-const releaseAttestation = workflowText.indexOf("actions/attest-build-provenance@");
-if (exactReleaseSmoke < 0 || exactReleaseScan < 0 || !workflowText.includes("CONTAINER_SMOKE_NO_BUILD: \"1\"")) {
+const ciWorkflow = workflows.find(([path]) => path === ".github/workflows/ci.yml")?.[1] ?? "";
+const publishStart = ciWorkflow.indexOf("\n  publish:");
+const publishEnd = ciWorkflow.indexOf("\n  promotion-proposal:", publishStart);
+const publishWorkflow = publishStart >= 0 && publishEnd > publishStart ? ciWorkflow.slice(publishStart, publishEnd) : "";
+const exactReleaseSmoke = publishWorkflow.indexOf("Smoke-test exact published digests");
+const exactReleaseScan = publishWorkflow.indexOf("Scan exact published digests before attestation");
+const releaseSbomGeneration = publishWorkflow.indexOf("Generate SBOMs for exact published digests");
+const releaseProvenance = publishWorkflow.indexOf("actions/attest-build-provenance@");
+const releaseSbom = publishWorkflow.indexOf("actions/attest-sbom@");
+if (exactReleaseSmoke < 0 || exactReleaseScan < 0 || !publishWorkflow.includes("CONTAINER_SMOKE_NO_BUILD: \"1\"")) {
   errors.push("release publication must smoke-test the exact pushed immutable digests without rebuilding");
 }
-if (exactReleaseScan < 0 || releaseAttestation < 0 || exactReleaseScan > releaseAttestation) {
-  errors.push("release publication must scan pushed digests before attestation");
+if (exactReleaseSmoke < 0 || exactReleaseScan <= exactReleaseSmoke || releaseSbomGeneration < 0 || releaseProvenance < 0 || releaseSbom < 0 || exactReleaseScan > releaseSbomGeneration || exactReleaseScan > releaseProvenance || exactReleaseScan > releaseSbom) {
+  errors.push("release publication must scan pushed digests before SBOM and provenance attestation");
+}
+const releasePreGate = publishWorkflow.slice(0, Math.max(releaseSbomGeneration, 0));
+if (/--provenance=(?!false\b)|--sbom=(?!false\b)|actions\/attest-(?:sbom|build-provenance)@/.test(releasePreGate)) {
+  errors.push("release publication must not produce or attach provenance/SBOM before exact-digest gates");
+}
+const releaseBuilds = [...publishWorkflow.matchAll(/docker buildx build[^\n]*/g)].map(([line]) => line);
+if (releaseBuilds.length !== 4 || releaseBuilds.some((line) => !line.includes("--provenance=false") || !line.includes("--sbom=false"))) {
+  errors.push("web, collector, migrate, and backup release builds must disable Buildx provenance and SBOM before gates");
+}
+const releasePostGate = publishWorkflow.slice(Math.max(releaseSbomGeneration, 0));
+const releaseStepBlock = (name) => {
+  const start = releasePostGate.indexOf("- name: " + name);
+  if (start < 0) return "";
+  const end = releasePostGate.indexOf("\n      - ", start + 1);
+  return releasePostGate.slice(start, end < 0 ? releasePostGate.length : end);
+};
+for (const service of ["web", "collector", "migrate", "backup"]) {
+  const subjectName = "subject-name: ${{ env.IMAGE_PREFIX }}-" + service;
+  const subjectDigest = "subject-digest: ${{ steps." + service + ".outputs.digest }}";
+  const sbomStep = releaseStepBlock("Attest " + service + " SBOM");
+  const provenanceStep = releaseStepBlock("Attest " + service + " provenance");
+  if (!sbomStep.includes("uses: actions/attest-sbom@") || !sbomStep.includes(subjectName) || !sbomStep.includes(subjectDigest) || !sbomStep.includes("sbom-path: ${{ runner.temp }}/tracegarden-release-sbom/" + service + ".spdx.json")) {
+    errors.push(`release SBOM attestation is missing the exact ${service} digest or SBOM`);
+  }
+  if (!provenanceStep.includes("uses: actions/attest-build-provenance@") || !provenanceStep.includes(subjectName) || !provenanceStep.includes(subjectDigest)) {
+    errors.push(`release provenance attestation is missing the exact ${service} digest`);
+  }
+  if (releasePostGate.indexOf("Attest " + service + " SBOM") > releasePostGate.indexOf("Attest " + service + " provenance")) {
+    errors.push(`release attestations are out of order for ${service}`);
+  }
+}
+if ((publishWorkflow.match(/uses: actions\/attest-sbom@[0-9a-f]{40}/g) ?? []).length !== 4 || (publishWorkflow.match(/uses: actions\/attest-build-provenance@[0-9a-f]{40}/g) ?? []).length !== 4) {
+  errors.push("release publication must attach both SBOM and provenance for all four images");
+}
+if (!releasePostGate.includes("--format spdx-json") || !releasePostGate.includes("tracegarden-release-sbom")) {
+  errors.push("release publication must generate SBOMs for exact pushed digests after the gates");
 }
 for (const required of [
   "backup_digest: ${{ steps.backup.outputs.digest }}",
