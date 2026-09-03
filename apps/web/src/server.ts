@@ -826,10 +826,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     let unsubscribe: (() => void) | undefined;
     let stream: SSEStreamingApi | undefined;
     let finishStream = (): void => {};
-    let restoreOutgoingWrite = (): void => {};
     const outgoing = context.env.outgoing;
-    const originalWrite = outgoing.write;
-    let destroyOutgoingOnClose = false;
+    const onOutgoingClose = (): void => client.close();
     const client: LiveSseClient = {
       workspaceId: session.member.workspaceId,
       memberId: session.member.id,
@@ -843,13 +841,15 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
         if (closed) return;
         closed = true;
         liveSseClients.delete(clientId);
+        outgoing.removeListener("close", onOutgoingClose);
+        outgoing.socket?.removeListener("close", onOutgoingClose);
         unsubscribe?.();
-        restoreOutgoingWrite();
         finishStream();
-        if (destroyOutgoingOnClose && !outgoing.destroyed && !outgoing.writableEnded) outgoing.destroy();
-        if (stream && !stream.aborted && !stream.closed) stream.abort();
+        if (stream && !stream.aborted && !stream.closed && !outgoing.destroyed && !outgoing.writableEnded) stream.abort();
       },
     };
+    outgoing.once("close", onOutgoingClose);
+    outgoing.socket?.once("close", onOutgoingClose);
     const sendAuthorizedHint = async (): Promise<void> => {
       if (client.hintCheckInFlight || closed || !client.readySent || !stream) return;
       client.hintCheckInFlight = true;
@@ -887,21 +887,8 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       if (!client.hintQueued) void sendAuthorizedHint();
     };
     liveSseClients.set(clientId, client);
-    const invokeOriginalWrite = originalWrite.bind(outgoing) as (chunk: string | Uint8Array, encoding?: BufferEncoding, callback?: () => void) => boolean;
-    const guardedWrite = (chunk: string | Uint8Array, encoding?: BufferEncoding, callback?: () => void): boolean => {
-      const accepted = invokeOriginalWrite(chunk, encoding, callback);
-      if (!accepted) {
-        destroyOutgoingOnClose = true;
-        client.close();
-      }
-      return accepted;
-    };
-    outgoing.write = guardedWrite as typeof outgoing.write;
-    restoreOutgoingWrite = (): void => {
-      if (outgoing.write === guardedWrite) outgoing.write = originalWrite;
-    };
     const abort = (): void => client.close();
-    context.req.raw.signal.addEventListener("abort", abort, { once: true });
+    context.req.raw.signal?.addEventListener("abort", abort, { once: true });
     try {
       unsubscribe = await timelineNotifications.subscribeTimeline(onNotification);
       if (closed) {

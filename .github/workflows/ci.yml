@@ -19,6 +19,7 @@ env:
   NODE_VERSION: 26.8.1
   PNPM_VERSION: 11.9.0
   NODE_IMAGE: node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89
+  BUN_IMAGE: docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2
   POSTGRES_IMAGE: postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7
   HELM_IMAGE: docker.io/alpine/helm:3.17.3@sha256:d899e6316789fec04ee95300a18e454b7942539cbb3d89bde3e0655d6ca2e895
   KUBECONFORM_IMAGE: ghcr.io/yannh/kubeconform:v0.6.7@sha256:0925177fb05b44ce18574076141b5c3d83235e1904d3f952182ac99ddc45762c
@@ -110,9 +111,35 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
       - run: npm install --global pnpm@${PNPM_VERSION}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
       - run: docker pull --platform linux/arm64 "$NODE_IMAGE"
       - run: docker pull --platform linux/arm64 "$POSTGRES_IMAGE"
+      - run: docker pull --platform linux/arm64 "$BUN_IMAGE"
       - run: pnpm test:container
+      - name: Run Bun compiled-ESM compatibility gate
+        env:
+          BUN_COMPAT_PROJECT: tracegarden-bun-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          BUN_COMPAT_DATABASE_PORT: 45440
+        run: |
+          set -eu
+          bun_container="${BUN_COMPAT_PROJECT}-postgres"
+          docker run --pull=never -d --name "$bun_container" -p "127.0.0.1:${BUN_COMPAT_DATABASE_PORT}:5432" \
+            -e POSTGRES_DB=tracegarden -e POSTGRES_USER=tracegarden -e POSTGRES_PASSWORD=local-only "$POSTGRES_IMAGE"
+          cleanup() { docker rm -f "$bun_container" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          for attempt in $(seq 1 60); do
+            if docker exec "$bun_container" pg_isready -U tracegarden -d tracegarden >/dev/null 2>&1; then break; fi
+            if [ "$attempt" = 60 ]; then exit 1; fi
+            sleep 0.5
+          done
+          docker run --rm --pull=never --platform linux/arm64 --network host --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
+            -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
+            -e BUN_COMPAT_DATABASE_URL="postgresql://tracegarden:local-only@127.0.0.1:${BUN_COMPAT_DATABASE_PORT}/tracegarden" \
+            -e BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/bun-compat-cache \
+            -e BUN_COMPAT_EXPECT_CONTAINER_BOUNDARY=1 \
+            "$BUN_IMAGE" scripts/bun-compatibility.mjs
       - name: Scan built images for actionable CVEs
         run: |
           set -eu

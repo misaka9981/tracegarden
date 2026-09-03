@@ -1152,13 +1152,16 @@ if (liveObservation) {
 }
 unsubscribeLiveTimeline();
 const backpressureDatabase = await readyMemoryDatabase();
+await configureClusterScope(ownerMember, backpressureDatabase.clusterScope, scopeInput);
 let backpressureSubscriptions = 0;
+let backpressureCleanupCalls = 0;
 const originalSubscribeTimeline = backpressureDatabase.timeline?.subscribeTimeline?.bind(backpressureDatabase.timeline);
 if (originalSubscribeTimeline && backpressureDatabase.timeline) {
   backpressureDatabase.timeline.subscribeTimeline = async (listener) => {
     backpressureSubscriptions += 1;
     const unsubscribe = await originalSubscribeTimeline(listener);
     return () => {
+      backpressureCleanupCalls += 1;
       backpressureSubscriptions -= 1;
       unsubscribe();
     };
@@ -1172,14 +1175,17 @@ const backpressureRuntime = await createWebRuntime({
 });
 const backpressureBaselineSubscriptions = backpressureSubscriptions;
 const originalResponseWrite = ServerResponse.prototype.write;
-let forceBackpressure = false;
+let backpressureWritePending = false;
 let backpressureWriteObserved = false;
 ServerResponse.prototype.write = function (...args) {
-  if (forceBackpressure) {
+  const accepted = originalResponseWrite.apply(this, args);
+  if (backpressureWritePending) {
+    backpressureWritePending = false;
     backpressureWriteObserved = true;
+    setImmediate(() => this.emit("drain"));
     return false;
   }
-  return originalResponseWrite.apply(this, args);
+  return accepted;
 };
 try {
   const backpressureLogin = await fetch("http://127.0.0.1:43209/auth/login", {
@@ -1188,36 +1194,60 @@ try {
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: "identity=owner&lang=en",
   });
-  forceBackpressure = true;
+  backpressureWritePending = true;
+  const backpressureRequestAbort = new AbortController();
   const backpressureStream = await fetch("http://127.0.0.1:43209/api/timeline/stream", {
     headers: { cookie: backpressureLogin.headers.get("set-cookie") ?? "" },
+    signal: backpressureRequestAbort.signal,
   });
   assert.equal(backpressureStream.status, 200);
+  assert.ok(backpressureStream.body);
+  const backpressureReader = backpressureStream.body.getReader();
+  const backpressureReady = await backpressureReader.read();
+  assert.equal(backpressureReady.done, false);
+  assert.match(new TextDecoder().decode(backpressureReady.value), /event: ready/);
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(backpressureWriteObserved, true);
-  for (let attempt = 0; attempt < 20 && backpressureSubscriptions !== backpressureBaselineSubscriptions; attempt += 1) {
+  assert.equal(backpressureSubscriptions, backpressureBaselineSubscriptions + 1);
+  const backpressureNotification = await backpressureDatabase.timeline.recordObservation(normalizePodObservation(savedScope, {
+    kind: "Pod",
+    metadata: { name: "backpressure-notification", namespace: "tracegarden", uid: "backpressure-notification", resourceVersion: "1" },
+    status: { phase: "Running" },
+  }, "2099-01-01T00:00:00.000Z"));
+  let backpressureTimelineBody = "";
+  let backpressureReadTimeout;
+  const backpressureTimelineRead = await Promise.race([
+    (async () => {
+      for (;;) {
+        const { done, value } = await backpressureReader.read();
+        if (done) return { done: true, value: undefined };
+        backpressureTimelineBody += new TextDecoder().decode(value);
+        if (backpressureTimelineBody.includes("event: timeline")) return { done: false, value };
+      }
+    })(),
+    new Promise((_, reject) => {
+      backpressureReadTimeout = setTimeout(() => reject(new Error("SSE timeline notification did not arrive after drain")), 1_000);
+    }),
+  ]).finally(() => clearTimeout(backpressureReadTimeout));
+  assert.equal(backpressureTimelineRead.done, false);
+  assert.match(backpressureTimelineBody, /event: timeline/);
+  assert.match(backpressureTimelineBody, new RegExp(`\\"entryId\\":\\"${backpressureNotification.entry.id}\\"`));
+  assert.equal(backpressureSubscriptions, backpressureBaselineSubscriptions + 1);
+  backpressureReader.releaseLock();
+  const backpressureAbort = new AbortController();
+  const backpressureBodyDone = backpressureStream.body.pipeTo(new WritableStream(), { signal: backpressureAbort.signal }).catch(() => undefined);
+  backpressureRequestAbort.abort();
+  backpressureAbort.abort();
+  await backpressureBodyDone;
+  for (let attempt = 0; attempt < 20 && (backpressureSubscriptions !== backpressureBaselineSubscriptions || backpressureCleanupCalls !== 1); attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.equal(backpressureSubscriptions, backpressureBaselineSubscriptions);
-  const backpressureMetrics = await fetch("http://127.0.0.1:43209/metrics");
-  assert.match(await backpressureMetrics.text(), /tracegarden_sse_clients 0/);
-  const backpressureReader = backpressureStream.body?.getReader();
-  assert.ok(backpressureReader);
-  const backpressureBodyClosed = await new Promise((resolve) => {
-    const timeout = setTimeout(() => resolve(false), 1000);
-    const readUntilClosed = async () => {
-      for (;;) {
-        const { done } = await backpressureReader.read();
-        if (done) return true;
-      }
-    };
-    void readUntilClosed().then(
-      (closed) => { clearTimeout(timeout); resolve(closed); },
-      () => { clearTimeout(timeout); resolve(true); },
-    );
-  });
-  assert.equal(backpressureBodyClosed, true, "backpressure must close the response body");
+  assert.equal(backpressureCleanupCalls, 1, "explicit SSE close must clean exactly once");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(backpressureCleanupCalls, 1);
 } finally {
-  forceBackpressure = false;
+  backpressureWritePending = false;
   ServerResponse.prototype.write = originalResponseWrite;
   await backpressureRuntime.close();
 }
