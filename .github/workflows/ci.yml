@@ -36,6 +36,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - run: node scripts/delivery-policy.mjs
 
   static:
@@ -50,6 +51,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - run: npm install --global pnpm@${PNPM_VERSION}
       - run: pnpm install --frozen-lockfile
       - run: pnpm env:check
@@ -71,6 +73,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
           bun-version: 1.4.0
@@ -91,6 +94,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
           bun-version: 1.4.0
@@ -114,6 +118,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - run: npm install --global pnpm@${PNPM_VERSION}
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
@@ -199,6 +204,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - run: npm install --global pnpm@${PNPM_VERSION}
       - name: Provision checksummed local Kubernetes schemas
         run: |
@@ -256,6 +262,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - run: npm install --global pnpm@${PNPM_VERSION}
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
@@ -458,6 +465,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - run: npm install --global pnpm@${PNPM_VERSION}
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --audit-level=high
@@ -500,6 +508,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - run: npm install --global pnpm@${PNPM_VERSION}
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
@@ -723,6 +732,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: false
+          package-manager-cache: false
       - run: npm install --global pnpm@${PNPM_VERSION}
       - run: pnpm install --frozen-lockfile
       - name: Validate reviewable promotion proposal
