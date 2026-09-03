@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { dump, loadAll } from "js-yaml";
 
-const schemaDirectory = resolve(process.argv[2] ?? ".ci/kubeconform-schemas/v1.31.0-standalone-strict");
+const schemaDirectory = process.argv[2] ?? ".ci/kubeconform-schemas/v1.31.0-standalone-strict";
 const schemaFiles = {
   "ConfigMap/v1": "configmap-v1.json",
   "CronJob/batch/v1": "cronjob-batch-v1.json",

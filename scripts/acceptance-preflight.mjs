@@ -71,6 +71,7 @@ assert.match(acceptance, /\["deterministic collector failure and recovery suites
 assert.match(workflow, /\$BUN_IMAGE\" scripts\/collector-resilience\.mjs/);
 assert.match(workflow, /\$BUN_IMAGE\" scripts\/migrate-bun-smoke\.mjs/);
 assert.match(workflow, /\$BUN_IMAGE\" scripts\/backup-test\.mjs/);
+assert.match(workflow, /KUBECONFORM_SCHEMA_LOCATION:\s+\$\{\{ github\.workspace \}\}\/\.ci\/kubeconform-schemas\/v1\.31\.0-standalone-strict\//, "workflow must use the provisioned workspace schema directory");
 for (const required of ["--no-cache", "--network", "none", "--pull=false", "container-context.mjs", "--load", "--pull=never", "--read-only", "pg_dump", "pg_restore", "id", "--version"]) {
   assert.match(cleanCacheBuild, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `clean-cache build must include ${required}`);
 }

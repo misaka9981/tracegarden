@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url)));
 assert.match(packageJson.scripts["chart:render"], /KUBECONFIG=\/dev\/null helm template/);
@@ -125,7 +125,7 @@ assert.match(deployments, /automountServiceAccountToken: true/);
 assert.match(deployments, /serviceAccountName: .*logsServiceAccount/);
 assert.match(deployments, /serviceAccountName: .*observationServiceAccount/);
 
-const schemaDirectory = resolve(process.cwd(), ".ci/kubeconform-schemas/v1.31.0-standalone-strict");
+const schemaDirectory = ".ci/kubeconform-schemas/v1.31.0-standalone-strict";
 assert.equal((kubeconformAdapter.match(/"[^"]+": "[^"]+\.json"/g) ?? []).length, 14, "adapter must cover every checked-in schema");
 
 function renderChart(extraArgs = []) {
