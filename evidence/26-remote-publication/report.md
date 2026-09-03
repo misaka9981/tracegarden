@@ -20,7 +20,7 @@ The sanitized command/result record is retained at `evidence/26-remote-publicati
 - `v0.1.0` was recreated once after the final pre-release validation and points to `6ee9a5f33fc16541fe0054dec29bd682075816e2` both locally and on `origin`. It is the only release/tag recreation in this final successful attempt; no force-push or mutable tag was used.
 - Release workflow: `33808214530`.
 - Protected publication job: `100824381992`, approved normally through environment `production` (`21157164002`).
-- The final post-release metadata commit contains only this report and Ticket 26 metadata. A `git diff-tree` comparison from the tagged runtime/publication source was checked before push; no runtime-bearing source was changed after the published commit.
+- The final post-release metadata commit contains only this report, its sanitized transcript, and Ticket 26 metadata. A `git diff-tree` comparison from the tagged runtime/publication source was checked before push; no runtime-bearing source was changed after the published commit.
 
 ## Published immutable images
 
