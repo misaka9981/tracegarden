@@ -6,6 +6,8 @@ const nodeImage = "node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8
 const bunImage = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
 const smokeScripts = ["scripts/browser-smoke.mjs", "scripts/postgres-smoke.mjs", "scripts/core-loop-browser.mjs"];
 const acceptanceDocs = await readFile("docs/acceptance.md", "utf8");
+const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+const workflow = await readFile(".github/workflows/ci.yml", "utf8");
 const compose = await readFile("docker-compose.yml", "utf8");
 const containerSmoke = await readFile("scripts/container-smoke.mjs", "utf8");
 const containerContext = await readFile("scripts/container-context.mjs", "utf8");
@@ -17,6 +19,11 @@ for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Doc
   assert.match(dockerfile, /COPY --from=frozen \/dist\//, `${path} must consume the generated frozen build context`);
   assert.doesNotMatch(dockerfile, /(?:npm|pnpm) (?:install|add|fetch)/, `${path} must not contact a package registry`);
 }
+const collectorDockerfile = await readFile("deploy/docker/collector.Dockerfile", "utf8");
+assert.ok(collectorDockerfile.startsWith(`FROM ${bunImage}\n`), "collector must use the pinned Bun base image");
+assert.match(collectorDockerfile, /USER bun/);
+assert.match(collectorDockerfile, /CMD \["bun", "dist\/apps\/collector\/src\/main\.js"\]/);
+assert.doesNotMatch(collectorDockerfile, /node:26|USER node|CMD \["node"/i, "collector image must not retain a Node runtime");
 assert.equal((compose.match(/network: none/g) ?? []).length, 3, "application image builds must use network none");
 assert.equal((compose.match(/frozen: \$\{TRACEGARDEN_CONTAINER_CONTEXT/g) ?? []).length, 3, "application image builds must use the generated frozen context");
 assert.match(containerSmoke, /container-context\.mjs/);
@@ -31,6 +38,8 @@ assert.match(containerSmoke, /up\", \"-d\", \"--pull\", \"never\", \"--no-build\
 assert.match(cleanCachePolicy, /--offline/);
 assert.match(cleanCachePolicy, /unexpectedly succeeded/);
 assert.match(acceptance, /scripts\/container-clean-cache\.mjs/);
+assert.match(packageJson.scripts["test:bun"], /bun scripts\/collector-resilience\.mjs/);
+assert.match(workflow, /\$BUN_IMAGE\" scripts\/collector-resilience\.mjs/);
 for (const required of ["--no-cache", "--network", "none", "--pull=false", "container-context.mjs", "--load", "--pull=never", "--read-only", "pg_dump", "pg_restore", "id", "--version"]) {
   assert.match(cleanCacheBuild, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `clean-cache build must include ${required}`);
 }

@@ -140,6 +140,10 @@ jobs:
             -e BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/bun-compat-cache \
             -e BUN_COMPAT_EXPECT_CONTAINER_BOUNDARY=1 \
             "$BUN_IMAGE" scripts/bun-compatibility.mjs
+          docker run --rm --pull=never --platform linux/arm64 --network host --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
+            -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
+            "$BUN_IMAGE" scripts/collector-resilience.mjs
       - name: Scan built images for actionable CVEs
         run: |
           set -eu
@@ -244,6 +248,7 @@ jobs:
       - run: pnpm build
       - run: node scripts/container-context.mjs
       - run: docker pull --platform linux/arm64 "$NODE_IMAGE"
+      - run: docker pull --platform linux/arm64 "$BUN_IMAGE"
       - name: Verify preview publication namespace configuration
         run: test "$GHCR_NAMESPACE" = misaka3389 && test "$GHCR_NAMESPACE" = "${GHCR_NAMESPACE,,}"
       - name: Login to the configured private GHCR namespace
@@ -349,6 +354,7 @@ jobs:
       - run: pnpm build
       - run: node scripts/container-context.mjs
       - run: docker pull --platform linux/arm64 "$NODE_IMAGE"
+      - run: docker pull --platform linux/arm64 "$BUN_IMAGE"
       - name: Verify publication namespace configuration
         run: test "$GHCR_NAMESPACE" = "${GHCR_NAMESPACE,,}"
       - name: Login to the configured private GHCR namespace

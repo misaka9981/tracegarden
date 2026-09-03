@@ -1134,6 +1134,10 @@ function watchCompletionError(value: unknown): Error {
   });
 }
 
+function isWatchAbortError(value: unknown): boolean {
+  return value instanceof DOMException && value.name === "AbortError";
+}
+
 export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter {
   readonly kind = "production" as const;
   contacted = false;
@@ -1286,7 +1290,9 @@ export class ConfiguredKubernetesAdapter implements KubernetesObservationAdapter
     const finish = (error?: unknown): void => {
       if (complete) return;
       complete = true;
-      if (error !== undefined && error !== null) failure = watchCompletionError(error);
+      if (error !== undefined && error !== null && !(signal?.aborted && isWatchAbortError(error))) {
+        failure = watchCompletionError(error);
+      }
       wake?.();
       wake = null;
     };

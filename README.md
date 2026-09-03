@@ -29,13 +29,13 @@ Run the status page without a database for a local HTTP smoke run:
 NODE_ENV=test DATABASE_MODE=memory pnpm start
 ```
 
-For PostgreSQL-backed development, copy `.env.example`, start `postgres:18.3-alpine` with `docker compose up -d postgres`, and run the web process with `DATABASE_URL` set. `pnpm db:migrate` applies the repository-owned migrations after a build. The production Compose path builds ARM64-pinned web, collector, and one-shot migration images; web and collector wait for the migration gate, verify its committed state without running migrations, and still fail closed if migrations or readiness checks fail. Both application images run as `node` with a read-only root and `/tmp` as their only writable filesystem. Start the independent collector with `DATABASE_URL` set; without explicit Kubernetes settings its adapter remains inert and does not contact a Cluster.
+For PostgreSQL-backed development, copy `.env.example`, start `postgres:18.3-alpine` with `docker compose up -d postgres`, and run the web process with `DATABASE_URL` set. `pnpm db:migrate` applies the repository-owned migrations after a build. The production Compose path builds ARM64-pinned web, collector, and one-shot migration images; web and collector wait for the migration gate, verify its committed state without running migrations, and still fail closed if migrations or readiness checks fail. The web and migration images run as `node`, while the collector runs as pinned Bun `1.3.14`; all application images use a read-only root and `/tmp` as their only writable filesystem. Start the independent collector with `DATABASE_URL` set; without explicit Kubernetes settings its adapter remains inert and does not contact a Cluster.
 
 `pnpm env:check` requires Node.js 26.8.x and validates production database and `TIMELINE_CURSOR_SECRET` configuration. The current development host may report this check as unavailable until Node 26 is installed.
 
 ## Agreed baseline
 
-- The current implementation uses Node.js 26.8.x, ESM, and TypeScript 7.0.2; Bun is the production-runtime target for a later, per-process migration with Node retained as the rollback runtime.
+- The current implementation uses Node.js 26.8.x for web/migration/backup, Bun 1.3.14 for the collector, ESM, and TypeScript 7.0.2; the prior Node collector image remains its rollback runtime.
 - pnpm workspaces and Turborepo task metadata remain the development workspace.
 - The current web uses Node `node:http`, server-rendered HTML, native forms, and a small `fetch`/`EventSource` client. Hono is the target web transport and Hono JSX may structure those views without React or hydration.
 - PostgreSQL 18 and the repository-owned `pg` migration/data boundary remain unchanged.

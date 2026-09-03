@@ -1,4 +1,4 @@
-FROM node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89
+FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=frozen /dist/apps/collector ./dist/apps/collector
@@ -7,6 +7,6 @@ COPY --from=frozen /node_modules ./node_modules
 RUN find /app/dist -type f \( -name '*.d.ts' -o -name '*.d.ts.map' -o -name '*.js.map' \) -delete \
   && rm -rf /app/node_modules/.bin /app/node_modules/.pnpm/node_modules/.bin /app/node_modules/.pnpm/node_modules/@typescript \
   && find /app/node_modules -type l -xtype l -delete
-USER node
+USER bun
 EXPOSE 3001
-CMD ["node", "dist/apps/collector/src/main.js"]
+CMD ["bun", "dist/apps/collector/src/main.js"]

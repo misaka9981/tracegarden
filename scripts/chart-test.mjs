@@ -74,6 +74,8 @@ assert.match(migration, /MIGRATION_DATABASE_READY_RETRY_SECONDS/);
 assert.match(migration, /databaseReadyTimeoutSeconds/);
 assert.match(migration, /databaseReadyRetrySeconds/);
 assert.match(deployments, /initContainers:/);
+assert.match(deployments, /command: \["node", "--input-type=module", "--eval"\]/);
+assert.match(deployments, /command: \["bun", "--input-type=module", "--eval"\]/);
 assert.match(deployments, /wait-for-schema/);
 assert.match(deployments, /MIGRATION_SCHEMA_READY_TIMEOUT_SECONDS/);
 assert.match(deployments, /MIGRATION_SCHEMA_READY_RETRY_SECONDS/);

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 
 const context = process.env.TRACEGARDEN_CONTAINER_CONTEXT?.trim() || ".scratch/container-context";
 const nodeImage = "node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89";
+const bunImage = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
 const postgresImage = "postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7";
 const builds = [
   ["web", "deploy/docker/web.Dockerfile", true],
@@ -25,6 +26,7 @@ function requireImage(image) {
 }
 
 requireImage(nodeImage);
+requireImage(bunImage);
 requireImage(postgresImage);
 execFileSync(process.execPath, ["scripts/container-context.mjs"], { stdio: "inherit" });
 for (const [service, dockerfile, frozen] of builds) {
@@ -36,6 +38,24 @@ for (const [service, dockerfile, frozen] of builds) {
   ];
   try {
     docker(args);
+    if (service === "collector") {
+      if (dockerOutput(["image", "inspect", "-f", "{{.Config.User}}", tag]) !== "bun") {
+        throw new Error("clean-cache collector image must use the non-root bun user");
+      }
+      if (dockerOutput(["image", "inspect", "-f", "{{.Architecture}}", tag]) !== "arm64") {
+        throw new Error("clean-cache collector image must be ARM64");
+      }
+      const runArgs = [
+        "run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "bun",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL",
+      ];
+      if (dockerOutput([...runArgs, "--entrypoint", "bun", tag, "--version"]) !== "1.3.14") {
+        throw new Error("clean-cache collector image must run Bun 1.3.14");
+      }
+      if (dockerOutput([...runArgs, "--entrypoint", "sh", tag, "-c", "test ! -e /usr/local/bin/node"]) !== "") {
+        throw new Error("clean-cache collector image must not contain a Node runtime");
+      }
+    }
     if (service === "backup") {
       if (dockerOutput(["image", "inspect", "-f", "{{.Config.User}}", tag]) !== "node") {
         throw new Error("clean-cache backup image must use the non-root node user");

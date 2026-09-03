@@ -240,6 +240,35 @@ try {
   Watch.prototype.watch = originalWatch;
 }
 
+const configuredCancellationController = new AbortController();
+let configuredCancellationControllerReturned;
+let configuredCancellationWatchCount = 0;
+let configuredCancellationCleanupCount = 0;
+Watch.prototype.watch = async (_path, _query, _callback, done) => {
+  configuredCancellationWatchCount += 1;
+  configuredCancellationControllerReturned = new AbortController();
+  configuredCancellationControllerReturned.signal.addEventListener("abort", () => {
+    configuredCancellationWatchCount -= 1;
+    configuredCancellationCleanupCount += 1;
+    done(new DOMException("aborted", "AbortError"));
+  }, { once: true });
+  return configuredCancellationControllerReturned;
+};
+try {
+  const stream = await configuredAdapter.watch(productionWatchScope, "1", configuredCancellationController.signal);
+  const iteration = stream[Symbol.asyncIterator]();
+  const pendingIteration = iteration.next();
+  await Promise.resolve();
+  assert.equal(configuredCancellationWatchCount, 1);
+  configuredCancellationController.abort();
+  assert.equal((await pendingIteration).done, true);
+  assert.equal(configuredCancellationControllerReturned?.signal.aborted, true);
+  assert.equal(configuredCancellationCleanupCount, 1);
+  assert.equal(configuredCancellationWatchCount, 0);
+} finally {
+  Watch.prototype.watch = originalWatch;
+}
+
 Watch.prototype.watch = async (_path, _query, callback) => {
   for (let index = 0; index <= KUBERNETES_WATCH_BUFFER_LIMIT; index += 1) {
     callback("BOOKMARK", { metadata: { resourceVersion: String(index) } }, {});

@@ -137,6 +137,10 @@ for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Doc
   const bases = [...source.matchAll(/^FROM\s+(\S+)/gm)].map(([, image]) => image);
   if (!bases.length || bases.some((image) => !immutableDigest.test(image))) errors.push(`${path}: every base image must be digest-pinned`);
 }
+const collectorDockerfile = await readFile("deploy/docker/collector.Dockerfile", "utf8");
+if (!collectorDockerfile.startsWith("FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2\n")) errors.push("collector Dockerfile must use the pinned Bun 1.3.14 base");
+if (!collectorDockerfile.includes('USER bun') || !collectorDockerfile.includes('CMD ["bun", "dist/apps/collector/src/main.js"]')) errors.push("collector Dockerfile must run as Bun without a Node entrypoint");
+if (/^FROM\s+node:/m.test(collectorDockerfile) || /CMD \["node"/.test(collectorDockerfile)) errors.push("collector Dockerfile must not retain a Node runtime");
 const backupDockerfile = await readFile("deploy/docker/backup.Dockerfile", "utf8");
 const backupScript = await readFile("scripts/backup.mjs", "utf8");
 if (/apt-get|awscli|spawn\(\s*["']aws["']/.test(backupDockerfile) || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_dump") || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_restore")) {

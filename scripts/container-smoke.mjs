@@ -7,6 +7,7 @@ const backupSmoke = process.env.CONTAINER_SMOKE_BACKUP === "1";
 const invalidUrlProject = `${project}-invalid-url`;
 const schemaFailureProject = `${project}-schema-failure`;
 const nodeImage = "node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89";
+const bunImage = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
 const postgresImage = "postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7";
 const environment = { ...process.env, COMPOSE_PROJECT_NAME: project, POSTGRES_PORT: "0" };
 
@@ -30,8 +31,8 @@ function expectFailure(args, extraEnvironment = environment) {
   }
 }
 
-if (!imageAvailable(nodeImage) || !imageAvailable(postgresImage)) {
-  throw new Error("container smoke requires the pinned Node.js 26 and PostgreSQL images; refusing to report a skipped check as passed");
+if (!imageAvailable(nodeImage) || !imageAvailable(bunImage) || !imageAvailable(postgresImage)) {
+  throw new Error("container smoke requires the pinned Node.js 26, Bun, and PostgreSQL images; refusing to report a skipped check as passed");
 }
 
 function compose(args, composeProject = project, extraEnvironment = environment) {
@@ -90,7 +91,8 @@ try {
 
   for (const service of ["web", "collector"]) {
     const container = compose(["ps", "-q", service]);
-    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", container]), "node");
+    const runtimeUser = service === "collector" ? "bun" : "node";
+    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", container]), runtimeUser);
     assert.match(compose(["exec", "-T", service, "id", "-u"]), /^[1-9]\d*$/);
     assert.match(compose(["exec", "-T", service, "id", "-g"]), /^[1-9]\d*$/);
     assert.equal(docker(["inspect", "-f", "{{.HostConfig.ReadonlyRootfs}}", container]), "true");
@@ -101,7 +103,12 @@ try {
     assert.match(imageId, /^sha256:[a-f0-9]{64}$/);
     assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", imageId]), "arm64");
     assert.doesNotMatch(docker(["image", "inspect", "-f", "{{json .Config.Env}}", imageId]), /GOOGLE|KUBERNETES/);
-    assert.match(compose(["exec", "-T", service, "node", "--version"]), /^v26\.8\.\d+$/);
+    if (service === "collector") {
+      assert.equal(compose(["exec", "-T", service, "bun", "--version"]), "1.3.14");
+      assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /usr/local/bin/node"]), "");
+    } else {
+      assert.match(compose(["exec", "-T", service, "node", "--version"]), /^v26\.8\.\d+$/);
+    }
     assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /app/apps && test ! -e /app/scripts && test ! -e /app/.env && test ! -e /app/node_modules/.pnpm/node_modules/.bin && test ! -e /app/node_modules/.pnpm/node_modules/@typescript"]), "");
     assert.equal(expectFailure(["compose", "-p", project, "exec", "-T", service, "sh", "-c", "touch /app/.write-test"]), true);
     assert.equal(compose(["exec", "-T", service, "sh", "-c", "touch /tmp/.write-test && rm /tmp/.write-test"]), "");
@@ -182,7 +189,7 @@ try {
   );
   const imageFile = process.env.CONTAINER_SMOKE_IMAGE_FILE?.trim();
   if (imageFile) await writeFile(imageFile, `${Object.entries(imageIds).map(([service, imageId]) => `${service}=${imageId}`).join("\n")}\n`);
-  console.log("ARM64 Node 26.8.x non-root read-only web, collector, migration gate, invalid-URL, and schema-failure smoke passed");
+  console.log("ARM64 Node 26.8.x web and Bun 1.3.14 collector non-root read-only, migration gate, invalid-URL, and schema-failure smoke passed");
 } finally {
   try { compose(["down", "-v"]); } catch { /* preserve the original failure */ }
 }
