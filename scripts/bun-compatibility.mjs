@@ -520,9 +520,10 @@ try {
   });
   assert.equal(backupResult.retentionDays, 7);
   assert.deepEqual(backup.decryptBackupBuffer(uploadedArtifact, key), Buffer.from("bun-backup-payload"));
-  const fakePgDump = join(temporaryDirectory, "pg_dump.mjs");
-  await writeFile(fakePgDump, "process.stdout.write('bun-pg-dump')\n");
-  const dumped = await backup.runPgDump(databaseUrl, process.env, { command: "bun", commandArgs: [fakePgDump] });
+  const dumped = await backup.runPgDump(databaseUrl, { ...process.env, PATH: `/usr/local/bin:${process.env.PATH ?? ""}` }, {
+    command: "bun",
+    commandArgs: ["-e", "process.stdout.write('bun-pg-dump')"],
+  });
   assert.equal(dumped.toString(), "bun-pg-dump");
   assert.equal(createHash("sha256").update(uploadedArtifact).digest().length, 32);
 
