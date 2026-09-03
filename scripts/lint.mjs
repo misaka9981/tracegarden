@@ -16,7 +16,7 @@ async function visit(directory) {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) await visit(path);
-    else if (path.endsWith(".ts") || path.endsWith(".mjs")) sourceFiles.push(path);
+    else if (path.endsWith(".ts") || path.endsWith(".tsx") || path.endsWith(".mjs")) sourceFiles.push(path);
   }
 }
 

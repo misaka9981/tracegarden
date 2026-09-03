@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 const write = process.argv.includes("--write");
 const roots = ["apps", "packages", "scripts", "types"];
-const extensions = new Set([".ts", ".mjs", ".json", ".yaml", ".yml", ".css", ".sql"]);
+const extensions = new Set([".ts", ".tsx", ".mjs", ".json", ".yaml", ".yml", ".css", ".sql"]);
 
 async function filesIn(directory) {
   const entries = await readdir(directory, { withFileTypes: true });

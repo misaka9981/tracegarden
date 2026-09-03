@@ -3,7 +3,7 @@ import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { ServerResponse } from "node:http";
 import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
-import { createWebRuntime, renderApplicationPage, renderStatusPage } from "../dist/apps/web/src/server.js";
+import { createWebRuntime, renderApplicationPage, renderLoginPage, renderStatusPage } from "../dist/apps/web/src/server.js";
 import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError, parseTimelineNotification, probePostgresReadiness, waitForDatabase, waitForMigrations } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LastWorkspaceOwnerError, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
@@ -69,6 +69,14 @@ assert.match(renderStatusPage("en", true), /Application status/);
 assert.ok(!renderStatusPage("en", true).includes("DATABASE_URL"));
 
 const identityAdapter = new LocalIdentityAdapter();
+const escapingLoginPage = renderLoginPage("en", true, new LocalIdentityAdapter([{
+  key: "escaped",
+  email: "escaped@example.test",
+  displayName: "<img src=x onerror=alert(1)>",
+}]), "<script>alert(1)</script>");
+assert.match(escapingLoginPage, /&lt;img src=x onerror=alert\(1\)&gt;/);
+assert.match(escapingLoginPage, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+assert.doesNotMatch(escapingLoginPage, /<img|<script>alert/);
 const googleEnvironment = {
   NODE_ENV: "production",
   GOOGLE_CLIENT_ID: "test-client",

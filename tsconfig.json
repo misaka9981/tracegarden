@@ -3,6 +3,8 @@
     "target": "ES2024",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "jsx": "react-jsx",
+    "jsxImportSource": "hono/jsx",
     "lib": ["ES2024", "DOM"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
@@ -21,6 +23,6 @@
     "declarationMap": true,
     "noEmitOnError": true
   },
-  "include": ["apps/**/*.ts", "packages/**/*.ts", "types/**/*.d.ts"],
+  "include": ["apps/**/*.ts", "apps/**/*.tsx", "packages/**/*.ts", "types/**/*.d.ts"],
   "exclude": ["dist", "node_modules"]
 }
