@@ -75,7 +75,7 @@ const exactReleaseSmoke = publishWorkflow.indexOf("Smoke-test exact published di
 const exactReleaseScan = publishWorkflow.indexOf("Scan exact published digests before attestation");
 const releaseSbomGeneration = publishWorkflow.indexOf("Generate SBOMs for exact published digests");
 const releaseProvenance = publishWorkflow.indexOf("actions/attest-build-provenance@");
-const releaseSbom = publishWorkflow.indexOf("actions/attest-sbom@");
+const releaseSbom = publishWorkflow.indexOf("actions/attest@");
 if (exactReleaseSmoke < 0 || exactReleaseScan < 0 || !publishWorkflow.includes("CONTAINER_SMOKE_NO_BUILD: \"1\"")) {
   errors.push("release publication must smoke-test the exact pushed immutable digests without rebuilding");
 }
@@ -105,7 +105,7 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
   const subjectDigest = "subject-digest: ${{ steps." + service + ".outputs.digest }}";
   const sbomStep = releaseStepBlock("Attest " + service + " SBOM");
   const provenanceStep = releaseStepBlock("Attest " + service + " provenance");
-  if (!sbomStep.includes("uses: actions/attest-sbom@") || !sbomStep.includes(subjectName) || !sbomStep.includes(subjectDigest) || !sbomStep.includes("sbom-path: ${{ runner.temp }}/tracegarden-release-sbom/" + service + ".spdx.json")) {
+  if (!sbomStep.includes("uses: actions/attest@") || !sbomStep.includes(subjectName) || !sbomStep.includes(subjectDigest) || !sbomStep.includes("sbom-path: ${{ github.workspace }}/.scratch/tracegarden-release-sbom/" + service + ".spdx.json")) {
     errors.push(`release SBOM attestation is missing the exact ${service} digest or SBOM`);
   }
   if (!provenanceStep.includes("uses: actions/attest-build-provenance@") || !provenanceStep.includes(subjectName) || !provenanceStep.includes(subjectDigest)) {
@@ -115,11 +115,14 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
     errors.push(`release attestations are out of order for ${service}`);
   }
 }
-if ((publishWorkflow.match(/uses: actions\/attest-sbom@[0-9a-f]{40}/g) ?? []).length !== 4 || (publishWorkflow.match(/uses: actions\/attest-build-provenance@[0-9a-f]{40}/g) ?? []).length !== 4) {
+if ((publishWorkflow.match(/uses: actions\/attest@[0-9a-f]{40}/g) ?? []).length !== 4 || (publishWorkflow.match(/uses: actions\/attest-build-provenance@[0-9a-f]{40}/g) ?? []).length !== 4) {
   errors.push("release publication must attach both SBOM and provenance for all four images");
 }
 if (!releasePostGate.includes("--format spdx-json") || !releasePostGate.includes("tracegarden-release-sbom")) {
   errors.push("release publication must generate SBOMs for exact pushed digests after the gates");
+}
+if (!releasePostGate.includes('sbom_dir="$GITHUB_WORKSPACE/.scratch/tracegarden-release-sbom"') || !releasePostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !releasePostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
+  errors.push("release publication must stat, parse, and retain each SBOM before attestation");
 }
 for (const required of [
   "backup_digest: ${{ steps.backup.outputs.digest }}",
@@ -156,6 +159,9 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
 }
 if (!previewWorkflow.includes("backup_digest: ${{ steps.backup.outputs.digest }}") || !previewWorkflow.includes("BACKUP_REPOSITORY=\"${IMAGE_PREFIX}-backup\"") || !previewWorkflow.includes("BACKUP_DIGEST=\"${{ steps.backup.outputs.digest }}\"")) {
   errors.push("preview publication must carry the exact backup digest into its artifact outputs");
+}
+if (!previewPostGate.includes('sbom_dir="$GITHUB_WORKSPACE/.scratch/tracegarden-preview-sbom"') || !previewPostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !previewPostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
+  errors.push("preview publication must stat and parse each SBOM before attestation");
 }
 if (/--platform linux\/arm64/.test(workflowText) && !workflowText.includes("runs-on: ubuntu-24.04-arm")) {
   errors.push("ARM64 builds require a native ARM runner or immutable-pinned QEMU setup");

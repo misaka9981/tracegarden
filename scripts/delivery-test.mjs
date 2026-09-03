@@ -43,11 +43,14 @@ const sbomGeneration = publishWorkflow.indexOf("Generate SBOMs for exact publish
 assert.ok(smokeGate >= 0 && cveGate > smokeGate && sbomGeneration > cveGate, "release gates must precede SBOM generation");
 const preGatePublication = publishWorkflow.slice(0, sbomGeneration);
 assert.doesNotMatch(preGatePublication, /--provenance=(?!false\b)|--sbom=(?!false\b)|actions\/attest-(?:sbom|build-provenance)@/, "release publication must not attest before exact-digest gates");
+assert.ok(publishWorkflow.includes('sbom_dir="$GITHUB_WORKSPACE/.scratch/tracegarden-release-sbom"'));
+assert.ok(publishWorkflow.includes('test -s "$sbom_dir/${service}.spdx.json"'));
+assert.ok(publishWorkflow.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'"));
 const releaseBuilds = [...publishWorkflow.matchAll(/docker buildx build[^\n]*/g)].map(([line]) => line);
 assert.equal(releaseBuilds.length, 4, "release must build web, collector, migrate, and backup");
 assert.ok(releaseBuilds.every((line) => line.includes("--provenance=false") && line.includes("--sbom=false") && line.includes("--network none") && line.includes("--pull=false")), "all release builds must disable attestations, network access, and pulls");
 const postGatePublication = publishWorkflow.slice(sbomGeneration);
-assert.equal((postGatePublication.match(/uses: actions\/attest-sbom@[0-9a-f]{40}/g) ?? []).length, 4, "each release image needs an SBOM attestation");
+assert.equal((postGatePublication.match(/uses: actions\/attest@[0-9a-f]{40}/g) ?? []).length, 4, "each release image needs an SBOM attestation");
 assert.equal((postGatePublication.match(/uses: actions\/attest-build-provenance@[0-9a-f]{40}/g) ?? []).length, 4, "each release image needs a provenance attestation");
 const stepBlock = (name) => {
   const start = postGatePublication.indexOf("- name: " + name);
@@ -60,11 +63,11 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
   const subjectDigest = "subject-digest: ${{ steps." + service + ".outputs.digest }}";
   const sbomStep = stepBlock("Attest " + service + " SBOM");
   const provenanceStep = stepBlock("Attest " + service + " provenance");
-  assert.match(sbomStep, /uses: actions\/attest-sbom@[0-9a-f]{40}/);
+  assert.match(sbomStep, /uses: actions\/attest@[0-9a-f]{40}/);
   assert.match(provenanceStep, /uses: actions\/attest-build-provenance@[0-9a-f]{40}/);
   assert.ok(sbomStep.includes(subjectName) && sbomStep.includes(subjectDigest), `${service} SBOM must use its exact digest`);
   assert.ok(provenanceStep.includes(subjectName) && provenanceStep.includes(subjectDigest), `${service} provenance must use its exact digest`);
-  assert.ok(sbomStep.includes("sbom-path: ${{ runner.temp }}/tracegarden-release-sbom/" + service + ".spdx.json"), `${service} SBOM path is missing`);
+  assert.ok(sbomStep.includes("sbom-path: ${{ github.workspace }}/.scratch/tracegarden-release-sbom/" + service + ".spdx.json"), `${service} SBOM path is missing`);
   assert.ok(postGatePublication.indexOf("Attest " + service + " SBOM") < postGatePublication.indexOf("Attest " + service + " provenance"), `${service} attestations must have identical ordering`);
 }
 
@@ -91,6 +94,9 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
 assert.ok(previewWorkflow.includes("backup_digest: ${{ steps.backup.outputs.digest }}"));
 assert.ok(previewWorkflow.includes('BACKUP_REPOSITORY="${IMAGE_PREFIX}-backup"'));
 assert.ok(previewWorkflow.includes('BACKUP_DIGEST="${{ steps.backup.outputs.digest }}"'));
+assert.ok(previewPostGate.includes('sbom_dir="$GITHUB_WORKSPACE/.scratch/tracegarden-preview-sbom"'));
+assert.ok(previewPostGate.includes('test -s "$sbom_dir/${service}.spdx.json"'));
+assert.ok(previewPostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'"));
 
 function schemaError(path, message) {
   throw new Error(`${path}: ${message}`);
