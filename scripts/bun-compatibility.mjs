@@ -521,7 +521,7 @@ try {
   assert.equal(backupResult.retentionDays, 7);
   assert.deepEqual(backup.decryptBackupBuffer(uploadedArtifact, key), Buffer.from("bun-backup-payload"));
   const fakePgDump = join(temporaryDirectory, "pg_dump");
-  await writeFile(fakePgDump, "#!/usr/local/bin/bun\nprocess.stdout.write('bun-pg-dump')\n");
+  await writeFile(fakePgDump, `#!${process.execPath}\nprocess.stdout.write('bun-pg-dump')\n`);
   await chmod(fakePgDump, 0o755);
   const dumped = await backup.runPgDump(databaseUrl, { ...process.env, PATH: `${temporaryDirectory}:${process.env.PATH ?? ""}` });
   assert.equal(dumped.toString(), "bun-pg-dump");
