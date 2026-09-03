@@ -25,7 +25,7 @@
           "type": "array",
           "minItems": 1,
           "maxItems": 1,
-          "items": { "const": "https://github.com/MISAKA3389/tracegarden-gitops.git" }
+          "items": { "const": "https://github.com/misaka9981/tracegarden-gitops.git" }
         },
         "destinations": {
           "type": "array",

@@ -4,7 +4,7 @@
 
 **Blocked by:** 23: Prove Argo CD reconciliation and Preview Environment cleanup on kind.
 
-**Status:** needs-info
+**Status:** claimed
 
 - [ ] Explicit authorization names the private GitHub repository, GHCR namespace, protected environment, GitOps repository/branch, and disposable Argo destination.
 - [ ] Required checks pass for one recorded commit before publication.

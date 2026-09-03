@@ -76,6 +76,6 @@ The company contexts are outside project scope and must not be contacted. The fo
 - available persistent capacity and production PostgreSQL topology
 - Cloudflare domain, Tunnel, Access, R2, and TLS configuration
 - Google OAuth client configuration
-- `MISAKA3389` GitHub authentication in the local client
+- `misaka9981` GitHub authentication in the local client
 
 Implementation must keep these as configuration or placeholders until primary evidence is available.

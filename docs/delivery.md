@@ -2,7 +2,7 @@
 
 ## Repository ownership
 
-Remote repositories will belong to the GitHub account `MISAKA3389`. Both the application repository and the GitOps repository remain private initially. No remote repository is created during the design phase, and no command may silently use the currently active company GitHub identity.
+Remote repositories will belong to the GitHub account `misaka9981`. The application repository is public and the GitOps repository is private. No remote repository is created during the design phase, and no command may silently use the currently active company GitHub identity.
 
 ## CI
 
@@ -53,7 +53,7 @@ Production contains separate web and collector Deployments, PostgreSQL persisten
 
 ## External setup left for later authorization
 
-- Create the two private repositories under `MISAKA3389`.
+- Create the two private repositories under `misaka9981`.
 - Configure GHCR and GitHub Environment protections.
 - Install or configure Argo CD on the personal cluster, then install the operator-managed preview lifecycle controller and its GitHub/GHCR Secrets.
 - Configure Cloudflare DNS, TLS, Access, and optional Tunnel.

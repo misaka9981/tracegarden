@@ -9,18 +9,18 @@ imagePullSecrets:
 
 images:
   web:
-    repository: ghcr.io/misaka3389/tracegarden-web
+    repository: ghcr.io/misaka9981/tracegarden-web
     # No digest fallback: protected per-PR values are required for rendering.
     digest: ""
   collector:
-    repository: ghcr.io/misaka3389/tracegarden-collector
+    repository: ghcr.io/misaka9981/tracegarden-collector
     digest: ""
   migrate:
-    repository: ghcr.io/misaka3389/tracegarden-migrate
+    repository: ghcr.io/misaka9981/tracegarden-migrate
     digest: ""
   # Carried for the immutable publication handoff; Preview has no backup workload.
   backup:
-    repository: ghcr.io/misaka3389/tracegarden-backup
+    repository: ghcr.io/misaka9981/tracegarden-backup
     digest: sha256:5555555555555555555555555555555555555555555555555555555555555555
   postgres:
     repository: postgres

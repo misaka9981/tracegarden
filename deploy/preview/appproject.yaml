@@ -9,7 +9,7 @@ metadata:
     tracegarden.dev/live-behavior: unverified-until-argocd-is-authorized
 spec:
   sourceRepos:
-    - https://github.com/MISAKA3389/tracegarden-gitops.git
+    - https://github.com/misaka9981/tracegarden-gitops.git
   destinations:
     - server: https://kubernetes.default.svc
       namespace: preview-pr-*

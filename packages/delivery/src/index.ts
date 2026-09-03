@@ -1,7 +1,7 @@
 const SHA256_DIGEST = /^sha256:[a-f0-9]{64}$/;
 const GIT_COMMIT = /^[a-f0-9]{40}$/;
 const PREVIEW_NUMBER = /^[1-9][0-9]{0,8}$/;
-export const TRUSTED_PREVIEW_GITOPS_REPOSITORY = "https://github.com/MISAKA3389/tracegarden-gitops.git";
+export const TRUSTED_PREVIEW_GITOPS_REPOSITORY = "https://github.com/misaka9981/tracegarden-gitops.git";
 
 export type PreviewPullRequest = Readonly<{
   number: number;

@@ -278,7 +278,7 @@ if (!appProject.includes("group: networking.k8s.io\n      kind: NetworkPolicy") 
 if (applicationSet.includes(".state") || applicationSet.includes(".draft") || applicationSet.includes("templatePatch")) {
   errors.push("ApplicationSet must use supported PR parameters without state/draft template assumptions");
 }
-if (!applicationSet.includes("repoURL: https://github.com/MISAKA3389/tracegarden-gitops.git") || !applicationSet.includes("targetRevision: main") || applicationSet.includes("head_sha")) {
+if (!applicationSet.includes("repoURL: https://github.com/misaka9981/tracegarden-gitops.git") || !applicationSet.includes("targetRevision: main") || applicationSet.includes("head_sha")) {
   errors.push("preview chart and values must come from the protected GitOps repository main, not a PR head");
 }
 if (!applicationSet.includes("syncPolicy:\n    preserveResourcesOnDeletion: false") || applicationSet.includes("template.spec.syncPolicy.preserveResourcesOnDeletion")) {

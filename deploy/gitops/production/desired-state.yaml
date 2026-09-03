@@ -10,11 +10,11 @@ metadata:
 spec:
   releaseCommit: caf64d38ac32a3be62c81cfa6d786d21fc68bd5b
   images:
-    web: ghcr.io/misaka3389/tracegarden-web@sha256:b95ddd90e6a525915d68f81df1a42a4a5d1994a1d5c136ba1955a6508f76f843
-    collector: ghcr.io/misaka3389/tracegarden-collector@sha256:0823af5872c101651899f5181af1669a0ebb87e2672c2032bb3bd3a26ade02b6
-    migrate: ghcr.io/misaka3389/tracegarden-migrate@sha256:0ed108dbe1b1ed6e4e20863d050e5a7f1a9ee0e19854138d9405147a8b61019d
+    web: ghcr.io/misaka9981/tracegarden-web@sha256:b95ddd90e6a525915d68f81df1a42a4a5d1994a1d5c136ba1955a6508f76f843
+    collector: ghcr.io/misaka9981/tracegarden-collector@sha256:0823af5872c101651899f5181af1669a0ebb87e2672c2032bb3bd3a26ade02b6
+    migrate: ghcr.io/misaka9981/tracegarden-migrate@sha256:0ed108dbe1b1ed6e4e20863d050e5a7f1a9ee0e19854138d9405147a8b61019d
     # Offline fixture; a real promotion must carry the attested backup_digest.
-    backup: ghcr.io/misaka3389/tracegarden-backup@sha256:5c36d5ff0b98f098d2892fc11425fc5f88c7d1c8d57f85ca9d99b37d3825fc4a
+    backup: ghcr.io/misaka9981/tracegarden-backup@sha256:5c36d5ff0b98f098d2892fc11425fc5f88c7d1c8d57f85ca9d99b37d3825fc4a
   approval:
     protectedEnvironment: production
     required: true

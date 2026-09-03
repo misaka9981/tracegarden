@@ -23,7 +23,7 @@ data:
     export const TARGET_SERVICE_ACCOUNT_NAME = "tracegarden-preview";
     export const SOURCE_NAMESPACE = process.env.PREVIEW_SOURCE_NAMESPACE?.trim() || "argocd";
     export const SOURCE_IMAGE_SECRET_NAME = "tracegarden-preview-ghcr";
-    export const TRUSTED_GITOPS_OWNER = "MISAKA3389";
+    export const TRUSTED_GITOPS_OWNER = "misaka9981";
     export const TRUSTED_GITOPS_REPOSITORY = "tracegarden-gitops";
     export const TRUSTED_GITOPS_REVISION = "main";
     export const TRUSTED_GITOPS_DIGEST_PATH = "environments/previews/digests";
@@ -507,7 +507,7 @@ spec:
                 - name: NODE_ENV
                   value: production
                 - name: GITHUB_OWNER
-                  value: MISAKA3389
+                  value: misaka9981
                 - name: GITHUB_REPO
                   value: tracegarden
                 - name: GITHUB_TOKEN

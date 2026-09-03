@@ -31,7 +31,7 @@
       "additionalProperties": false,
       "required": ["repository", "digest"],
       "properties": {
-        "repository": { "type": "string", "pattern": "^ghcr.io/misaka3389/tracegarden-(web|collector|migrate|backup)$" },
+        "repository": { "type": "string", "pattern": "^ghcr.io/misaka9981/tracegarden-(web|collector|migrate|backup)$" },
         "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
       }
     }

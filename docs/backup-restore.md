@@ -17,7 +17,7 @@ Set the following values together; leaving any value empty makes enabling fail c
 ```yaml
 images:
   backup:
-    repository: ghcr.io/misaka3389/tracegarden-backup
+    repository: ghcr.io/misaka9981/tracegarden-backup
     digest: <attested-backup-digest>
 backup:
   enabled: true

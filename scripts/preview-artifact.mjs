@@ -9,7 +9,7 @@ const required = (name) => {
 };
 const repository = (name, component) => {
   const value = required(name);
-  const expected = `ghcr.io/misaka3389/tracegarden-${component}`;
+  const expected = `ghcr.io/misaka9981/tracegarden-${component}`;
   if (value !== expected) throw new Error(`${name} must equal ${expected}`);
   return value;
 };

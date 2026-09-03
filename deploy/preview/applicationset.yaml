@@ -21,7 +21,7 @@ spec:
         # label. The PR number selects a file; it cannot select its contents.
         requeueAfterSeconds: 60
         github:
-          owner: MISAKA3389
+          owner: misaka9981
           repo: tracegarden
           # The operator lifecycle controller applies this label only to open,
           # non-draft PRs and removes it when cleanup is required.
@@ -45,7 +45,7 @@ spec:
     spec:
       project: previews
       source:
-        repoURL: https://github.com/MISAKA3389/tracegarden-gitops.git
+        repoURL: https://github.com/misaka9981/tracegarden-gitops.git
         targetRevision: main
         path: environments/previews/chart
         helm:

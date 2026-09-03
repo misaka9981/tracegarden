@@ -281,7 +281,7 @@ assert.equal(promotion.spec.releaseCommit.length, 40);
 assert.equal(promotion.spec.protectedEnvironment.approvalRequired, true);
 assert.equal(promotion.spec.gitOps.pullRequestRequired, true);
 assert.equal(promotion.spec.gitOps.directClusterMutation, false);
-assert.equal(promotion.spec.images.backup.repository, "ghcr.io/misaka3389/tracegarden-backup");
+assert.equal(promotion.spec.images.backup.repository, "ghcr.io/misaka9981/tracegarden-backup");
 assert.match(promotion.spec.images.backup.digest, /^sha256:[a-f0-9]{64}$/);
 const invalidPromotion = structuredClone(promotion);
 invalidPromotion.spec.images.backup.digest = "not-a-digest";
@@ -290,8 +290,8 @@ assert.throws(() => validateSchema(invalidPromotion, promotionSchema), /pattern/
 assert.match(desiredState, /releaseCommit: [a-f0-9]{40}/);
 assert.equal([...desiredState.matchAll(/@sha256:[a-f0-9]{64}/g)].length, 4);
 assert.equal(
-  desiredState.match(/backup: (ghcr\.io\/misaka3389\/tracegarden-backup@sha256:[a-f0-9]{64})/)?.[1],
-  `ghcr.io/misaka3389/tracegarden-backup@${promotion.spec.images.backup.digest}`,
+  desiredState.match(/backup: (ghcr\.io\/misaka9981\/tracegarden-backup@sha256:[a-f0-9]{64})/)?.[1],
+  `ghcr.io/misaka9981/tracegarden-backup@${promotion.spec.images.backup.digest}`,
 );
 assert.match(productionApp, /argocd-pull/);
 assert.match(previewValues, /serviceAccount:\n  name: tracegarden-preview/);
@@ -323,7 +323,7 @@ assert.equal(declaration?.database.productionCredentials, false);
 assert.equal(declaration?.seed.dataSet, "non-production");
 assert.equal(createPreviewDeclaration({ number: 42, state: "open", draft: true }, trustedSource), null);
 assert.equal(createPreviewDeclaration({ number: 42, state: "closed", draft: false }, trustedSource), null);
-assert.throws(() => createPreviewDeclaration({ number: 42, state: "open", draft: false }, { repository: "https://github.com/MISAKA3389/tracegarden.git", revision: commit }), /protected GitOps repository/);
+assert.throws(() => createPreviewDeclaration({ number: 42, state: "open", draft: false }, { repository: "https://github.com/misaka9981/tracegarden.git", revision: commit }), /protected GitOps repository/);
 assert.deepEqual(reconcilePreviewDeclarations(
   [{ number: 42, state: "open", draft: false }, { number: 7, state: "closed", draft: false }],
   ["preview-pr-7", "preview-pr-99"],
@@ -510,13 +510,13 @@ const artifactEnvironment = {
   ...process.env,
   PREVIEW_NUMBER: "42",
   PREVIEW_COMMIT: commit,
-  WEB_REPOSITORY: "ghcr.io/misaka3389/tracegarden-web",
+  WEB_REPOSITORY: "ghcr.io/misaka9981/tracegarden-web",
   WEB_DIGEST: `sha256:${"1".repeat(64)}`,
-  COLLECTOR_REPOSITORY: "ghcr.io/misaka3389/tracegarden-collector",
+  COLLECTOR_REPOSITORY: "ghcr.io/misaka9981/tracegarden-collector",
   COLLECTOR_DIGEST: `sha256:${"2".repeat(64)}`,
-  MIGRATE_REPOSITORY: "ghcr.io/misaka3389/tracegarden-migrate",
+  MIGRATE_REPOSITORY: "ghcr.io/misaka9981/tracegarden-migrate",
   MIGRATE_DIGEST: `sha256:${"3".repeat(64)}`,
-  BACKUP_REPOSITORY: "ghcr.io/misaka3389/tracegarden-backup",
+  BACKUP_REPOSITORY: "ghcr.io/misaka9981/tracegarden-backup",
   BACKUP_DIGEST: `sha256:${"5".repeat(64)}`,
 };
 const artifact = spawnSync(process.execPath, ["scripts/preview-artifact.mjs", artifactPath, valuePath], {
@@ -549,7 +549,7 @@ const promotionArtifactEnvironment = {
   ...process.env,
   RELEASE_COMMIT: commit,
   GITHUB_RUN_ID: "12345",
-  GHCR_NAMESPACE: "misaka3389",
+  GHCR_NAMESPACE: "misaka9981",
   WEB_DIGEST: `sha256:${"1".repeat(64)}`,
   COLLECTOR_DIGEST: `sha256:${"2".repeat(64)}`,
   MIGRATE_DIGEST: `sha256:${"3".repeat(64)}`,
@@ -561,7 +561,7 @@ const promotionArtifact = spawnSync(process.execPath, ["scripts/promotion-artifa
 });
 assert.equal(promotionArtifact.status, 0, promotionArtifact.stderr || "promotion artifact generation failed");
 const generatedPromotion = await parseYaml(promotionArtifactPath);
-assert.equal(generatedPromotion.spec.images.backup, `ghcr.io/misaka3389/tracegarden-backup@sha256:${"5".repeat(64)}`);
+assert.equal(generatedPromotion.spec.images.backup, `ghcr.io/misaka9981/tracegarden-backup@sha256:${"5".repeat(64)}`);
 const invalidPromotionArtifact = spawnSync(process.execPath, ["scripts/promotion-artifact.mjs", join(artifactDirectory, "invalid-promotion.yaml")], {
   encoding: "utf8",
   env: { ...promotionArtifactEnvironment, BACKUP_DIGEST: "not-a-digest" },
@@ -629,7 +629,7 @@ if (process.env.DELIVERY_RENDER === "true") {
   assert.match(render.stdout, /preemptionPolicy: Never/);
   assert.match(render.stdout, /serviceAccountName: tracegarden-preview/);
   assert.match(render.stdout, /imagePullSecrets:/);
-  assert.match(render.stdout, /ghcr.io\/misaka3389\/tracegarden-web@sha256:b95ddd90e6a525915d68f81df1a42a4a5d1994a1d5c136ba1955a6508f76f843/);
+  assert.match(render.stdout, /ghcr.io\/misaka9981\/tracegarden-web@sha256:b95ddd90e6a525915d68f81df1a42a4a5d1994a1d5c136ba1955a6508f76f843/);
   assert.doesNotMatch(render.stdout, /existingSecret|production-database|production-credentials: "true"/);
   assert.doesNotMatch(render.stdout, /secretName: tracegarden-preview-ghcr[\s\S]*mountPath/);
   console.log("offline preview lifecycle, Access identity, promotion, and Helm declaration checks passed");

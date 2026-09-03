@@ -301,7 +301,7 @@
       "additionalProperties": false,
       "required": ["repository", "digest"],
       "properties": {
-        "repository": { "const": "ghcr.io/misaka3389/tracegarden-backup" },
+        "repository": { "const": "ghcr.io/misaka9981/tracegarden-backup" },
         "digest": { "oneOf": [{ "const": "" }, { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }] }
       }
     },

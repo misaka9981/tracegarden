@@ -43,7 +43,7 @@
           "additionalProperties": false,
           "required": ["repository", "desiredStatePath", "pullRequestRequired", "directClusterMutation"],
           "properties": {
-            "repository": { "const": "https://github.com/MISAKA3389/tracegarden-gitops.git" },
+            "repository": { "const": "https://github.com/misaka9981/tracegarden-gitops.git" },
             "desiredStatePath": { "const": "environments/production/tracegarden/values.yaml" },
             "pullRequestRequired": { "const": true },
             "directClusterMutation": { "const": false }
@@ -58,7 +58,7 @@
       "additionalProperties": false,
       "required": ["repository", "digest"],
       "properties": {
-        "repository": { "type": "string", "pattern": "^ghcr.io/misaka3389/tracegarden-(web|collector|migrate)$" },
+        "repository": { "type": "string", "pattern": "^ghcr.io/misaka9981/tracegarden-(web|collector|migrate)$" },
         "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
       }
     },
@@ -67,7 +67,7 @@
       "additionalProperties": false,
       "required": ["repository", "digest"],
       "properties": {
-        "repository": { "const": "ghcr.io/misaka3389/tracegarden-backup" },
+        "repository": { "const": "ghcr.io/misaka9981/tracegarden-backup" },
         "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
       }
     }

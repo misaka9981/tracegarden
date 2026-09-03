@@ -256,7 +256,7 @@ jobs:
       - run: node scripts/container-context.mjs
       - run: docker pull --platform linux/arm64 "$BUN_IMAGE"
       - name: Verify preview publication namespace configuration
-        run: test "$GHCR_NAMESPACE" = misaka3389 && test "$GHCR_NAMESPACE" = "${GHCR_NAMESPACE,,}"
+        run: test "$GHCR_NAMESPACE" = misaka9981 && test "$GHCR_NAMESPACE" = "${GHCR_NAMESPACE,,}"
       - name: Login to the configured private GHCR namespace
         env:
           GH_TOKEN: ${{ github.token }}
