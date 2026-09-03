@@ -116,7 +116,7 @@ try {
     assert.ok(backupContainer, "the exact release backup image must create a container");
     await waitForStopped(backupContainer);
     assert.notEqual(docker(["inspect", "-f", "{{.State.ExitCode}}", backupContainer]), "0", "backup must fail closed without backup configuration");
-    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", backupContainer]), "node");
+    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", backupContainer]), "bun");
     assert.equal(docker(["inspect", "-f", "{{.HostConfig.ReadonlyRootfs}}", backupContainer]), "true");
     assert.match(docker(["inspect", "-f", "{{json .HostConfig.CapDrop}}", backupContainer]), /ALL/);
     assert.match(docker(["inspect", "-f", "{{json .HostConfig.Tmpfs}}", backupContainer]), /tmp/);
@@ -125,6 +125,7 @@ try {
     assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", backupImageId]), "arm64");
     assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "pg_dump", backupImageId, "--version"]), "pg_dump (PostgreSQL) 18.3");
     assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "pg_restore", backupImageId, "--version"]), "pg_restore (PostgreSQL) 18.3");
+    assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "sh", backupImageId, "-c", "test ! -e /usr/local/bin/node"]), "");
     assert.doesNotMatch(docker(["inspect", "-f", "{{json .Config.Env}}", backupContainer]), /AWS_ACCESS_KEY|AWS_SECRET_ACCESS_KEY|BACKUP_ENCRYPTION/);
     assert.match(docker(["logs", backupContainer]), /missing backup configuration: DATABASE_URL/);
   }

@@ -31,6 +31,13 @@ assert.ok(collectorDockerfile.startsWith(`FROM ${bunImage}\n`), "collector must 
 assert.match(collectorDockerfile, /USER bun/);
 assert.match(collectorDockerfile, /CMD \["bun", "dist\/apps\/collector\/src\/main\.js"\]/);
 assert.doesNotMatch(collectorDockerfile, /node:26|USER node|CMD \["node"/i, "collector image must not retain a Node runtime");
+const backupDockerfile = await readFile("deploy/docker/backup.Dockerfile", "utf8");
+assert.ok(backupDockerfile.includes(`FROM ${bunImage}`), "backup must use the pinned Bun base image");
+assert.match(backupDockerfile, /USER bun/);
+assert.match(backupDockerfile, /ENTRYPOINT \["bun", "\/app\/backup\.mjs"\]/);
+assert.doesNotMatch(backupDockerfile, /node:26|USER node|ENTRYPOINT \["node"/i, "backup image must not retain a Node runtime");
+assert.match(backupDockerfile, /COPY --from=postgres-runtime \/usr\/local\/bin\/pg_dump/);
+assert.match(backupDockerfile, /COPY --from=postgres-runtime \/usr\/local\/bin\/pg_restore/);
 const deployment = await readFile("deploy/chart/templates/deployments.yaml", "utf8");
 const webDeployment = deployment.slice(0, deployment.indexOf("\n---"));
 assert.ok(webDeployment.includes('command: ["bun", "--input-type=module", "--eval"]'));

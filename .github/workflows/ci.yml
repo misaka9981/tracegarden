@@ -412,7 +412,7 @@ jobs:
               image: $migrate_ref
             backup:
               image: $backup_ref
-              user: node
+              user: bun
               read_only: true
               tmpfs:
                 - /tmp:rw,noexec,nosuid,size=64m

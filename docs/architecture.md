@@ -29,7 +29,7 @@ deploy/
 docs/
 ```
 
-The web transport uses Bun's fetch listener and Hono route composition with Hono JSX view modules; it does not change the domain or URL contracts. Web and collector now run on Bun 1.3.14; migration and backup remain on Node.js 26.8.x until their independent modernization steps. See [ADR 0006](adr/0006-choose-hono-and-staged-bun-runtime.md).
+The web transport uses Bun's fetch listener and Hono route composition with Hono JSX view modules; it does not change the domain or URL contracts. Web, collector, and backup now run on Bun 1.3.14; migration remains on Node.js 26.8.x until its independent modernization step. See [ADR 0006](adr/0006-choose-hono-and-staged-bun-runtime.md).
 
 ## Deep modules and seams
 
@@ -95,7 +95,7 @@ Recent logs use a second ServiceAccount and the `logs:read` application capabili
 
 ## Runtime and persistence
 
-- Production runtime: Bun 1.3.14 for web and collector; Node.js 26.8.x remains for migration and backup until their independent tickets land
+- Production runtime: Bun 1.3.14 for web, collector, and backup; Node.js 26.8.x remains for migration until its independent ticket lands
 - Language: TypeScript 7 with explicit strict settings and its native `tsc` as the authoritative compiler
 - Web transport: Hono route composition; the production web entrypoint uses Bun's native server
 - Views and client: server-rendered HTML strings, native forms, and a small `fetch`/`EventSource` client today; Hono JSX may structure those views without React or hydration
@@ -106,7 +106,7 @@ Recent logs use a second ServiceAccount and the `logs:read` application capabili
 - Styling: existing page styles; no Tailwind
 - Development and validation: pnpm workspaces, native `tsc --noEmit`, and Node-based Playwright
 
-The parent Node web and collector images and entrypoints remain independent rollback baselines in Git history, while migration and backup stay on their own Node images. Exact dependency changes for each migration step are selected only in that step and do not change PostgreSQL, `pg`, or the validation toolchain.
+The parent Node web, collector, and backup images and entrypoints remain independent rollback baselines in Git history; migration stays on its Node image. Exact dependency changes for each migration step are selected only in that step and do not change PostgreSQL, `pg`, or the validation toolchain.
 
 ## Verification strategy
 

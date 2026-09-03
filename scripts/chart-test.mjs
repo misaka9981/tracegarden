@@ -43,6 +43,8 @@ assert.match(backup, /suspend: \{\{ not \.Values\.backup\.enabled \}\}/);
 assert.match(backup, /BACKUP_ENCRYPTION_MECHANISM/);
 assert.match(backup, /BACKUP_CREDENTIALS_SOURCE/);
 assert.match(backup, /secretKeyRef:/);
+assert.match(backup, /command: \["bun", "\/app\/backup\.mjs"\]/);
+assert.doesNotMatch(backup, /command: \["node"/);
 assert.doesNotMatch(backup, /kind: ConfigMap/);
 assert.ok(schema.properties.migration.required.includes("databaseReadyTimeoutSeconds"));
 assert.ok(schema.properties.migration.required.includes("databaseReadyRetrySeconds"));
@@ -76,6 +78,7 @@ assert.match(migration, /databaseReadyTimeoutSeconds/);
 assert.match(migration, /databaseReadyRetrySeconds/);
 assert.match(deployments, /initContainers:/);
 assert.match(deployments, /wait-for-schema/);
+assert.doesNotMatch(deployments, /command: \["node", "--input-type=module", "--eval"\]/);
 const deploymentSections = deployments.split("\n---\n");
 assert.equal(deploymentSections.length, 2, "chart must render independent web and collector deployments");
 for (const [component, section] of [["web", deploymentSections[0]], ["collector", deploymentSections[1]]]) {

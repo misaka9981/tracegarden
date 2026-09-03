@@ -57,18 +57,24 @@ for (const [service, dockerfile, frozen] of builds) {
       }
     }
     if (service === "backup") {
-      if (dockerOutput(["image", "inspect", "-f", "{{.Config.User}}", tag]) !== "node") {
-        throw new Error("clean-cache backup image must use the non-root node user");
+      if (dockerOutput(["image", "inspect", "-f", "{{.Config.User}}", tag]) !== "bun") {
+        throw new Error("clean-cache backup image must use the non-root bun user");
       }
       if (dockerOutput(["image", "inspect", "-f", "{{.Architecture}}", tag]) !== "arm64") {
         throw new Error("clean-cache backup image must be ARM64");
       }
       const runArgs = [
-        "run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "node",
+        "run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "bun",
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL",
       ];
       const uid = dockerOutput([...runArgs, "--entrypoint", "id", tag, "-u"]);
       if (!/^[1-9]\d*$/.test(uid)) throw new Error("clean-cache backup image must run with a non-root effective UID");
+      if (dockerOutput([...runArgs, "--entrypoint", "bun", tag, "--version"]) !== "1.3.14") {
+        throw new Error("clean-cache backup image must run Bun 1.3.14");
+      }
+      if (dockerOutput([...runArgs, "--entrypoint", "sh", tag, "-c", "test ! -e /usr/local/bin/node"]) !== "") {
+        throw new Error("clean-cache backup image must not contain a Node runtime");
+      }
       for (const binary of ["pg_dump", "pg_restore"]) {
         const version = dockerOutput([...runArgs, "--entrypoint", binary, tag, "--version"]);
         if (version !== `${binary} (PostgreSQL) 18.3`) throw new Error(`clean-cache backup image failed ${binary} --version`);

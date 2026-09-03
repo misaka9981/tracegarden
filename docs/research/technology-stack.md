@@ -22,7 +22,7 @@ Research date: 2026-09-01. Sources are official documentation, specifications, r
 
 | Area | Current implementation | Accepted target or constraint |
 |---|---|---|
-| Runtime | Bun 1.3.14 for web and collector; Node.js 26.8.x for migration and backup; ESM | Bun adoption remains per-process; each parent Node image/entrypoint remains the rollback runtime for its migrated process |
+| Runtime | Bun 1.3.14 for web, collector, and backup; Node.js 26.8.x for migration; ESM | Bun adoption remains per-process; each parent Node image/entrypoint remains the rollback runtime for its migrated process |
 | Language | TypeScript 7 with native `tsc` | `tsc --noEmit` remains authoritative |
 | Web transport | Hono fetch listener on Bun | Existing URLs, methods, statuses, redirects, cookies, authorization, health, metrics, telemetry, and SSE contracts remain unchanged |
 | Views and client | Server-rendered HTML strings, native forms, and a small `fetch`/`EventSource` client | Hono JSX may structure server views without React, hydration, or a client state framework |
@@ -35,4 +35,4 @@ Research date: 2026-09-01. Sources are official documentation, specifications, r
 
 ## Evidence boundary
 
-The web and collector source and production images use Bun with Hono/compiled ESM; migration and backup remain on Node.js 26.8.x. PostgreSQL and `pg` remain unchanged. Tickets 05 and 06 cover the web and collector migrations; migration and backup modernization, live cluster behavior, and external integrations remain unverified under the existing authorization boundary. The parent Node image and entrypoint for each migrated process remain independently recoverable.
+The web, collector, and backup sources and production images use Bun with Hono where applicable; migration remains on Node.js 26.8.x. PostgreSQL and `pg` remain unchanged. Tickets 05, 06, and 08 cover those process migrations; the remaining migration process, live cluster behavior, and external integrations remain unverified under the existing authorization boundary. The parent Node image and entrypoint for each migrated process remain independently recoverable.

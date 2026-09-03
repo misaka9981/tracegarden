@@ -1,5 +1,5 @@
 FROM postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7 AS postgres-runtime
-FROM node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89
+FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2
 
 ENV NODE_ENV=production
 WORKDIR /app
@@ -22,5 +22,5 @@ COPY --from=postgres-runtime /usr/lib/liblber.so.2 /usr/lib/liblber.so.2
 COPY --from=postgres-runtime /usr/lib/libsasl2.so.3 /usr/lib/libsasl2.so.3
 COPY --from=postgres-runtime /usr/lib/libkeyutils.so.1 /usr/lib/libkeyutils.so.1
 COPY scripts/backup.mjs /app/backup.mjs
-USER node
-ENTRYPOINT ["node", "/app/backup.mjs"]
+USER bun
+ENTRYPOINT ["bun", "/app/backup.mjs"]

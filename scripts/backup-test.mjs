@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { decryptBackupBuffer, encryptBackupBuffer, runBackup, safePostgresDatabaseUrl, uploadWithAws, validateBackupConfiguration } from "./backup.mjs";
 import {
   assertCleanDatabase,
@@ -115,6 +115,31 @@ try {
   assert.match(result.artifactName, /^tracegarden\/20260102T030405Z-[a-f0-9]{12}\.dump\.enc$/);
   assert.equal(result.retentionDays, 30);
 
+  const hangingPgDumpDirectory = await mkdtemp(join(directory, "pg-dump-bin-"));
+  const hangingPgDump = join(hangingPgDumpDirectory, "pg_dump");
+  const pgDumpPidFile = join(directory, "pg-dump.pid");
+  await writeFile(hangingPgDump, `#!/bin/sh\nprintf '%s' "$$" > "$PG_DUMP_PID_FILE"\nexec sleep 1000\n`);
+  await chmod(hangingPgDump, 0o755);
+  const backupTempEntriesBeforeDump = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith("tracegarden-backup-")));
+  const pgDumpEnvironment = {
+    ...environment,
+    DATABASE_URL: "postgresql://tracegarden:pg-dump-secret@database.invalid:5432/tracegarden",
+    AWS_ACCESS_KEY_ID: "test-access",
+    AWS_SECRET_ACCESS_KEY: "test-secret",
+    PATH: `${hangingPgDumpDirectory}:${process.env.PATH ?? ""}`,
+    PG_DUMP_PID_FILE: pgDumpPidFile,
+  };
+  await assert.rejects(
+    runBackup({ environment: pgDumpEnvironment, timeoutMs: 1_000 }),
+    (error) => error instanceof Error && error.message === "pg_dump timed out"
+      && !error.message.includes("pg-dump-secret") && !error.message.includes("database.invalid"),
+  );
+  const pgDumpPid = Number(await readFile(pgDumpPidFile, "utf8"));
+  assert.ok(Number.isInteger(pgDumpPid) && pgDumpPid > 0);
+  assert.throws(() => process.kill(pgDumpPid, 0), (error) => error?.code === "ESRCH");
+  const backupTempEntriesAfterDump = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith("tracegarden-backup-")));
+  assert.deepEqual([...backupTempEntriesAfterDump].filter((entry) => !backupTempEntriesBeforeDump.has(entry)), [], "timed-out pg_dump must remove its run-created temporary directory");
+
   let nativeUpload;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
@@ -174,7 +199,27 @@ try {
     assert.notEqual(nativeUpload.url, "https://storage.invalid/tracegarden-backups/fixtures/vector.dump.enc");
     assert.notEqual(nativeUpload.options.headers.authorization, vectorAuthorization, "canonical path perturbation must change the signature");
     assert.equal(nativeUpload.options.headers["x-amz-content-sha256"], "565b24bc77ebeee74f70f6c608e099956666c3589ed85146fcea7e77d9f25356");
-    console.log("offline backup encryption, native SigV4 fixed vector, perturbation, off-VM gate, and credential-free boundary passed");
+
+    let uploadSignal;
+    let uploadDirectory;
+    const hangingUpload = (request) => {
+      uploadDirectory = dirname(request.artifactPath);
+      return uploadWithAws({ ...request, environment: vectorEnvironment, now: signingClock, timeoutMs: 100 });
+    };
+    globalThis.fetch = async (_url, options) => {
+      uploadSignal = options.signal;
+      await new Promise(() => {});
+    };
+    await assert.rejects(
+      runBackup({ environment: vectorEnvironment, dump: async () => plaintext, upload: hangingUpload, now: signingClock, timeoutMs: 100 }),
+      (error) => error instanceof Error && error.message === "encrypted backup upload timed out"
+        && !error.message.includes("test-secret") && !error.message.includes("storage.invalid"),
+    );
+    assert.equal(uploadSignal?.aborted, true, "timed-out upload must abort its fetch request");
+    assert.ok(uploadDirectory);
+    await assert.rejects(access(uploadDirectory), (error) => error?.code === "ENOENT", "timed-out upload must remove its run-created temporary directory");
+
+    console.log("offline backup encryption, native SigV4 fixed vector, perturbation, timeout cancellation, off-VM gate, and credential-free boundary passed");
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -149,6 +149,9 @@ const backupScript = await readFile("scripts/backup.mjs", "utf8");
 if (/apt-get|awscli|spawn\(\s*["']aws["']/.test(backupDockerfile) || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_dump") || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_restore")) {
   errors.push("backup image must use the pinned PostgreSQL runtime and no mutable apt/awscli dependency");
 }
+if (!backupDockerfile.includes("FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2") || !backupDockerfile.includes('USER bun') || !backupDockerfile.includes('ENTRYPOINT ["bun", "/app/backup.mjs"]') || /^FROM\s+node:/m.test(backupDockerfile) || /ENTRYPOINT \["node"/.test(backupDockerfile)) {
+  errors.push("backup Dockerfile must use the pinned Bun runtime without a Node fallback");
+}
 if (/spawn\(\s*["']aws["']/.test(backupScript) || !backupScript.includes("createHmac") || !backupScript.includes("fetch(endpointUrl")) {
   errors.push("backup uploader must use the owned native SigV4 fetch path");
 }

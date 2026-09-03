@@ -11,6 +11,8 @@ const CREDENTIAL_QUERY_ASSIGNMENT = /(?:password|pass|secret|token|credential|ac
 const AES_KEY_BYTES = 32;
 const AES_IV_BYTES = 12;
 const ENVELOPE_SEPARATOR = "\n";
+export const BACKUP_OPERATION_TIMEOUT_MS = 30_000;
+const PG_DUMP_KILL_GRACE_MS = 250;
 const OBJECT_STORAGE_ENDPOINT_PATTERN = /^https:\/\/([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(\/[^\s?#]*)?$/;
 
 function requiredValue(environment, name) {
@@ -143,18 +145,54 @@ function databaseProcessEnvironment(databaseUrl, environment) {
   };
 }
 
-function runPgDump(databaseUrl, environment) {
+function boundedTimeout(timeoutMs) {
+  return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : BACKUP_OPERATION_TIMEOUT_MS;
+}
+
+function runPgDump(databaseUrl, environment, { timeoutMs = BACKUP_OPERATION_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     const connection = databaseProcessEnvironment(databaseUrl, environment);
-    const child = spawn("pg_dump", ["--format=custom", "--no-password", `--dbname=${connection.safeUrl}`], {
-      env: connection.environment,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    let child;
+    try {
+      child = spawn("pg_dump", ["--format=custom", "--no-password", `--dbname=${connection.safeUrl}`], {
+        env: connection.environment,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch {
+      reject(new Error("pg_dump could not be started"));
+      return;
+    }
     const output = [];
+    const timeout = boundedTimeout(timeoutMs);
+    let timedOut = false;
+    let timeoutHandle;
+    let killHandle;
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutHandle);
+      clearTimeout(killHandle);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const terminate = () => {
+      if (settled || child.exitCode !== null || child.signalCode !== null) return;
+      timedOut = true;
+      child.kill("SIGTERM");
+      killHandle = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }, PG_DUMP_KILL_GRACE_MS);
+    };
     child.stdout.on("data", (chunk) => output.push(chunk));
     child.stderr.resume();
-    child.once("error", () => reject(new Error("pg_dump could not be started")));
-    child.once("close", (code) => code === 0 ? resolve(Buffer.concat(output)) : reject(new Error("pg_dump failed")));
+    child.once("error", () => finish(new Error(timedOut ? "pg_dump timed out" : "pg_dump could not be started")));
+    child.once("close", (code) => {
+      if (timedOut) finish(new Error("pg_dump timed out"));
+      else if (code === 0) finish(null, Buffer.concat(output));
+      else finish(new Error("pg_dump failed"));
+    });
+    timeoutHandle = setTimeout(terminate, timeout);
   });
 }
 
@@ -166,7 +204,7 @@ function canonicalPath(path) {
   return path.split("/").map((segment) => encodeURIComponent(segment).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`)).join("/") || "/";
 }
 
-async function uploadWithAws({ artifactPath, endpoint, bucket, artifactName, environment, now = new Date() }) {
+async function uploadWithAws({ artifactPath, endpoint, bucket, artifactName, environment, now = new Date(), timeoutMs = BACKUP_OPERATION_TIMEOUT_MS }) {
   const accessKey = environment.AWS_ACCESS_KEY_ID?.trim();
   const secretKey = environment.AWS_SECRET_ACCESS_KEY?.trim();
   if (!accessKey || !secretKey) throw new Error("object-storage credentials are unavailable from the configured Secret");
@@ -191,14 +229,39 @@ async function uploadWithAws({ artifactPath, endpoint, bucket, artifactName, env
   const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretKey}`, date), region), "s3"), "aws4_request");
   const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${createHash("sha256").update(canonicalRequest).digest("hex")}`;
   const authorization = `AWS4-HMAC-SHA256 Credential=${accessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${createHmac("sha256", signingKey).update(stringToSign).digest("hex")}`;
-  const response = await fetch(endpointUrl, {
-    method: "PUT",
-    headers: { ...headers, authorization },
-    body,
-  });
-  if (!response.ok) {
-    if (response.body) await response.body.cancel().catch(() => undefined);
+  const timeout = boundedTimeout(timeoutMs);
+  const controller = new AbortController();
+  let timeoutHandle;
+  let rejectTimeout = () => {};
+  const timeoutPromise = new Promise((_, reject) => { rejectTimeout = reject; });
+  let fetchPromise;
+  try {
+    fetchPromise = fetch(endpointUrl, {
+      method: "PUT",
+      headers: { ...headers, authorization },
+      body,
+      signal: controller.signal,
+    });
+  } catch {
     throw new Error("encrypted backup upload failed");
+  }
+  timeoutHandle = setTimeout(() => {
+    controller.abort();
+    rejectTimeout(new Error("encrypted backup upload timed out"));
+  }, timeout);
+  try {
+    const response = await Promise.race([fetchPromise, timeoutPromise]);
+    if (controller.signal.aborted) throw new Error("encrypted backup upload timed out");
+    if (!response.ok) {
+      if (response.body) await response.body.cancel().catch(() => undefined);
+      throw new Error("encrypted backup upload failed");
+    }
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("encrypted backup upload timed out");
+    if (error instanceof Error && error.message === "encrypted backup upload failed") throw error;
+    throw new Error("encrypted backup upload failed");
+  } finally {
+    clearTimeout(timeoutHandle);
   }
 }
 
@@ -207,19 +270,21 @@ function artifactName(now = new Date()) {
   return `tracegarden/${timestamp}-${randomBytes(6).toString("hex")}.dump.enc`;
 }
 
-export async function runBackup({ environment = process.env, dump = null, upload = uploadWithAws, now = new Date() } = {}) {
+export async function runBackup({ environment = process.env, dump = null, upload = uploadWithAws, now = new Date(), timeoutMs = BACKUP_OPERATION_TIMEOUT_MS } = {}) {
   const configuration = validateBackupConfiguration(environment, { requireCredentials: !dump || upload === uploadWithAws });
   const key = await readEncryptionKey(configuration.keyFile);
-  const plaintext = dump ? await dump(configuration.databaseUrl, environment) : await runPgDump(configuration.databaseUrl, environment);
-  if (!Buffer.isBuffer(plaintext)) throw new Error("pg_dump did not produce a byte artifact");
-  const encrypted = encryptBackupBuffer(plaintext, key);
   const directory = await mkdtemp(join(tmpdir(), "tracegarden-backup-"));
-  const path = join(directory, "backup.dump.enc");
-  const name = artifactName(now);
   try {
+    const plaintext = dump
+      ? await dump(configuration.databaseUrl, environment)
+      : await runPgDump(configuration.databaseUrl, environment, { timeoutMs });
+    if (!Buffer.isBuffer(plaintext)) throw new Error("pg_dump did not produce a byte artifact");
+    const encrypted = encryptBackupBuffer(plaintext, key);
+    const path = join(directory, "backup.dump.enc");
+    const name = artifactName(now);
     await writeFile(path, encrypted, { mode: 0o600 });
     const uploadRequest = { artifactPath: path, artifactName: name, endpoint: configuration.endpoint, bucket: configuration.bucket, retentionDays: configuration.retentionDays };
-    if (upload === uploadWithAws) await uploadWithAws({ ...uploadRequest, environment, now });
+    if (upload === uploadWithAws) await uploadWithAws({ ...uploadRequest, environment, now, timeoutMs });
     else await upload(uploadRequest);
     return { artifactName: name, encryptedBytes: encrypted.length, retentionDays: configuration.retentionDays };
   } finally {
@@ -233,7 +298,7 @@ export async function main(environment = process.env) {
     console.log(JSON.stringify({ event: "backup.completed", ...result }));
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
-    const safeMessage = /^(missing backup configuration: [A-Z0-9_]+|DATABASE_URL must (?:be (?:a PostgreSQL URL|a valid PostgreSQL URL)|not contain credential-bearing query parameters(?: or fragments)?)|BACKUP_ENDPOINT must (?:be (?:a valid HTTPS URL|an HTTPS URL without embedded credentials)|not contain query parameters or fragments)|BACKUP_BUCKET must be an object-storage bucket name|BACKUP_RETENTION_DAYS must be a positive integer|backup destination must be off-VM|BACKUP_CREDENTIALS_SOURCE must identify a Kubernetes Secret|BACKUP_ENCRYPTION_MECHANISM must be aes-256-gcm|object-storage credentials are unavailable from the configured Secret|backup encryption key must be a 32-byte hexadecimal or base64 value|backup encryption key must be 32 bytes|pg_dump (?:could not be started|failed)|object-storage uploader could not be started|encrypted backup upload failed|pg_dump did not produce a byte artifact)$/.test(message)
+    const safeMessage = /^(missing backup configuration: [A-Z0-9_]+|DATABASE_URL must (?:be (?:a PostgreSQL URL|a valid PostgreSQL URL)|not contain credential-bearing query parameters(?: or fragments)?)|BACKUP_ENDPOINT must (?:be (?:a valid HTTPS URL|an HTTPS URL without embedded credentials)|not contain query parameters or fragments)|BACKUP_BUCKET must be an object-storage bucket name|BACKUP_RETENTION_DAYS must be a positive integer|backup destination must be off-VM|BACKUP_CREDENTIALS_SOURCE must identify a Kubernetes Secret|BACKUP_ENCRYPTION_MECHANISM must be aes-256-gcm|object-storage credentials are unavailable from the configured Secret|backup encryption key must be a 32-byte hexadecimal or base64 value|backup encryption key must be 32 bytes|pg_dump (?:could not be started|failed|timed out)|object-storage uploader could not be started|encrypted backup upload (?:failed|timed out)|pg_dump did not produce a byte artifact)$/.test(message)
       ? message
       : "unexpected backup process failure";
     console.error(`backup failed: ${safeMessage}`);
