@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -520,10 +520,9 @@ try {
   });
   assert.equal(backupResult.retentionDays, 7);
   assert.deepEqual(backup.decryptBackupBuffer(uploadedArtifact, key), Buffer.from("bun-backup-payload"));
-  const fakePgDump = join(temporaryDirectory, "pg_dump");
-  await writeFile(fakePgDump, `#!${process.execPath}\nprocess.stdout.write('bun-pg-dump')\n`);
-  await chmod(fakePgDump, 0o755);
-  const dumped = await backup.runPgDump(databaseUrl, { ...process.env, PATH: `${temporaryDirectory}:${process.env.PATH ?? ""}` });
+  const fakePgDump = join(temporaryDirectory, "pg_dump.mjs");
+  await writeFile(fakePgDump, "process.stdout.write('bun-pg-dump')\n");
+  const dumped = await backup.runPgDump(databaseUrl, process.env, { command: process.execPath, commandArgs: [fakePgDump] });
   assert.equal(dumped.toString(), "bun-pg-dump");
   assert.equal(createHash("sha256").update(uploadedArtifact).digest().length, 32);
 

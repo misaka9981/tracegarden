@@ -149,12 +149,12 @@ function boundedTimeout(timeoutMs) {
   return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : BACKUP_OPERATION_TIMEOUT_MS;
 }
 
-function runPgDump(databaseUrl, environment, { timeoutMs = BACKUP_OPERATION_TIMEOUT_MS } = {}) {
+function runPgDump(databaseUrl, environment, { timeoutMs = BACKUP_OPERATION_TIMEOUT_MS, command = "pg_dump", commandArgs = [] } = {}) {
   return new Promise((resolve, reject) => {
     const connection = databaseProcessEnvironment(databaseUrl, environment);
     let child;
     try {
-      child = spawn("pg_dump", ["--format=custom", "--no-password", `--dbname=${connection.safeUrl}`], {
+      child = spawn(command, [...commandArgs, "--format=custom", "--no-password", `--dbname=${connection.safeUrl}`], {
         env: connection.environment,
         stdio: ["ignore", "pipe", "pipe"],
       });
