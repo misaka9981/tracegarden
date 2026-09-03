@@ -23,7 +23,7 @@ pnpm acceptance                passed
 
 The acceptance run used the exact Bun image already established by Ticket 04:
 `docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2`.
-The web image ran as `bun`, read-only, non-root, capability-dropped, and ARM64; the collector remained on its Node image. The web production image contains the Bun entrypoint and not the Node web entrypoint. Existing Hono request, auth, cookie/redirect, capability, SSE, telemetry, probe, migration, and shutdown checks passed through the existing suites.
+The web image ran as `bun`, read-only, non-root, capability-dropped, and ARM64; this Ticket 05 run used the collector's then-current Node image. The web production image contains the Bun entrypoint and not the Node web entrypoint. Existing Hono request, auth, cookie/redirect, capability, SSE, telemetry, probe, migration, and shutdown checks passed through the existing suites; Ticket 06 separately proves the collector's subsequent Bun migration.
 
 ## Authorized kind check
 

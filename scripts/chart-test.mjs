@@ -75,11 +75,14 @@ assert.match(migration, /MIGRATION_DATABASE_READY_RETRY_SECONDS/);
 assert.match(migration, /databaseReadyTimeoutSeconds/);
 assert.match(migration, /databaseReadyRetrySeconds/);
 assert.match(deployments, /initContainers:/);
-assert.match(deployments, /command: \["node", "--input-type=module", "--eval"\]/);
-assert.match(deployments, /command: \["bun", "--input-type=module", "--eval"\]/);
 assert.match(deployments, /wait-for-schema/);
-assert.match(deployments.slice(0, deployments.indexOf("\n---")), /command: \["bun", "--input-type=module", "--eval"\]/);
-assert.match(deployments.slice(deployments.indexOf("\n---") + 1), /command: \["node", "--input-type=module", "--eval"\]/);
+const deploymentSections = deployments.split("\n---\n");
+assert.equal(deploymentSections.length, 2, "chart must render independent web and collector deployments");
+for (const [component, section] of [["web", deploymentSections[0]], ["collector", deploymentSections[1]]]) {
+  assert.match(section, /- name: wait-for-schema[\s\S]*?command: \["bun", "--input-type=module", "--eval"\]/, `${component} schema wait must use Bun`);
+  assert.match(section, /MIGRATION_SCHEMA_READY_TIMEOUT_SECONDS/);
+  assert.match(section, /MIGRATION_SCHEMA_READY_RETRY_SECONDS/);
+}
 assert.match(webBunSource, /createWebApplication/);
 assert.match(webBunSource, /bun\.serve/);
 assert.match(deployments, /MIGRATION_SCHEMA_READY_TIMEOUT_SECONDS/);

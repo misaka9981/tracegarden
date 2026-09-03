@@ -4,13 +4,13 @@
 
 ## Scope
 
-This evidence covers only the collector production runtime. Web, migration, backup, PostgreSQL, `pg`, pnpm, TypeScript, Node Playwright, Cluster permissions, and database schema/semantics were not migrated. The tested collector worktree was based on `c8ae474f160e9799c9375923edd7300f8b649176` with the Ticket 06 changes; the ticket and this report were added after runtime validation.
+This evidence covers only the collector production runtime; Ticket 05 separately covers the web. Migration, backup, PostgreSQL, `pg`, pnpm, TypeScript, Node Playwright, Cluster permissions, and database schema/semantics were not changed by this ticket. The tested collector worktree was based on `c8ae474f160e9799c9375923edd7300f8b649176` with the Ticket 06 changes; the ticket and this report were added after runtime validation.
 
 ## Implemented boundary
 
 - The collector production image uses the exact ARM64 Bun `1.3.14` image:
   `docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2`.
-- The collector package, Compose service, chart init check, release workflow, preflight, chart, container, and delivery checks invoke Bun. Web, migration, and backup retain their Node runtime and entrypoints.
+- The collector package, Compose service, chart init check, release workflow, preflight, chart, container, and delivery checks invoke Bun. Ticket 05 separately moved web to Bun; migration and backup retain their Node runtime and entrypoints.
 - The collector image runs as `bun`, with no separate Node base, Node entrypoint, or `/usr/local/bin/node`; Bun's intrinsic `/usr/local/bun-node-fallback-bin/node` compatibility path is part of the Bun image and is not a separate runtime.
 - The existing compiled application, production dependency, read-only root, dropped-capability, non-root, ARM64, and bounded `/tmp` boundaries remain in force.
 

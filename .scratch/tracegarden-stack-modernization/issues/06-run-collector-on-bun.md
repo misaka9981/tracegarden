@@ -14,7 +14,7 @@
 
 ## Answer
 
-Resolved with the bounded evidence in [evidence/06-collector-bun/report.md](../../../evidence/06-collector-bun/report.md). The collector alone now uses the exact ARM64 Bun 1.3.14 image and entrypoint, and the Bun gate runs the deterministic collector-resilience suite before the broader compatibility harness. Web, migration, backup, PostgreSQL, `pg`, pnpm, TypeScript, Node Playwright, and Cluster permissions remain unchanged. The authorized ARM64 VM acceptance and isolated kind smoke passed, including cleanup and preservation of the existing Caddy/kind containers. Production external integrations remain outside this ticket.
+Resolved with the bounded evidence in [evidence/06-collector-bun/report.md](../../../evidence/06-collector-bun/report.md). The collector alone now uses the exact ARM64 Bun 1.3.14 image and entrypoint, and the Bun gate runs the deterministic collector-resilience suite before the broader compatibility harness. Ticket 05 separately covers the web; migration and backup, PostgreSQL, `pg`, pnpm, TypeScript, Node Playwright, and Cluster permissions remain unchanged. The authorized ARM64 VM acceptance and isolated kind smoke passed, including cleanup and preservation of the existing Caddy/kind containers. Production external integrations remain outside this ticket.
 
 ## Safe stop rules
 

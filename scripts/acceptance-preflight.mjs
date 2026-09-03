@@ -49,6 +49,7 @@ assert.match(cleanCachePolicy, /--offline/);
 assert.match(cleanCachePolicy, /unexpectedly succeeded/);
 assert.match(acceptance, /scripts\/container-clean-cache\.mjs/);
 assert.match(packageJson.scripts["test:bun"], /bun scripts\/collector-resilience\.mjs/);
+assert.match(acceptance, /\["deterministic collector failure and recovery suites \(Bun\)", "bun", \["scripts\/collector-resilience\.mjs"\]\]/, "authoritative acceptance must run collector resilience with Bun");
 assert.match(workflow, /\$BUN_IMAGE\" scripts\/collector-resilience\.mjs/);
 for (const required of ["--no-cache", "--network", "none", "--pull=false", "container-context.mjs", "--load", "--pull=never", "--read-only", "pg_dump", "pg_restore", "id", "--version"]) {
   assert.match(cleanCacheBuild, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `clean-cache build must include ${required}`);
