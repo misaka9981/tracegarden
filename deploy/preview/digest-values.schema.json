@@ -7,11 +7,12 @@
     "images": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["web", "collector", "migrate", "postgres"],
+      "required": ["web", "collector", "migrate", "backup", "postgres"],
       "properties": {
         "web": { "$ref": "#/definitions/privateImage" },
         "collector": { "$ref": "#/definitions/privateImage" },
         "migrate": { "$ref": "#/definitions/privateImage" },
+        "backup": { "$ref": "#/definitions/privateImage" },
         "postgres": {
           "type": "object",
           "additionalProperties": false,
@@ -30,7 +31,7 @@
       "additionalProperties": false,
       "required": ["repository", "digest"],
       "properties": {
-        "repository": { "type": "string", "pattern": "^ghcr.io/misaka3389/tracegarden-(web|collector|migrate)$" },
+        "repository": { "type": "string", "pattern": "^ghcr.io/misaka3389/tracegarden-(web|collector|migrate|backup)$" },
         "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
       }
     }

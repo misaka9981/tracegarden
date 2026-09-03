@@ -9,9 +9,6 @@ const required = (name) => {
 const digest = (name) => {
   const value = required(name);
   if (!/^sha256:[a-f0-9]{64}$/.test(value)) throw new Error(`${name} must be a sha256 image digest`);
-  if (name === "BACKUP_DIGEST" && value === "sha256:4444444444444444444444444444444444444444444444444444444444444444") {
-    throw new Error("BACKUP_DIGEST must be replaced with the attested release digest");
-  }
   return value;
 };
 const releaseCommit = required("RELEASE_COMMIT");

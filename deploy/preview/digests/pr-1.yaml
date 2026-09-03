@@ -10,6 +10,9 @@ images:
   migrate:
     repository: ghcr.io/misaka3389/tracegarden-migrate
     digest: sha256:0ed108dbe1b1ed6e4e20863d050e5a7f1a9ee0e19854138d9405147a8b61019d
+  backup:
+    repository: ghcr.io/misaka3389/tracegarden-backup
+    digest: sha256:5555555555555555555555555555555555555555555555555555555555555555
   postgres:
     repository: postgres
     digest: sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7

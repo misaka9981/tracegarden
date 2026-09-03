@@ -29,12 +29,7 @@
             "web": { "$ref": "#/definitions/image" },
             "collector": { "$ref": "#/definitions/image" },
             "migrate": { "$ref": "#/definitions/image" },
-            "backup": {
-              "allOf": [
-                { "$ref": "#/definitions/backupImage" },
-                { "not": { "type": "object", "properties": { "digest": { "const": "sha256:4444444444444444444444444444444444444444444444444444444444444444" } } } }
-              ]
-            }
+            "backup": { "$ref": "#/definitions/backupImage" }
           }
         },
         "protectedEnvironment": {

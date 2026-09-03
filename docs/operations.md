@@ -6,7 +6,7 @@ Ordinary Kubernetes Observations default to 90 days. An owner can configure the 
 
 ## Backups
 
-The deployment includes a suspended-by-default CronJob template for encrypted PostgreSQL backups to S3-compatible off-VM object storage (Cloudflare R2 is one possible later configuration). It remains suspended until an HTTPS endpoint, bucket, encryption mechanism and key Secret, object-storage credential Secret, schedule, positive retention period, and off-VM destination are explicitly configured. See [Backup and restore rehearsal](backup-restore.md).
+The deployment includes an encrypted PostgreSQL backup CronJob that is omitted by default. It is rendered only when an exact immutable backup image digest, HTTPS endpoint, bucket, encryption mechanism and key Secret, object-storage credential Secret, schedule, positive retention period, and off-VM destination are explicitly configured. See [Backup and restore rehearsal](backup-restore.md).
 
 The backup process encrypts the `pg_dump` artifact before invoking the uploader. Backup and restore secrets never enter Git, ordinary ConfigMaps, command output, or application telemetry. The offline process test uses no cloud endpoint or credential.
 

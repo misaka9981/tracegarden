@@ -28,11 +28,12 @@
     "images": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["web", "collector", "migrate", "postgres"],
+      "required": ["web", "collector", "migrate", "backup", "postgres"],
       "properties": {
         "web": { "$ref": "#/definitions/image" },
         "collector": { "$ref": "#/definitions/image" },
         "migrate": { "$ref": "#/definitions/image" },
+        "backup": { "$ref": "#/definitions/image" },
         "postgres": { "$ref": "#/definitions/image" }
       }
     },

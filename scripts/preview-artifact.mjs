@@ -29,6 +29,7 @@ const images = {
   web: { repository: repository("WEB_REPOSITORY", "web"), digest: digest("WEB_DIGEST") },
   collector: { repository: repository("COLLECTOR_REPOSITORY", "collector"), digest: digest("COLLECTOR_DIGEST") },
   migrate: { repository: repository("MIGRATE_REPOSITORY", "migrate"), digest: digest("MIGRATE_DIGEST") },
+  backup: { repository: repository("BACKUP_REPOSITORY", "backup"), digest: digest("BACKUP_DIGEST") },
   postgres: { repository: "postgres", digest: "sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7" },
 };
 const declaration = {

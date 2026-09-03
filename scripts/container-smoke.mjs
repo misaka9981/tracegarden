@@ -6,7 +6,6 @@ const project = process.env.CONTAINER_SMOKE_PROJECT?.trim() || `tracegarden-smok
 const backupSmoke = process.env.CONTAINER_SMOKE_BACKUP === "1";
 const invalidUrlProject = `${project}-invalid-url`;
 const schemaFailureProject = `${project}-schema-failure`;
-const nodeImage = "node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89";
 const bunImage = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
 const postgresImage = "postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7";
 const environment = { ...process.env, COMPOSE_PROJECT_NAME: project, POSTGRES_PORT: "0" };
@@ -31,8 +30,8 @@ function expectFailure(args, extraEnvironment = environment) {
   }
 }
 
-if (!imageAvailable(nodeImage) || !imageAvailable(bunImage) || !imageAvailable(postgresImage)) {
-  throw new Error("container smoke requires the pinned Node.js 26, Bun, and PostgreSQL images; refusing to report a skipped check as passed");
+if (!imageAvailable(bunImage) || !imageAvailable(postgresImage)) {
+  throw new Error("container smoke requires the pinned Bun and PostgreSQL images; refusing to report a skipped check as passed");
 }
 
 function compose(args, composeProject = project, extraEnvironment = environment) {
@@ -170,7 +169,7 @@ try {
       if (prepareSchema) {
         compose(["exec", "-T", "postgres", "psql", "-U", "tracegarden", "-d", "tracegarden", "-c", prepareSchema], failureProject, failureEnvironment);
       }
-      compose(["build", "--pull=false"], failureProject, failureEnvironment);
+      if (process.env.CONTAINER_SMOKE_NO_BUILD !== "1") compose(["build", "--pull=false"], failureProject, failureEnvironment);
       try { compose(["up", "-d", "--pull", "never", "--no-build"], failureProject, failureEnvironment); } catch { /* expected one-shot migration failure */ }
       const failedMigration = compose(["ps", "-aq", "migrate"], failureProject, failureEnvironment);
       assert.ok(failedMigration, "the failed migration gate must create a container");

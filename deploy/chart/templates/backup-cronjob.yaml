@@ -1,4 +1,5 @@
 {{ include "tracegarden.validateBackup" . }}
+{{- if .Values.backup.enabled }}
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -108,3 +109,4 @@ spec:
                   - key: {{ .Values.backup.encryption.keySecret.key | quote }}
                     path: encryption-key
             {{- end }}
+{{- end }}

@@ -1,5 +1,4 @@
 const SHA256_DIGEST = /^sha256:[a-f0-9]{64}$/;
-const BACKUP_DIGEST_PLACEHOLDER = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
 const GIT_COMMIT = /^[a-f0-9]{40}$/;
 const PREVIEW_NUMBER = /^[1-9][0-9]{0,8}$/;
 export const TRUSTED_PREVIEW_GITOPS_REPOSITORY = "https://github.com/MISAKA3389/tracegarden-gitops.git";
@@ -238,9 +237,6 @@ export function createPromotionProposal(input: PromotionInput): PromotionProposa
     if (!reference) throw new Error(`images.${component} is required`);
     if (!reference.repository.trim()) throw new Error(`images.${component}.repository is required`);
     assertDigest(reference.digest, `images.${component}.digest`);
-    if (component === "backup" && reference.digest === BACKUP_DIGEST_PLACEHOLDER) {
-      throw new Error("images.backup.digest must be replaced with the attested release digest");
-    }
   }
   const desiredState = {
     web: `${input.images.web.repository}@${input.images.web.digest}`,

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const postgresImage = "postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7";
-const nodeImage = "node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89";
 const bunImage = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
 const smokeScripts = ["scripts/browser-smoke.mjs", "scripts/postgres-smoke.mjs", "scripts/core-loop-browser.mjs"];
 const acceptanceDocs = await readFile("docs/acceptance.md", "utf8");
@@ -16,6 +15,7 @@ const containerContext = await readFile("scripts/container-context.mjs", "utf8")
 const cleanCachePolicy = await readFile("scripts/container-context-clean-cache.mjs", "utf8");
 const cleanCacheBuild = await readFile("scripts/container-clean-cache.mjs", "utf8");
 const acceptance = await readFile("scripts/acceptance.mjs", "utf8");
+assert.doesNotMatch(workflow, /NODE_IMAGE|node:26-bookworm/, "production container workflow must not require a Node runtime image");
 for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Dockerfile", "deploy/docker/migrate.Dockerfile"]) {
   const dockerfile = await readFile(path, "utf8");
   assert.match(dockerfile, /COPY --from=frozen \/dist\//, `${path} must consume the generated frozen build context`);
@@ -92,7 +92,12 @@ for (const path of smokeScripts) {
 }
 
 assert.ok(acceptanceDocs.includes(`docker image inspect '${postgresImage}'`), "acceptance docs must state the exact PostgreSQL image prerequisite");
-assert.ok(acceptanceDocs.includes(`docker image inspect '${nodeImage}'`), "acceptance docs must state the exact Node.js image prerequisite");
 assert.ok(acceptanceDocs.includes(`docker image inspect '${bunImage}'`), "acceptance docs must state the exact Bun image prerequisite");
 assert.match(compose, /migrate:[\s\S]*?user: bun/, "docker-compose migration must run as Bun");
+for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Dockerfile", "deploy/docker/migrate.Dockerfile", "deploy/docker/backup.Dockerfile"]) {
+  const dockerfile = await readFile(path, "utf8");
+  const bunBases = [...dockerfile.matchAll(/^FROM\s+(\S+)/gm)].map(([, image]) => image).filter((image) => image === bunImage);
+  assert.deepEqual(bunBases, [bunImage], `${path} must use exactly one shared pinned Bun base`);
+  assert.doesNotMatch(dockerfile, /^FROM\s+node:|(?:CMD|ENTRYPOINT)\s+\["node"/im, `${path} must not retain a Node production runtime`);
+}
 console.log("offline acceptance preflight policy passed: pinned images, network-disabled frozen application builds, and pull-never smoke runs");

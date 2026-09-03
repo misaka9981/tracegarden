@@ -23,11 +23,10 @@ The workflow runs the compiled-ESM Bun compatibility gate and the dedicated Bun 
 
 ```sh
 docker image inspect 'postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7'
-docker image inspect 'node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89'
 docker image inspect 'docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2'
 ```
 
-Also keep Chromium, Helm, kubeconform, and dependencies available locally. The browser, PostgreSQL, core-loop, and container smokes fail closed when their pinned images are absent; none runs `docker pull`. Each database/container/browser/process check owns cleanup; a failed step stops the workflow.
+Also keep Chromium, Helm, kubeconform, and dependencies available locally. Node.js 26.8.x is required for the pnpm, TypeScript, and Node-based validation toolchain; no Node production image is required. The browser, PostgreSQL, core-loop, and container smokes fail closed when their pinned images are absent; none runs `docker pull`. Each database/container/browser/process check owns cleanup; a failed step stops the workflow.
 
 ## Evidence boundary
 

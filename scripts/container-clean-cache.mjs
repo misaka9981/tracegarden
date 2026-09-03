@@ -1,7 +1,6 @@
 import { execFileSync } from "node:child_process";
 
 const context = process.env.TRACEGARDEN_CONTAINER_CONTEXT?.trim() || ".scratch/container-context";
-const nodeImage = "node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89";
 const bunImage = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
 const postgresImage = "postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7";
 const builds = [
@@ -25,7 +24,6 @@ function requireImage(image) {
   }
 }
 
-requireImage(nodeImage);
 requireImage(bunImage);
 requireImage(postgresImage);
 execFileSync(process.execPath, ["scripts/container-context.mjs"], { stdio: "inherit" });

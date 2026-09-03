@@ -68,6 +68,30 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
   assert.ok(postGatePublication.indexOf("Attest " + service + " SBOM") < postGatePublication.indexOf("Attest " + service + " provenance"), `${service} attestations must have identical ordering`);
 }
 
+const previewStart = ciWorkflow.indexOf("\n  preview-publish:");
+const previewEnd = ciWorkflow.indexOf("\n  security:", previewStart);
+assert.ok(previewStart >= 0 && previewEnd > previewStart, "preview publication job must be declared");
+const previewWorkflow = ciWorkflow.slice(previewStart, previewEnd);
+const previewBuilds = [...previewWorkflow.matchAll(/docker buildx build[^\n]*/g)].map(([line]) => line);
+assert.equal(previewBuilds.length, 4, "preview must build web, collector, migrate, and backup");
+assert.ok(previewBuilds.every((line) => line.includes("--provenance=false") && line.includes("--sbom=false") && line.includes("--network none") && line.includes("--pull=false")), "preview builds must disable attestations, network access, and pulls");
+const previewSmoke = previewWorkflow.indexOf("Smoke-test exact preview digests");
+const previewScan = previewWorkflow.indexOf("Scan exact preview digests before attestation");
+const previewSbom = previewWorkflow.indexOf("Generate SBOMs for exact preview digests");
+assert.ok(previewSmoke >= 0 && previewScan > previewSmoke && previewSbom > previewScan, "preview smoke and CVE gates must precede SBOM generation");
+assert.match(previewWorkflow, /CONTAINER_SMOKE_NO_BUILD: "1"/);
+const previewPreGate = previewWorkflow.slice(0, previewSbom);
+assert.doesNotMatch(previewPreGate, /actions\/attest-(?:sbom|build-provenance)@/, "preview must not attest before exact-digest gates");
+const previewPostGate = previewWorkflow.slice(previewSbom);
+for (const service of ["web", "collector", "migrate", "backup"]) {
+  assert.match(previewPostGate, new RegExp(`Attest preview ${service} SBOM`));
+  assert.match(previewPostGate, new RegExp(`Attest preview ${service} provenance`));
+  assert.ok(previewPostGate.includes("subject-digest: ${{ steps." + service + ".outputs.digest }}"));
+}
+assert.ok(previewWorkflow.includes("backup_digest: ${{ steps.backup.outputs.digest }}"));
+assert.ok(previewWorkflow.includes('BACKUP_REPOSITORY="${IMAGE_PREFIX}-backup"'));
+assert.ok(previewWorkflow.includes('BACKUP_DIGEST="${{ steps.backup.outputs.digest }}"'));
+
 function schemaError(path, message) {
   throw new Error(`${path}: ${message}`);
 }
@@ -202,7 +226,7 @@ assert.equal(appProject.spec.namespaceResourceWhitelist.some(({ kind }) => kind 
 assert.equal(appProject.spec.namespaceResourceWhitelist.some(({ kind }) => kind === "ServiceAccount"), false);
 assert.equal("preview" in previewDigestValues, false);
 assert.ok(previewDigestValues.images);
-for (const component of ["web", "collector", "migrate", "postgres"]) {
+for (const component of ["web", "collector", "migrate", "backup", "postgres"]) {
   assert.match(previewDigestValues.images[component].digest, /^sha256:[a-f0-9]{64}$/);
 }
 assert.equal(lifecycle.spec.cleanup.onPullRequestState.closed, "delete");
@@ -259,11 +283,10 @@ assert.equal(promotion.spec.gitOps.pullRequestRequired, true);
 assert.equal(promotion.spec.gitOps.directClusterMutation, false);
 assert.equal(promotion.spec.images.backup.repository, "ghcr.io/misaka3389/tracegarden-backup");
 assert.match(promotion.spec.images.backup.digest, /^sha256:[a-f0-9]{64}$/);
-assert.notEqual(promotion.spec.images.backup.digest, "sha256:4444444444444444444444444444444444444444444444444444444444444444");
 const invalidPromotion = structuredClone(promotion);
-invalidPromotion.spec.images.backup.digest = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+invalidPromotion.spec.images.backup.digest = "not-a-digest";
 const promotionSchema = JSON.parse(await read("deploy/promotion/promotion.schema.json"));
-assert.throws(() => validateSchema(invalidPromotion, promotionSchema), /excluded schema/);
+assert.throws(() => validateSchema(invalidPromotion, promotionSchema), /pattern/);
 assert.match(desiredState, /releaseCommit: [a-f0-9]{40}/);
 assert.equal([...desiredState.matchAll(/@sha256:[a-f0-9]{64}/g)].length, 4);
 assert.equal(
@@ -469,10 +492,10 @@ assert.equal(proposal.review.mechanism, "gitops-pull-request");
 assert.equal(proposal.desiredState.backup, "example/backup@sha256:" + "5".repeat(64));
 assert.throws(() => createPromotionProposal({
   releaseCommit: commit,
-  images: { ...images, backup: { ...images.backup, digest: "sha256:" + "4".repeat(64) } },
+  images: { ...images, backup: { ...images.backup, digest: "not-a-digest" } },
   approval: { environment: "production", approved: true, reviewer: "maintainer" },
   gitOps: { repository: "gitops", path: "production/values.yaml", pullRequestRequired: true },
-}), /attested release digest/);
+}), /sha256 image digest/);
 assert.throws(() => createPromotionProposal({
   releaseCommit: commit,
   images,
@@ -493,6 +516,8 @@ const artifactEnvironment = {
   COLLECTOR_DIGEST: `sha256:${"2".repeat(64)}`,
   MIGRATE_REPOSITORY: "ghcr.io/misaka3389/tracegarden-migrate",
   MIGRATE_DIGEST: `sha256:${"3".repeat(64)}`,
+  BACKUP_REPOSITORY: "ghcr.io/misaka3389/tracegarden-backup",
+  BACKUP_DIGEST: `sha256:${"5".repeat(64)}`,
 };
 const artifact = spawnSync(process.execPath, ["scripts/preview-artifact.mjs", artifactPath, valuePath], {
   encoding: "utf8",
@@ -510,6 +535,7 @@ validateSchema(generatedValues, digestValuesSchema);
 assert.equal(generatedValues.images.web.digest, `sha256:${"1".repeat(64)}`);
 assert.equal(generatedValues.images.collector.digest, `sha256:${"2".repeat(64)}`);
 assert.equal(generatedValues.images.migrate.digest, `sha256:${"3".repeat(64)}`);
+assert.equal(generatedValues.images.backup.digest, `sha256:${"5".repeat(64)}`);
 assert.equal(generatedValues.images.postgres.digest, "sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7");
 assert.equal("preview" in generatedValues, false);
 const generatedMetadata = await parseYaml(artifactPath);
@@ -538,9 +564,9 @@ const generatedPromotion = await parseYaml(promotionArtifactPath);
 assert.equal(generatedPromotion.spec.images.backup, `ghcr.io/misaka3389/tracegarden-backup@sha256:${"5".repeat(64)}`);
 const invalidPromotionArtifact = spawnSync(process.execPath, ["scripts/promotion-artifact.mjs", join(artifactDirectory, "invalid-promotion.yaml")], {
   encoding: "utf8",
-  env: { ...promotionArtifactEnvironment, BACKUP_DIGEST: `sha256:${"4".repeat(64)}` },
+  env: { ...promotionArtifactEnvironment, BACKUP_DIGEST: "not-a-digest" },
 });
-assert.notEqual(invalidPromotionArtifact.status, 0, "promotion artifact must reject the backup digest placeholder");
+assert.notEqual(invalidPromotionArtifact.status, 0, "promotion artifact must reject an invalid backup digest");
 rmSync(artifactDirectory, { recursive: true, force: true });
 
 const lifecycleCheck = spawnSync(process.execPath, ["scripts/preview-lifecycle-controller.mjs"], {

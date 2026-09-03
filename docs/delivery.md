@@ -14,7 +14,7 @@ Pull requests run required checks before they are eligible for preview or merge:
 4. Unit and deterministic collector tests.
 5. PostgreSQL migration and repository integration tests.
 6. Web build and Playwright smoke tests.
-7. Non-root container builds for web and collector.
+7. Non-root production container builds for web, collector, migration, and backup.
 8. Helm render and Kubernetes schema validation.
 9. Dependency, image, secret-pattern, and supply-chain checks selected during implementation.
 

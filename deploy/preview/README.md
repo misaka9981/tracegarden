@@ -61,10 +61,10 @@ operator-managed configuration, not PR values or credentials.
 collector, migration, and backup images, protected production approval
 requirement, and GitOps pull-request requirement. CI emits a complete,
 reviewable desired-state artifact with the gated `backup_digest`; remote GitOps
-PR creation remains deferred. The chart values retain a documentation-only
-placeholder while backup is disabled; replace it, and refresh the offline
-promotion/desired-state fixtures, with the attested release digest before
-enabling or promoting backup. `deploy/gitops/production/application.yaml`
+PR creation remains deferred. Preview carries the immutable backup digest for
+publication handoff but has no backup workload; production chart values select
+no backup image. Supply the attested release digest through trusted desired
+state before enabling or promoting backup. `deploy/gitops/production/application.yaml`
 declares Argo CD's pull source. Live GitHub, Cloudflare, Argo CD, registry, and
 Cluster behavior remain **unverified** until authorized infrastructure is
 provided.

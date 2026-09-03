@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 const errors = [];
 const immutableDigest = /@sha256:[a-f0-9]{64}/;
+const bunImage = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
 const actionFiles = [];
 
 async function visit(directory) {
@@ -124,22 +125,51 @@ for (const required of [
   "backup_digest: ${{ steps.backup.outputs.digest }}",
   "backup_ref=\"${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}\"",
   "CONTAINER_SMOKE_BACKUP: \"1\"",
-  "test \"$BACKUP_DIGEST\" != sha256:4444444444444444444444444444444444444444444444444444444444444444",
 ]) {
   if (!workflowText.includes(required)) errors.push(`release backup gate is missing ${required}`);
+}
+const previewStart = ciWorkflow.indexOf("\n  preview-publish:");
+const previewEnd = ciWorkflow.indexOf("\n  security:", previewStart);
+const previewWorkflow = previewStart >= 0 && previewEnd > previewStart ? ciWorkflow.slice(previewStart, previewEnd) : "";
+const previewBuilds = [...previewWorkflow.matchAll(/docker buildx build[^\n]*/g)].map(([line]) => line);
+const previewSmoke = previewWorkflow.indexOf("Smoke-test exact preview digests");
+const previewScan = previewWorkflow.indexOf("Scan exact preview digests before attestation");
+const previewSbom = previewWorkflow.indexOf("Generate SBOMs for exact preview digests");
+if (previewBuilds.length !== 4 || previewBuilds.some((line) => !line.includes("--provenance=false") || !line.includes("--sbom=false") || !line.includes("--network none") || !line.includes("--pull=false"))) {
+  errors.push("preview publication must build all four images once with pre-gate attestations disabled");
+}
+if (previewSmoke < 0 || previewScan <= previewSmoke || previewSbom <= previewScan || !previewWorkflow.includes("CONTAINER_SMOKE_NO_BUILD: \"1\"")) {
+  errors.push("preview publication must smoke-test exact digests without a second build and CVE-scan before SBOM generation");
+}
+const previewPreGate = previewWorkflow.slice(0, Math.max(previewSbom, 0));
+if (/actions\/attest-(?:sbom|build-provenance)@/.test(previewPreGate) || previewPreGate.includes("--provenance=mode") || previewPreGate.includes("--sbom=true")) {
+  errors.push("preview publication must not attach or generate attestations before exact-digest gates");
+}
+const previewPostGate = previewWorkflow.slice(Math.max(previewSbom, 0));
+for (const service of ["web", "collector", "migrate", "backup"]) {
+  if (!previewPostGate.includes("Attest preview " + service + " SBOM") || !previewPostGate.includes("Attest preview " + service + " provenance") || !previewPostGate.includes("subject-digest: ${{ steps." + service + ".outputs.digest }}")) {
+    errors.push(`preview publication is missing post-gate attestations for ${service}`);
+  }
+  if (previewPostGate.indexOf("Attest preview " + service + " SBOM") > previewPostGate.indexOf("Attest preview " + service + " provenance")) {
+    errors.push(`preview attestations are out of order for ${service}`);
+  }
+}
+if (!previewWorkflow.includes("backup_digest: ${{ steps.backup.outputs.digest }}") || !previewWorkflow.includes("BACKUP_REPOSITORY=\"${IMAGE_PREFIX}-backup\"") || !previewWorkflow.includes("BACKUP_DIGEST=\"${{ steps.backup.outputs.digest }}\"")) {
+  errors.push("preview publication must carry the exact backup digest into its artifact outputs");
 }
 if (/--platform linux\/arm64/.test(workflowText) && !workflowText.includes("runs-on: ubuntu-24.04-arm")) {
   errors.push("ARM64 builds require a native ARM runner or immutable-pinned QEMU setup");
 }
 if (/:latest\b|:main\b|:master\b|:edge\b/.test(workflowText)) errors.push("workflow suite must not publish mutable image tags");
+if (workflowText.includes("NODE_IMAGE") || workflowText.includes("node:26-bookworm")) errors.push("production container workflow must not require a Node runtime image");
 
 for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Dockerfile", "deploy/docker/migrate.Dockerfile", "deploy/docker/backup.Dockerfile"]) {
   const source = await readFile(path, "utf8");
   const bases = [...source.matchAll(/^FROM\s+(\S+)/gm)].map(([, image]) => image);
   if (!bases.length || bases.some((image) => !immutableDigest.test(image))) errors.push(`${path}: every base image must be digest-pinned`);
-  if (path.endsWith("/web.Dockerfile") && (!source.includes("docker.io/oven/bun:1.3.14-slim@sha256:") || !source.includes('CMD ["bun", "dist/apps/web/src/bun.js"]') || source.includes("node:26.8"))) {
-    errors.push("web production image must use the pinned Bun runtime and no Node base");
-  }
+  const bunBases = bases.filter((image) => image === bunImage);
+  if (bunBases.length !== 1) errors.push(`${path}: exactly one shared pinned Bun base is required`);
+  if (/^FROM\s+node:|(?:CMD|ENTRYPOINT)\s+\["node"/im.test(source)) errors.push(`${path}: Node cannot remain a production runtime`);
 }
 const collectorDockerfile = await readFile("deploy/docker/collector.Dockerfile", "utf8");
 if (!collectorDockerfile.startsWith("FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2\n")) errors.push("collector Dockerfile must use the pinned Bun 1.3.14 base");
@@ -194,12 +224,16 @@ const chartTest = await readFile("scripts/chart-test.mjs", "utf8");
 if (!chartTest.includes("kubeconform.mjs") || !kubeconformAdapter.includes("-schema-location")) errors.push("chart tests must pass an explicit schema location");
 const chartValues = await readFile("deploy/chart/values.yaml", "utf8");
 const chartHelpers = await readFile("deploy/chart/templates/_helpers.tpl", "utf8");
-if (!chartValues.includes("Documentation-only placeholder") || !chartHelpers.includes("images.backup.digest must be replaced with the attested release digest")) {
-  errors.push("backup chart values must document and fail closed on the digest placeholder");
+const backupValues = chartValues.slice(chartValues.indexOf("  backup:\n"), chartValues.indexOf("  postgres:\n"));
+if (!chartValues.includes("enabled: false") || !backupValues.includes('digest: ""')) {
+  errors.push("backup chart defaults must omit the image and contain no sentinel digest");
 }
-const chartDigests = [...chartValues.matchAll(/^\s+digest:\s+(\S+)/gm)].map(([, digest]) => digest);
-if (!chartDigests.length || !chartDigests.every((digest) => /^sha256:[a-f0-9]{64}$/.test(digest))) {
-  errors.push("deploy/chart/values.yaml: every deployment digest must be immutable");
+if (!chartHelpers.includes("images.backup.digest is required when backup.enabled is true")) {
+  errors.push("backup chart must fail closed when enabled without an immutable digest");
+}
+const chartDigests = [...chartValues.matchAll(/^\s+digest:\s+(\S+)/gm)].map(([, digest]) => digest).filter((digest) => digest !== '""');
+if (chartDigests.length !== 4 || !chartDigests.every((digest) => /^sha256:[a-f0-9]{64}$/.test(digest))) {
+  errors.push("deploy/chart/values.yaml: configured image digests must be immutable");
 }
 
 const deliveryDeclarations = {
@@ -225,7 +259,7 @@ for (const path of Object.keys(deliveryDeclarations)) {
 if (!workflowText.includes("promotion-proposal") || !workflowText.includes("environment: production") || /git push|kubectl|kubeadm/i.test(workflowText)) {
   errors.push("promotion workflow must be protected, reviewable, and free of direct Cluster or Git pushes");
 }
-for (const required of ["preview-publish", "github.event.pull_request.draft == false", "PREVIEW_COMMIT", "preview-artifact.mjs", "preview-image-declaration.yaml", "environments/previews/digests/pr-", "preview-digests", "steps.web.outputs.digest", "steps.collector.outputs.digest", "steps.migrate.outputs.digest"]) {
+for (const required of ["preview-publish", "github.event.pull_request.draft == false", "PREVIEW_COMMIT", "preview-artifact.mjs", "preview-image-declaration.yaml", "environments/previews/digests/pr-", "preview-digests", "steps.web.outputs.digest", "steps.collector.outputs.digest", "steps.migrate.outputs.digest", "steps.backup.outputs.digest", "BACKUP_REPOSITORY=", "BACKUP_DIGEST="]) {
   if (!workflowText.includes(required)) errors.push(`preview publication is missing ${required}`);
 }
 const applicationSet = deliveryDeclarations.applicationSet;

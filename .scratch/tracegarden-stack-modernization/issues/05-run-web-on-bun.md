@@ -14,7 +14,7 @@
 
 ## Answer
 
-Implemented and verified the web-only Bun runtime migration. The Hono application is served directly by Bun's `fetch` interface; no Node web listener or runtime fallback remains in the current source or production image. PostgreSQL, `pg`, pnpm, TypeScript, and the Node Playwright runner remain unchanged. The previous Node entrypoint remains recoverable from the parent commit only. The full evidence report is `evidence/05-bun-web/report.md`, including the ARM64 VM acceptance and the run-labelled authorized kind image execution/cleanup check. This ticket did not migrate the collector, migration, or backup processes; Ticket 06 separately covers the collector, while migration and backup remain on Node pending their tickets.
+Implemented and verified the web-only Bun runtime migration. The Hono application is served directly by Bun's `fetch` interface; no Node web listener or runtime fallback remains in the current source or production image. PostgreSQL, `pg`, pnpm, TypeScript, and the Node Playwright runner remain unchanged. The previous Node entrypoint remains recoverable from the parent commit only. The full evidence report is `evidence/05-bun-web/report.md`, including the ARM64 VM acceptance and the run-labelled authorized kind image execution/cleanup check. This ticket did not migrate the collector, migration, or backup processes. Tickets 06, 07, and 08 subsequently moved those processes to Bun independently; this answer records the web-only scope at the time of this ticket.
 
 ## Safe stop rules
 

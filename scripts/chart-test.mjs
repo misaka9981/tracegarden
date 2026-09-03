@@ -40,7 +40,7 @@ assert.ok(schema.required.includes("backup"));
 assert.ok(schema.properties.images.required.includes("backup"));
 assert.match(values, /enabled: false/);
 assert.match(backup, /kind: CronJob/);
-assert.match(backup, /suspend: \{\{ not \.Values\.backup\.enabled \}\}/);
+assert.match(backup, /if \.Values\.backup\.enabled/);
 assert.match(backup, /BACKUP_ENCRYPTION_MECHANISM/);
 assert.match(backup, /BACKUP_CREDENTIALS_SOURCE/);
 assert.match(backup, /secretKeyRef:/);
@@ -170,11 +170,11 @@ assert.doesNotMatch(privatePreviewRender.stdout, /name: tracegarden-preview-1-co
 const migrationName = (render) => render.match(/name: ([a-z0-9-]+-migration-[a-f0-9]{12})\n/)?.[1];
 assert.ok(migrationName(freshRender));
 assert.notEqual(migrationName(freshRender), migrationName(upgradeRender));
-assert.equal((freshRender.match(/^kind:/gm) ?? []).length, 21);
-assert.equal((upgradeRender.match(/^kind:/gm) ?? []).length, 21);
-assert.match(freshRender, /kind: CronJob/);
-assert.match(freshRender, /suspend: true/);
+assert.equal((freshRender.match(/^kind:/gm) ?? []).length, 20);
+assert.equal((upgradeRender.match(/^kind:/gm) ?? []).length, 20);
+assert.doesNotMatch(freshRender, /kind: CronJob/);
 assert.doesNotMatch(freshRender, /name: BACKUP_ENDPOINT/);
+assert.doesNotMatch(freshRender, /tracegarden-backup@/);
 const disabledEndpointRender = renderAndValidate(["--set", "backup.endpoint=https://storage.example.test"]);
 assert.doesNotMatch(disabledEndpointRender, /name: BACKUP_ENDPOINT/);
 const disabledIpv4EndpointRender = renderAndValidate(["--set", "backup.endpoint=https://1.1.1.1"]);
@@ -198,11 +198,11 @@ const enabledRender = renderAndValidate(completeEnabledBackupArgs);
 assert.match(enabledRender, /suspend: false/);
 assert.match(enabledRender, /backup-status: "configured"/);
 assert.match(enabledRender, /tracegarden-backup@sha256:5555555555555555555555555555555555555555555555555555555555555555/);
-const placeholderEnabledRender = renderChart([
+const missingBackupDigestRender = renderChart([
   ...completeEnabledBackupArgs,
-  "--set", "images.backup.digest=sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "--set", "images.backup.digest=",
 ]);
-assert.notEqual(placeholderEnabledRender.status, 0, "enabled backup must reject the digest placeholder");
+assert.notEqual(missingBackupDigestRender.status, 0, "enabled backup must reject a missing digest");
 const enabledIpv4Render = renderAndValidate([...completeEnabledBackupArgs, "--set", "backup.endpoint=https://1.1.1.1"]);
 assert.match(enabledIpv4Render, /suspend: false/);
 const placeholderRender = renderChart(completeEnabledBackupArgs.map((argument) => argument.replace("1.1.1.0/24", "192.0.2.0/24")));

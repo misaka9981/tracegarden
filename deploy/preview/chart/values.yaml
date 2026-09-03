@@ -18,6 +18,10 @@ images:
   migrate:
     repository: ghcr.io/misaka3389/tracegarden-migrate
     digest: ""
+  # Carried for the immutable publication handoff; Preview has no backup workload.
+  backup:
+    repository: ghcr.io/misaka3389/tracegarden-backup
+    digest: sha256:5555555555555555555555555555555555555555555555555555555555555555
   postgres:
     repository: postgres
     digest: ""

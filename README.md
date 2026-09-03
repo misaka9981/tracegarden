@@ -4,7 +4,7 @@ Tracegarden is a self-hosted change and incident timeline for a personal Kuberne
 
 ## Foundation
 
-The repository is a pnpm TypeScript 7 monorepo with independent web and collector processes. The foundation includes a PostgreSQL migration boundary, health endpoints, a bilingual status page (Simplified Chinese by default), and credential-free local smoke tests. Browser checks use Playwright; container checks fail rather than pass when a pinned Node 26, Bun 1.3.14, or PostgreSQL image is unavailable locally.
+The repository is a pnpm TypeScript 7 monorepo with independent web and collector processes. The foundation includes a PostgreSQL migration boundary, health endpoints, a bilingual status page (Simplified Chinese by default), and credential-free local smoke tests. Browser checks use Playwright; container checks fail rather than pass when a pinned Bun 1.3.14 or PostgreSQL image is unavailable locally. Node.js remains the host toolchain for pnpm, TypeScript, and validation scripts.
 
 ```sh
 pnpm install --frozen-lockfile

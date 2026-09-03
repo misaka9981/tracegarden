@@ -38,7 +38,7 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- printf "%s@%s" $image.repository $image.digest -}}
 {{- end }}
 
-{{/* Backup configuration is fail-closed; an incomplete path stays suspended. */}}
+{{/* Backup configuration is fail-closed; an incomplete path stays omitted. */}}
 {{- define "tracegarden.validateBackup" -}}
 {{- $endpointPattern := "^https://([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(/[^\\s?#]*)?$" }}
 {{- $numericHostEndpointPattern := "^https://[0-9]+(\\.[0-9]+)*(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(/[^\\s?#]*)?$" }}
@@ -54,7 +54,7 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- if not (or (regexMatch $ipv4CidrPattern .) (regexMatch $ipv6CidrPattern .)) }}{{ fail "backup.endpointCIDRs must contain valid IPv4 or IPv6 CIDRs" }}{{ end }}
 {{- end }}
 {{- if .Values.backup.enabled }}
-{{- if eq .Values.images.backup.digest "sha256:4444444444444444444444444444444444444444444444444444444444444444" }}{{ fail "images.backup.digest must be replaced with the attested release digest before backup.enabled is true" }}{{ end }}
+{{- $_ := required "images.backup.digest is required when backup.enabled is true" .Values.images.backup.digest }}
 {{- $_ := required "backup.endpoint is required when backup.enabled is true" .Values.backup.endpoint }}
 {{- range .Values.backup.endpointCIDRs }}
 {{- $cidr := lower . }}

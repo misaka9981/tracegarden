@@ -18,7 +18,6 @@ concurrency:
 env:
   NODE_VERSION: 26.8.1
   PNPM_VERSION: 11.9.0
-  NODE_IMAGE: node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89
   BUN_IMAGE: docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2
   POSTGRES_IMAGE: postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7
   HELM_IMAGE: docker.io/alpine/helm:3.17.3@sha256:d899e6316789fec04ee95300a18e454b7942539cbb3d89bde3e0655d6ca2e895
@@ -112,7 +111,6 @@ jobs:
       - run: npm install --global pnpm@${PNPM_VERSION}
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: docker pull --platform linux/arm64 "$NODE_IMAGE"
       - run: docker pull --platform linux/arm64 "$POSTGRES_IMAGE"
       - run: docker pull --platform linux/arm64 "$BUN_IMAGE"
       - run: pnpm test:container
@@ -237,6 +235,7 @@ jobs:
       web_digest: ${{ steps.web.outputs.digest }}
       collector_digest: ${{ steps.collector.outputs.digest }}
       migrate_digest: ${{ steps.migrate.outputs.digest }}
+      backup_digest: ${{ steps.backup.outputs.digest }}
     env:
       GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
       IMAGE_PREFIX: ghcr.io/${{ vars.GHCR_NAMESPACE }}/tracegarden
@@ -255,7 +254,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: node scripts/container-context.mjs
-      - run: docker pull --platform linux/arm64 "$NODE_IMAGE"
       - run: docker pull --platform linux/arm64 "$BUN_IMAGE"
       - name: Verify preview publication namespace configuration
         run: test "$GHCR_NAMESPACE" = misaka3389 && test "$GHCR_NAMESPACE" = "${GHCR_NAMESPACE,,}"
@@ -271,20 +269,158 @@ jobs:
         id: web
         run: |
           set -eu
-          docker buildx build --network none --pull=false --build-context frozen=.scratch/container-context --platform linux/arm64 --file deploy/docker/web.Dockerfile --tag "${IMAGE_PREFIX}-web:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-web.json" .
+          docker buildx build --network none --pull=false --build-context frozen=.scratch/container-context --platform linux/arm64 --file deploy/docker/web.Dockerfile --tag "${IMAGE_PREFIX}-web:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-web.json" .
           echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/preview-web.json")" >> "$GITHUB_OUTPUT"
       - name: Publish pull-request collector image
         id: collector
         run: |
           set -eu
-          docker buildx build --network none --pull=false --build-context frozen=.scratch/container-context --platform linux/arm64 --file deploy/docker/collector.Dockerfile --tag "${IMAGE_PREFIX}-collector:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-collector.json" .
+          docker buildx build --network none --pull=false --build-context frozen=.scratch/container-context --platform linux/arm64 --file deploy/docker/collector.Dockerfile --tag "${IMAGE_PREFIX}-collector:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-collector.json" .
           echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/preview-collector.json")" >> "$GITHUB_OUTPUT"
       - name: Publish pull-request migration image
         id: migrate
         run: |
           set -eu
-          docker buildx build --network none --pull=false --build-context frozen=.scratch/container-context --platform linux/arm64 --file deploy/docker/migrate.Dockerfile --tag "${IMAGE_PREFIX}-migrate:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=mode=max --sbom=true --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-migrate.json" .
+          docker buildx build --network none --pull=false --build-context frozen=.scratch/container-context --platform linux/arm64 --file deploy/docker/migrate.Dockerfile --tag "${IMAGE_PREFIX}-migrate:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-migrate.json" .
           echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/preview-migrate.json")" >> "$GITHUB_OUTPUT"
+      - name: Publish pull-request backup image
+        id: backup
+        run: |
+          set -eu
+          docker buildx build --network none --pull=false --build-context frozen=.scratch/container-context --platform linux/arm64 --file deploy/docker/backup.Dockerfile --tag "${IMAGE_PREFIX}-backup:pr-${PREVIEW_NUMBER}-${PREVIEW_COMMIT}" --push --provenance=false --sbom=false --label "org.opencontainers.image.revision=${PREVIEW_COMMIT}" --metadata-file "$RUNNER_TEMP/preview-backup.json" .
+          echo "digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/preview-backup.json")" >> "$GITHUB_OUTPUT"
+      - name: Pull preview digests for exact gates
+        run: |
+          set -eu
+          web_ref="${IMAGE_PREFIX}-web@${{ steps.web.outputs.digest }}"
+          collector_ref="${IMAGE_PREFIX}-collector@${{ steps.collector.outputs.digest }}"
+          migrate_ref="${IMAGE_PREFIX}-migrate@${{ steps.migrate.outputs.digest }}"
+          backup_ref="${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}"
+          docker pull --platform linux/arm64 "$POSTGRES_IMAGE"
+          docker pull --platform linux/arm64 "$TRIVY_IMAGE"
+          docker pull --platform linux/arm64 "$web_ref"
+          docker pull --platform linux/arm64 "$collector_ref"
+          docker pull --platform linux/arm64 "$migrate_ref"
+          docker pull --platform linux/arm64 "$backup_ref"
+          cat > "$RUNNER_TEMP/tracegarden-preview-compose.yml" <<EOF
+          services:
+            web:
+              image: $web_ref
+            collector:
+              image: $collector_ref
+            migrate:
+              image: $migrate_ref
+            backup:
+              image: $backup_ref
+              user: bun
+              read_only: true
+              tmpfs:
+                - /tmp:rw,noexec,nosuid,size=64m
+              cap_drop:
+                - ALL
+              security_opt:
+                - no-new-privileges:true
+              restart: "no"
+          EOF
+      - name: Smoke-test exact preview digests
+        env:
+          COMPOSE_FILE: docker-compose.yml:${{ runner.temp }}/tracegarden-preview-compose.yml
+          CONTAINER_SMOKE_NO_BUILD: "1"
+          CONTAINER_SMOKE_BACKUP: "1"
+          CONTAINER_SMOKE_PROJECT: tracegarden-preview-${{ github.run_id }}-${{ github.run_attempt }}
+        run: pnpm test:container
+      - name: Scan exact preview digests before attestation
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/tracegarden-preview-cve" "$RUNNER_TEMP/trivy-preview-cache"
+          failed=0
+          for service_ref in \
+            "${IMAGE_PREFIX}-web@${{ steps.web.outputs.digest }}" \
+            "${IMAGE_PREFIX}-collector@${{ steps.collector.outputs.digest }}" \
+            "${IMAGE_PREFIX}-migrate@${{ steps.migrate.outputs.digest }}" \
+            "${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}"; do
+            service="${service_ref##*/}"
+            service="${service%%@*}"
+            status=0
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP/tracegarden-preview-cve:/reports" \
+              -v "$RUNNER_TEMP/trivy-preview-cache:/root/.cache" \
+              "$TRIVY_IMAGE" image --format json --output "/reports/${service}.json" \
+              --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "$service_ref" || status=$?
+            if [ "$status" -ne 0 ]; then failed=1; fi
+          done
+          exit "$failed"
+      - name: Generate SBOMs for exact preview digests
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/tracegarden-preview-sbom" "$RUNNER_TEMP/trivy-preview-cache"
+          for service_ref in \
+            "${IMAGE_PREFIX}-web@${{ steps.web.outputs.digest }}" \
+            "${IMAGE_PREFIX}-collector@${{ steps.collector.outputs.digest }}" \
+            "${IMAGE_PREFIX}-migrate@${{ steps.migrate.outputs.digest }}" \
+            "${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}"; do
+            service="${service_ref##*/}"
+            service="${service%%@*}"
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP/tracegarden-preview-sbom:/reports" \
+              -v "$RUNNER_TEMP/trivy-preview-cache:/root/.cache" \
+              "$TRIVY_IMAGE" image --format spdx-json --output "/reports/${service}.spdx.json" "$service_ref"
+            test -s "$RUNNER_TEMP/tracegarden-preview-sbom/${service}.spdx.json"
+          done
+      - name: Attest preview web SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-web
+          subject-digest: ${{ steps.web.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/tracegarden-preview-sbom/web.spdx.json
+          push-to-registry: true
+      - name: Attest preview web provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-web
+          subject-digest: ${{ steps.web.outputs.digest }}
+          push-to-registry: true
+      - name: Attest preview collector SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-collector
+          subject-digest: ${{ steps.collector.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/tracegarden-preview-sbom/collector.spdx.json
+          push-to-registry: true
+      - name: Attest preview collector provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-collector
+          subject-digest: ${{ steps.collector.outputs.digest }}
+          push-to-registry: true
+      - name: Attest preview migrate SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-migrate
+          subject-digest: ${{ steps.migrate.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/tracegarden-preview-sbom/migrate.spdx.json
+          push-to-registry: true
+      - name: Attest preview migrate provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-migrate
+          subject-digest: ${{ steps.migrate.outputs.digest }}
+          push-to-registry: true
+      - name: Attest preview backup SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-backup
+          subject-digest: ${{ steps.backup.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/tracegarden-preview-sbom/backup.spdx.json
+          push-to-registry: true
+      - name: Attest preview backup provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-backup
+          subject-digest: ${{ steps.backup.outputs.digest }}
+          push-to-registry: true
       - name: Write actual preview digests
         run: |
           set -eu
@@ -293,6 +429,7 @@ jobs:
             WEB_REPOSITORY="${IMAGE_PREFIX}-web" WEB_DIGEST="${{ steps.web.outputs.digest }}" \
             COLLECTOR_REPOSITORY="${IMAGE_PREFIX}-collector" COLLECTOR_DIGEST="${{ steps.collector.outputs.digest }}" \
             MIGRATE_REPOSITORY="${IMAGE_PREFIX}-migrate" MIGRATE_DIGEST="${{ steps.migrate.outputs.digest }}" \
+            BACKUP_REPOSITORY="${IMAGE_PREFIX}-backup" BACKUP_DIGEST="${{ steps.backup.outputs.digest }}" \
             node scripts/preview-artifact.mjs \
             "$RUNNER_TEMP/tracegarden-preview/preview-image-declaration.yaml" \
             "$RUNNER_TEMP/tracegarden-preview/environments/previews/digests/pr-${PREVIEW_NUMBER}.yaml"
@@ -361,7 +498,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: node scripts/container-context.mjs
-      - run: docker pull --platform linux/arm64 "$NODE_IMAGE"
       - run: docker pull --platform linux/arm64 "$BUN_IMAGE"
       - name: Verify publication namespace configuration
         run: test "$GHCR_NAMESPACE" = "${GHCR_NAMESPACE,,}"
@@ -404,7 +540,6 @@ jobs:
           collector_ref="${IMAGE_PREFIX}-collector@${{ steps.collector.outputs.digest }}"
           migrate_ref="${IMAGE_PREFIX}-migrate@${{ steps.migrate.outputs.digest }}"
           backup_ref="${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}"
-          docker pull --platform linux/arm64 "$NODE_IMAGE"
           docker pull --platform linux/arm64 "$POSTGRES_IMAGE"
           docker pull --platform linux/arm64 "$web_ref"
           docker pull --platform linux/arm64 "$collector_ref"
@@ -598,7 +733,6 @@ jobs:
           for digest in "$WEB_DIGEST" "$COLLECTOR_DIGEST" "$MIGRATE_DIGEST" "$BACKUP_DIGEST"; do
             printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
           done
-          test "$BACKUP_DIGEST" != sha256:4444444444444444444444444444444444444444444444444444444444444444
           grep -q 'approvalRequired: true' deploy/promotion/promotion.yaml
           grep -q 'pullRequestRequired: true' deploy/promotion/promotion.yaml
           grep -q 'directClusterMutation: false' deploy/promotion/promotion.yaml

@@ -1,6 +1,6 @@
 # Backup and restore rehearsal
 
-Tracegarden ships an encrypted PostgreSQL backup path running on pinned Bun 1.3.14, but it is disabled by default. The Helm CronJob is suspended until the exact attested release image digest and all of these values are deliberately configured:
+Tracegarden ships an encrypted PostgreSQL backup path running on pinned Bun 1.3.14, but it is disabled by default. The backup workload is omitted until the exact attested release image digest and all of these values are deliberately configured:
 
 - an HTTPS object-storage endpoint, its authorized egress CIDR range, and bucket;
 - `aes-256-gcm` as the encryption mechanism and a Kubernetes Secret containing a 32-byte encryption key;
@@ -12,7 +12,7 @@ The backup process runs `pg_dump --format=custom`, encrypts the dump locally wit
 
 ## Configuration gate
 
-Set the following values together; leaving any value empty makes enabling fail closed. Before setting `backup.enabled: true`, replace the documentation-only `images.backup.digest` placeholder in `deploy/chart/values.yaml` with the exact `backup_digest` from the gated release supply-chain evidence or promotion artifact. Helm rejects the placeholder while backup is enabled; do not substitute a tag or an unverified digest.
+Set the following values together; leaving any value empty makes enabling fail closed. Before setting `backup.enabled: true`, supply the exact immutable `backup_digest` from the gated release supply-chain evidence or promotion artifact. The production values intentionally select no backup image; do not substitute a tag or an unverified digest.
 
 ```yaml
 images:
