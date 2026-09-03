@@ -6,7 +6,7 @@
 
 - Authorized source: public `misaka9981/tracegarden`; `main` was pushed without force-push.
 - Commits after tested source `a2ce7e0ba9ef5cf921bdbb84f370e647cf10f7ff` contain only this report and Ticket 26 metadata, as verified with `git diff-tree`; no runtime-bearing path changed after the final VM/CI-tested source.
-- Authorized release: annotated `v0.1.0`. It was deleted and recreated once at `91f6425799a5277c445fa4ba1847ed896b9479e5`; it remains at that commit.
+- Authorized release: annotated `v0.1.0`. It was deleted and recreated once at `a2ce7e0ba9ef5cf921bdbb84f370e647cf10f7ff`; it remains at that commit.
 - Authorized GHCR names were limited to `ghcr.io/misaka9981/tracegarden-{web,collector,migrate,backup}`.
 - Authorized GitOps target was private `misaka9981/tracegarden-gitops`, base `main`. No promotion PR was created because publication did not complete its required attestation gates.
 - Only disposable local/ARM64 validation was authorized. No production deployment or production resource was changed.
