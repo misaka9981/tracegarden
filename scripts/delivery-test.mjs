@@ -38,6 +38,7 @@ assert.match(proofFile, /on:\n  workflow_dispatch:/);
 assert.match(proofFile, /actions\/attest@59d89421af93a897026c735860bf21b6eb4f7b26/);
 assert.match(proofFile, /sbom-path: \.scratch\/tracegarden-proof-sbom\/web\.spdx\.json/);
 assert.match(proofFile, /test -s "\$sbom_dir\/web\.spdx\.json"/);
+assert.match(proofFile, /docker pull --platform linux\/arm64 "\$TRIVY_IMAGE"/);
 const publishStart = ciWorkflow.indexOf("\n  publish:");
 const publishEnd = ciWorkflow.indexOf("\n  promotion-proposal:", publishStart);
 assert.ok(publishStart >= 0 && publishEnd > publishStart, "release publication job must be declared");

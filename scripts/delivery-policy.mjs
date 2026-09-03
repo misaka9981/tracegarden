@@ -22,7 +22,7 @@ const workflowText = workflows.map(([, source]) => source).join("\n");
 
 for (const [path, source] of workflows) {
   if (!source.includes("permissions: {}")) errors.push(`${path}: top-level permissions must default to none`);
-  if (!/permissions:[ \t]*\n(?:[ \t]+[^\n]+\n)*[ \t]+contents:[ \t]+read\b/.test(source)) errors.push(`${path}: a read-only contents permission is required`);
+  if (!source.split("\n").some((line) => line.trim() === "contents: read")) errors.push(`${path}: a read-only contents permission is required`);
   for (const line of source.split("\n")) {
     const action = line.match(/uses:\s*([^\s#]+)/)?.[1];
     if (action && !/^([^/@]+\/[^/@]+)@[0-9a-f]{40}$/.test(action)) errors.push(`${path}: action is not pinned to a full commit SHA (${action})`);
@@ -69,7 +69,7 @@ if (!workflowText.includes('"$BUN_IMAGE" scripts/migrate-bun-smoke.mjs')) errors
 if (!workflowText.includes('"$BUN_IMAGE" scripts/backup-test.mjs')) errors.push("workflow suite must run the backup test under Bun");
 const ciWorkflow = workflows.find(([path]) => path === ".github/workflows/ci.yml")?.[1] ?? "";
 const proofFile = workflows.find(([path]) => path === ".github/workflows/attestation-proof.yml")?.[1] ?? "";
-if (!proofFile.includes("on:\n  workflow_dispatch:") || !proofFile.includes("actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26") || !proofFile.includes("sbom-path: .scratch/tracegarden-proof-sbom/web.spdx.json") || !proofFile.includes("test -s \"$sbom_dir/web.spdx.json\"")) {
+if (!proofFile.includes("on:\n  workflow_dispatch:") || !proofFile.includes("actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26") || !proofFile.includes("sbom-path: .scratch/tracegarden-proof-sbom/web.spdx.json") || !proofFile.includes("docker pull --platform linux/arm64 \"$TRIVY_IMAGE\"") || !proofFile.includes("test -s \"$sbom_dir/web.spdx.json\"")) {
   errors.push("workflow suite must retain the bounded standalone SBOM attestation proof");
 }
 const publishStart = ciWorkflow.indexOf("\n  publish:");

@@ -33,6 +33,8 @@ jobs:
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Pull the previously published exact digest
         run: docker pull --platform linux/arm64 "$SUBJECT_NAME@$SUBJECT_DIGEST"
+      - name: Pull the pinned SBOM tool
+        run: docker pull --platform linux/arm64 "$TRIVY_IMAGE"
       - name: Generate and verify SPDX SBOM at a relative path
         run: |
           set -eu
