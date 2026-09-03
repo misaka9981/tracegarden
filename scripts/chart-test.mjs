@@ -26,6 +26,7 @@ const webSource = await readFile(new URL("../apps/web/src/server.ts", import.met
 const webBunSource = await readFile(new URL("../apps/web/src/bun.ts", import.meta.url), "utf8");
 const collectorSource = await readFile(new URL("../apps/collector/src/main.ts", import.meta.url), "utf8");
 const migrationSource = await readFile(new URL("../apps/migrate/src/main.ts", import.meta.url), "utf8");
+const migrateDockerfile = await readFile(new URL("../deploy/docker/migrate.Dockerfile", import.meta.url), "utf8");
 const kubeconformAdapter = await readFile(new URL("./kubeconform.mjs", import.meta.url), "utf8");
 const postgres = await readFile(new URL("../deploy/chart/templates/postgres.yaml", import.meta.url), "utf8");
 const helpers = await readFile(new URL("../deploy/chart/templates/_helpers.tpl", import.meta.url), "utf8");
@@ -79,6 +80,7 @@ assert.match(migration, /databaseReadyRetrySeconds/);
 assert.match(deployments, /initContainers:/);
 assert.match(deployments, /wait-for-schema/);
 assert.doesNotMatch(deployments, /command: \["node", "--input-type=module", "--eval"\]/);
+assert.equal((deployments.match(/command: \["bun", "--input-type=module", "--eval"\]/g) ?? []).length, 2);
 const deploymentSections = deployments.split("\n---\n");
 assert.equal(deploymentSections.length, 2, "chart must render independent web and collector deployments");
 for (const [component, section] of [["web", deploymentSections[0]], ["collector", deploymentSections[1]]]) {
@@ -86,6 +88,10 @@ for (const [component, section] of [["web", deploymentSections[0]], ["collector"
   assert.match(section, /MIGRATION_SCHEMA_READY_TIMEOUT_SECONDS/);
   assert.match(section, /MIGRATION_SCHEMA_READY_RETRY_SECONDS/);
 }
+assert.match(migrateDockerfile, /FROM docker\.io\/oven\/bun:1\.3\.14-slim@sha256:[0-9a-f]{64}/);
+assert.match(migrateDockerfile, /USER bun/);
+assert.match(migrateDockerfile, /CMD \["bun", "dist\/apps\/migrate\/src\/main\.js"\]/);
+assert.doesNotMatch(migrateDockerfile, /node:26|USER node|CMD \["node"/i);
 assert.match(webBunSource, /createWebApplication/);
 assert.match(webBunSource, /bun\.serve/);
 assert.match(deployments, /MIGRATION_SCHEMA_READY_TIMEOUT_SECONDS/);

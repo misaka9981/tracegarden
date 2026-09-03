@@ -38,22 +38,22 @@ for (const [service, dockerfile, frozen] of builds) {
   ];
   try {
     docker(args);
-    if (service === "collector") {
+    if (service === "collector" || service === "migrate") {
       if (dockerOutput(["image", "inspect", "-f", "{{.Config.User}}", tag]) !== "bun") {
-        throw new Error("clean-cache collector image must use the non-root bun user");
+        throw new Error(`clean-cache ${service} image must use the non-root bun user`);
       }
       if (dockerOutput(["image", "inspect", "-f", "{{.Architecture}}", tag]) !== "arm64") {
-        throw new Error("clean-cache collector image must be ARM64");
+        throw new Error(`clean-cache ${service} image must be ARM64`);
       }
       const runArgs = [
         "run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "bun",
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL",
       ];
       if (dockerOutput([...runArgs, "--entrypoint", "bun", tag, "--version"]) !== "1.3.14") {
-        throw new Error("clean-cache collector image must run Bun 1.3.14");
+        throw new Error(`clean-cache ${service} image must run Bun 1.3.14`);
       }
-      if (dockerOutput([...runArgs, "--entrypoint", "sh", tag, "-c", "test ! -e /usr/local/bin/node"]) !== "") {
-        throw new Error("clean-cache collector image must not contain a Node runtime");
+      if (dockerOutput([...runArgs, "--entrypoint", "sh", tag, "-c", "test ! -e /usr/local/bin/node && ! command -v node"]) !== "") {
+        throw new Error(`clean-cache ${service} image must not contain a Node runtime`);
       }
     }
     if (service === "backup") {

@@ -143,6 +143,11 @@ jobs:
           docker run --rm --pull=never --platform linux/arm64 --network host --read-only \
             --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
             -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
+            -e MIGRATION_BUN_DATABASE_URL="postgresql://tracegarden:local-only@127.0.0.1:${BUN_COMPAT_DATABASE_PORT}/tracegarden" \
+            "$BUN_IMAGE" scripts/migrate-bun-smoke.mjs
+          docker run --rm --pull=never --platform linux/arm64 --network host --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
+            -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
             "$BUN_IMAGE" scripts/collector-resilience.mjs
       - name: Scan built images for actionable CVEs
         run: |

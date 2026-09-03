@@ -30,6 +30,7 @@
     "pretest:postgres": "pnpm build",
     "test:postgres": "node scripts/postgres-smoke.mjs",
     "test:bun": "pnpm build && bun scripts/collector-resilience.mjs && bun scripts/bun-compatibility.mjs",
+    "test:migrate:bun": "node scripts/migrate-bun-smoke.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "chart:render": "KUBECONFIG=/dev/null helm template tracegarden deploy/chart --namespace tracegarden --kube-version 1.31.0",
     "chart:validate": "KUBECONFIG=/dev/null helm template tracegarden deploy/chart --namespace tracegarden --kube-version 1.31.0 | node scripts/kubeconform.mjs",

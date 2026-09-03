@@ -29,6 +29,7 @@ const commands = [
   ["strict typecheck", pnpm, ["typecheck"]],
   ["production build", pnpm, ["build"]],
   ["Bun compiled-ESM compatibility gate", "bun", ["scripts/bun-compatibility.mjs"]],
+  ["Bun migration fresh/upgrade/lock/rollback/retry smoke", pnpm, ["test:migrate:bun"]],
   ["offline acceptance image preflight policy", process.execPath, ["scripts/acceptance-preflight.mjs"]],
   ["clean-cache frozen dependency fail-closed policy", process.execPath, ["scripts/container-context-clean-cache.mjs"]],
   ["clean Docker-cache offline container build", process.execPath, ["scripts/container-clean-cache.mjs"]],

@@ -65,6 +65,7 @@ if (!workflowText.includes("KUBECONFORM_SCHEMA_LOCATION")) {
   errors.push("workflow suite must pass an explicit local schema location");
 }
 if (!workflowText.includes("--exit-code 1") || !workflowText.includes("--severity HIGH,CRITICAL")) errors.push("workflow suite must fail on actionable image CVEs");
+if (!workflowText.includes("scripts/migrate-bun-smoke.mjs")) errors.push("workflow suite must run the Bun migration smoke");
 const ciWorkflow = workflows.find(([path]) => path === ".github/workflows/ci.yml")?.[1] ?? "";
 const publishStart = ciWorkflow.indexOf("\n  publish:");
 const publishEnd = ciWorkflow.indexOf("\n  promotion-proposal:", publishStart);
@@ -144,6 +145,10 @@ const collectorDockerfile = await readFile("deploy/docker/collector.Dockerfile",
 if (!collectorDockerfile.startsWith("FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2\n")) errors.push("collector Dockerfile must use the pinned Bun 1.3.14 base");
 if (!collectorDockerfile.includes('USER bun') || !collectorDockerfile.includes('CMD ["bun", "dist/apps/collector/src/main.js"]')) errors.push("collector Dockerfile must run as Bun without a Node entrypoint");
 if (/^FROM\s+node:/m.test(collectorDockerfile) || /CMD \["node"/.test(collectorDockerfile)) errors.push("collector Dockerfile must not retain a Node runtime");
+const migrateDockerfile = await readFile("deploy/docker/migrate.Dockerfile", "utf8");
+if (!migrateDockerfile.startsWith("FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2\n") || !migrateDockerfile.includes('USER bun') || !migrateDockerfile.includes('CMD ["bun", "dist/apps/migrate/src/main.js"]') || /^FROM\s+node:/m.test(migrateDockerfile) || /CMD \["node"/.test(migrateDockerfile)) {
+  errors.push("migration Dockerfile must use the pinned Bun runtime and no Node entrypoint");
+}
 const backupDockerfile = await readFile("deploy/docker/backup.Dockerfile", "utf8");
 const backupScript = await readFile("scripts/backup.mjs", "utf8");
 if (/apt-get|awscli|spawn\(\s*["']aws["']/.test(backupDockerfile) || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_dump") || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_restore")) {
@@ -159,6 +164,8 @@ const compose = await readFile("docker-compose.yml", "utf8");
 if (!/DATABASE_URL:\s+\$\{MIGRATION_DATABASE_URL:-/.test(compose)) errors.push("docker-compose migration DATABASE_URL must be parameterized");
 const webCompose = compose.slice(compose.indexOf("  web:\n"), compose.indexOf("  collector:\n"));
 if (!/\n    user: bun\n/.test(webCompose)) errors.push("docker-compose web service must run as the Bun image user");
+const migrateCompose = compose.slice(compose.indexOf("  migrate:\n"), compose.indexOf("  web:\n"));
+if (!/\n    user: bun\n/.test(migrateCompose)) errors.push("docker-compose migration service must run as the Bun image user");
 for (const image of [...compose.matchAll(/^\s+image:\s+(\S+)/gm)].map(([, value]) => value)) {
   if (!immutableDigest.test(image)) errors.push(`docker-compose.yml: image is not digest-pinned (${image})`);
 }

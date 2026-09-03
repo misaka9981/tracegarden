@@ -202,9 +202,9 @@ try {
     }, 30_000);
   }
 
-  const migration = await runChild(process.execPath, ["scripts/migrate.mjs"], databaseEnvironment(databaseUrl));
+  const migration = await runChild("bun", ["dist/apps/migrate/src/main.js"], databaseEnvironment(databaseUrl));
   assert.equal(migration.code, 0, `Bun migration process failed: ${migration.output}`);
-  assert.match(migration.output, /database migrations applied/);
+  assert.match(migration.output, /Tracegarden migrations applied/);
 
   database = new PostgresDatabase(databaseUrl);
   assert.equal(await database.ping(2_000), true);

@@ -31,6 +31,11 @@ assert.ok(collectorDockerfile.startsWith(`FROM ${bunImage}\n`), "collector must 
 assert.match(collectorDockerfile, /USER bun/);
 assert.match(collectorDockerfile, /CMD \["bun", "dist\/apps\/collector\/src\/main\.js"\]/);
 assert.doesNotMatch(collectorDockerfile, /node:26|USER node|CMD \["node"/i, "collector image must not retain a Node runtime");
+const migrateDockerfile = await readFile("deploy/docker/migrate.Dockerfile", "utf8");
+assert.ok(migrateDockerfile.startsWith(`FROM ${bunImage}\n`), "migration image must use the pinned Bun base image");
+assert.match(migrateDockerfile, /USER bun/);
+assert.match(migrateDockerfile, /CMD \["bun", "dist\/apps\/migrate\/src\/main\.js"\]/);
+assert.doesNotMatch(migrateDockerfile, /node:26|USER node|CMD \["node"/i, "migration image must not retain a Node runtime");
 const backupDockerfile = await readFile("deploy/docker/backup.Dockerfile", "utf8");
 assert.ok(backupDockerfile.includes(`FROM ${bunImage}`), "backup must use the pinned Bun base image");
 assert.match(backupDockerfile, /USER bun/);
@@ -61,6 +66,8 @@ assert.match(workflow, /\$BUN_IMAGE\" scripts\/collector-resilience\.mjs/);
 for (const required of ["--no-cache", "--network", "none", "--pull=false", "container-context.mjs", "--load", "--pull=never", "--read-only", "pg_dump", "pg_restore", "id", "--version"]) {
   assert.match(cleanCacheBuild, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `clean-cache build must include ${required}`);
 }
+assert.match(cleanCacheBuild, /test ! -e \/usr\/local\/bin\/node && ! command -v node/, "clean-cache Bun images must have no Node executable on PATH");
+assert.match(containerSmoke, /test ! -e \/usr\/local\/bin\/node && ! command -v node/, "container smoke must have no Node executable on PATH");
 
 for (const path of smokeScripts) {
   const source = await readFile(path, "utf8");
@@ -79,4 +86,5 @@ for (const path of smokeScripts) {
 assert.ok(acceptanceDocs.includes(`docker image inspect '${postgresImage}'`), "acceptance docs must state the exact PostgreSQL image prerequisite");
 assert.ok(acceptanceDocs.includes(`docker image inspect '${nodeImage}'`), "acceptance docs must state the exact Node.js image prerequisite");
 assert.ok(acceptanceDocs.includes(`docker image inspect '${bunImage}'`), "acceptance docs must state the exact Bun image prerequisite");
+assert.match(compose, /migrate:[\s\S]*?user: bun/, "docker-compose migration must run as Bun");
 console.log("offline acceptance preflight policy passed: pinned images, network-disabled frozen application builds, and pull-never smoke runs");

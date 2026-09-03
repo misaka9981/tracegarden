@@ -79,6 +79,15 @@ try {
   const imageIds = {
     migrate: docker(["inspect", "-f", "{{.Image}}", migrationContainer]),
   };
+  assert.equal(docker(["inspect", "-f", "{{.Config.User}}", migrationContainer]), "bun");
+  assert.equal(docker(["inspect", "-f", "{{.HostConfig.ReadonlyRootfs}}", migrationContainer]), "true");
+  assert.match(docker(["inspect", "-f", "{{json .HostConfig.CapDrop}}", migrationContainer]), /ALL/);
+  assert.match(docker(["inspect", "-f", "{{json .HostConfig.Tmpfs}}", migrationContainer]), /tmp/);
+  assert.match(docker(["inspect", "-f", "{{json .HostConfig.SecurityOpt}}", migrationContainer]), /no-new-privileges:true/);
+  assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", imageIds.migrate]), "arm64");
+  assert.match(docker(["run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "bun", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL", "--entrypoint", "id", imageIds.migrate, "-u"]), /^[1-9]\d*$/);
+  assert.equal(docker(["run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "bun", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL", "--entrypoint", "bun", imageIds.migrate, "--version"]), "1.3.14");
+  assert.equal(docker(["run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "bun", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL", "--entrypoint", "sh", imageIds.migrate, "-c", "test ! -e /usr/local/bin/node && ! command -v node"]), "");
 
   const webResponse = await waitFor("http://127.0.0.1:3000/health/readiness");
   const collectorResponse = await waitFor("http://127.0.0.1:3001/health/readiness", (response) => response.status === 503);
@@ -103,7 +112,7 @@ try {
     assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", imageId]), "arm64");
     assert.doesNotMatch(docker(["image", "inspect", "-f", "{{json .Config.Env}}", imageId]), /GOOGLE|KUBERNETES/);
     assert.equal(compose(["exec", "-T", service, "bun", "--version"]), "1.3.14");
-    assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /usr/local/bin/node"]), "");
+    assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /usr/local/bin/node && ! command -v node"]), "");
     assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /app/apps && test ! -e /app/scripts && test ! -e /app/.env && test ! -e /app/node_modules/.pnpm/node_modules/.bin && test ! -e /app/node_modules/.pnpm/node_modules/@typescript"]), "");
     assert.equal(expectFailure(["compose", "-p", project, "exec", "-T", service, "sh", "-c", "touch /app/.write-test"]), true);
     assert.equal(compose(["exec", "-T", service, "sh", "-c", "touch /tmp/.write-test && rm /tmp/.write-test"]), "");
@@ -185,7 +194,7 @@ try {
   );
   const imageFile = process.env.CONTAINER_SMOKE_IMAGE_FILE?.trim();
   if (imageFile) await writeFile(imageFile, `${Object.entries(imageIds).map(([service, imageId]) => `${service}=${imageId}`).join("\n")}\n`);
-  console.log("ARM64 Bun 1.3.14 web and collector non-root read-only, migration gate, invalid-URL, and schema-failure smoke passed");
+  console.log("ARM64 Bun 1.3.14 web, collector, and migration non-root read-only, migration gate, invalid-URL, and schema-failure smoke passed");
 } finally {
   try { compose(["down", "-v"]); } catch { /* preserve the original failure */ }
 }
