@@ -294,7 +294,8 @@ try {
   assert.equal(authStart.status, 200);
   const authPayload = await authStart.json();
   assert.equal(authPayload.redirect, true);
-  assert.match(authPayload.url, /^https:\/\/accounts\.google\.com\/o\/oauth2\/auth\?/);
+  assert.match(authPayload.url, /^https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+  assert.doesNotMatch(authPayload.url, /\/o\/oauth2\/auth\?/);
   const authSession = await auth.handler(new Request("https://bun-compatibility.example.test/api/auth/get-session"));
   assert.equal(authSession.status, 200);
   assert.equal(await authSession.text(), "null");
@@ -520,7 +521,7 @@ try {
   assert.equal(backupResult.retentionDays, 7);
   assert.deepEqual(backup.decryptBackupBuffer(uploadedArtifact, key), Buffer.from("bun-backup-payload"));
   const fakePgDump = join(temporaryDirectory, "pg_dump");
-  await writeFile(fakePgDump, "#!/bin/sh\nprintf 'bun-pg-dump'\n");
+  await writeFile(fakePgDump, "#!/usr/local/bin/bun\nprocess.stdout.write('bun-pg-dump')\n");
   await chmod(fakePgDump, 0o755);
   const dumped = await backup.runPgDump(databaseUrl, { ...process.env, PATH: `${temporaryDirectory}:${process.env.PATH ?? ""}` });
   assert.equal(dumped.toString(), "bun-pg-dump");
