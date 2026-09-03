@@ -134,7 +134,7 @@ try {
     assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", backupImageId]), "arm64");
     assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "pg_dump", backupImageId, "--version"]), "pg_dump (PostgreSQL) 18.3");
     assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "pg_restore", backupImageId, "--version"]), "pg_restore (PostgreSQL) 18.3");
-    assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "sh", backupImageId, "-c", "test ! -e /usr/local/bin/node"]), "");
+    assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "sh", backupImageId, "-c", "test ! -e /usr/local/bin/node && ! command -v node"]), "");
     assert.doesNotMatch(docker(["inspect", "-f", "{{json .Config.Env}}", backupContainer]), /AWS_ACCESS_KEY|AWS_SECRET_ACCESS_KEY|BACKUP_ENCRYPTION/);
     assert.match(docker(["logs", backupContainer]), /missing backup configuration: DATABASE_URL/);
   }

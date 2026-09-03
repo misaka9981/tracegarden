@@ -65,7 +65,8 @@ if (!workflowText.includes("KUBECONFORM_SCHEMA_LOCATION")) {
   errors.push("workflow suite must pass an explicit local schema location");
 }
 if (!workflowText.includes("--exit-code 1") || !workflowText.includes("--severity HIGH,CRITICAL")) errors.push("workflow suite must fail on actionable image CVEs");
-if (!workflowText.includes("scripts/migrate-bun-smoke.mjs")) errors.push("workflow suite must run the Bun migration smoke");
+if (!workflowText.includes('"$BUN_IMAGE" scripts/migrate-bun-smoke.mjs')) errors.push("workflow suite must run the Bun migration smoke");
+if (!workflowText.includes('"$BUN_IMAGE" scripts/backup-test.mjs')) errors.push("workflow suite must run the backup test under Bun");
 const ciWorkflow = workflows.find(([path]) => path === ".github/workflows/ci.yml")?.[1] ?? "";
 const publishStart = ciWorkflow.indexOf("\n  publish:");
 const publishEnd = ciWorkflow.indexOf("\n  promotion-proposal:", publishStart);

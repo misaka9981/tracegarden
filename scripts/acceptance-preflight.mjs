@@ -41,6 +41,8 @@ assert.ok(backupDockerfile.includes(`FROM ${bunImage}`), "backup must use the pi
 assert.match(backupDockerfile, /USER bun/);
 assert.match(backupDockerfile, /ENTRYPOINT \["bun", "\/app\/backup\.mjs"\]/);
 assert.doesNotMatch(backupDockerfile, /node:26|USER node|ENTRYPOINT \["node"/i, "backup image must not retain a Node runtime");
+assert.match(backupDockerfile, /PATH=\/usr\/local\/sbin:\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/sbin:\/bin/);
+assert.match(backupDockerfile, /rm -rf \/usr\/local\/bun-node-fallback-bin/);
 assert.match(backupDockerfile, /COPY --from=postgres-runtime \/usr\/local\/bin\/pg_dump/);
 assert.match(backupDockerfile, /COPY --from=postgres-runtime \/usr\/local\/bin\/pg_restore/);
 const deployment = await readFile("deploy/chart/templates/deployments.yaml", "utf8");
@@ -61,8 +63,14 @@ assert.match(cleanCachePolicy, /--offline/);
 assert.match(cleanCachePolicy, /unexpectedly succeeded/);
 assert.match(acceptance, /scripts\/container-clean-cache\.mjs/);
 assert.match(packageJson.scripts["test:bun"], /bun scripts\/collector-resilience\.mjs/);
+assert.match(packageJson.scripts["test:bun"], /bun scripts\/migrate-bun-smoke\.mjs/);
+assert.match(packageJson.scripts["test:bun"], /bun scripts\/backup-test\.mjs/);
+assert.match(acceptance, /\["Bun migration fresh\/upgrade\/lock\/rollback\/retry smoke", "bun", \["scripts\/migrate-bun-smoke\.mjs"\]\]/, "authoritative acceptance must run migration smoke with Bun");
+assert.match(acceptance, /\["offline encrypted backup and restore validation \(Bun\)", "bun", \["scripts\/backup-test\.mjs"\]\]/, "authoritative acceptance must run backup tests with Bun");
 assert.match(acceptance, /\["deterministic collector failure and recovery suites \(Bun\)", "bun", \["scripts\/collector-resilience\.mjs"\]\]/, "authoritative acceptance must run collector resilience with Bun");
 assert.match(workflow, /\$BUN_IMAGE\" scripts\/collector-resilience\.mjs/);
+assert.match(workflow, /\$BUN_IMAGE\" scripts\/migrate-bun-smoke\.mjs/);
+assert.match(workflow, /\$BUN_IMAGE\" scripts\/backup-test\.mjs/);
 for (const required of ["--no-cache", "--network", "none", "--pull=false", "container-context.mjs", "--load", "--pull=never", "--read-only", "pg_dump", "pg_restore", "id", "--version"]) {
   assert.match(cleanCacheBuild, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `clean-cache build must include ${required}`);
 }

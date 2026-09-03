@@ -1,6 +1,6 @@
 # Choose Hono transport and a staged Bun production runtime
 
-At decision time Tracegarden used Node.js 26.8.x, Node `node:http`, server-rendered HTML strings, native forms, a small `fetch`/`EventSource` client, PostgreSQL, and the `pg` driver. This ADR records the staged direction: Hono owns web transport and route composition; Hono JSX structures server-rendered views without React or hydration; and Bun becomes the production runtime one process at a time after compatibility and behavior parity are proven. Tickets 05, 06, and 08 have now moved the web, collector, and disabled-by-default backup processes to Bun 1.3.14; migration remains on Node.js 26.8.x pending its independent ticket. pnpm, native TypeScript `tsc --noEmit`, the Node-based Playwright toolchain, PostgreSQL, and `pg` remain. React, TanStack Router, TanStack Start, tRPC, and Tailwind are not adopted.
+At decision time Tracegarden used Node.js 26.8.x, Node `node:http`, server-rendered HTML strings, native forms, a small `fetch`/`EventSource` client, PostgreSQL, and the `pg` driver. This ADR records the staged direction: Hono owns web transport and route composition; Hono JSX structures server-rendered views without React or hydration; and Bun becomes the production runtime one process at a time after compatibility and behavior parity are proven. Tickets 05, 06, 07, and 08 have now moved the web, collector, migration, and disabled-by-default backup processes to Bun 1.3.14. pnpm, native TypeScript `tsc --noEmit`, the Node-based Playwright toolchain, PostgreSQL, and `pg` remain. React, TanStack Router, TanStack Start, tRPC, and Tailwind are not adopted.
 
 ## Alternatives
 
@@ -15,7 +15,7 @@ Hono adds a transport dependency and route migration work, while Hono JSX introd
 
 ## Rollback
 
-Each migration step must pass independently and retain the previous process entrypoint, image, and acceptance evidence. The parent commits preserve independent Node web and collector entrypoints/images as rollback baselines. If Hono transport or Hono JSX fails parity, deploy the last known-good Node `node:http` image/command and revert that step without changing public URLs or domain contracts. If a Bun process fails compatibility, restore that process's own last known-good Node image/command while leaving already-proven processes unchanged. PostgreSQL schema, `pg`, security boundaries, and migration/backup contracts are not rolled back or weakened to make a runtime change pass.
+Each migration step must pass independently and retain the previous process entrypoint, image, and acceptance evidence. The parent commits preserve independent Node entrypoints/images for all migrated processes as rollback baselines. If Hono transport or Hono JSX fails parity, deploy the last known-good Node `node:http` image/command and revert that step without changing public URLs or domain contracts. If a Bun process fails compatibility, restore that process's own last known-good Node image/command while leaving already-proven processes unchanged. PostgreSQL schema, `pg`, security boundaries, and migration/backup contracts are not rolled back or weakened to make a runtime change pass.
 
 ## Reconsideration
 

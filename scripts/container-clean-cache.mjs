@@ -72,7 +72,7 @@ for (const [service, dockerfile, frozen] of builds) {
       if (dockerOutput([...runArgs, "--entrypoint", "bun", tag, "--version"]) !== "1.3.14") {
         throw new Error("clean-cache backup image must run Bun 1.3.14");
       }
-      if (dockerOutput([...runArgs, "--entrypoint", "sh", tag, "-c", "test ! -e /usr/local/bin/node"]) !== "") {
+      if (dockerOutput([...runArgs, "--entrypoint", "sh", tag, "-c", "test ! -e /usr/local/bin/node && ! command -v node"]) !== "") {
         throw new Error("clean-cache backup image must not contain a Node runtime");
       }
       for (const binary of ["pg_dump", "pg_restore"]) {

@@ -1,7 +1,8 @@
 FROM postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7 AS postgres-runtime
 FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2
 
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WORKDIR /app
 COPY --from=postgres-runtime /usr/local/bin/pg_dump /usr/local/bin/pg_dump
 COPY --from=postgres-runtime /usr/local/bin/pg_restore /usr/local/bin/pg_restore
@@ -22,5 +23,6 @@ COPY --from=postgres-runtime /usr/lib/liblber.so.2 /usr/lib/liblber.so.2
 COPY --from=postgres-runtime /usr/lib/libsasl2.so.3 /usr/lib/libsasl2.so.3
 COPY --from=postgres-runtime /usr/lib/libkeyutils.so.1 /usr/lib/libkeyutils.so.1
 COPY scripts/backup.mjs /app/backup.mjs
+RUN rm -rf /usr/local/bun-node-fallback-bin
 USER bun
 ENTRYPOINT ["bun", "/app/backup.mjs"]

@@ -149,6 +149,10 @@ jobs:
             --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
             -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
             "$BUN_IMAGE" scripts/collector-resilience.mjs
+          docker run --rm --pull=never --platform linux/arm64 --network host --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
+            -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
+            "$BUN_IMAGE" scripts/backup-test.mjs
       - name: Scan built images for actionable CVEs
         run: |
           set -eu
