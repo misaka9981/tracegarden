@@ -50,6 +50,7 @@ const sbomGeneration = publishWorkflow.indexOf("Generate SBOMs for exact publish
 assert.ok(smokeGate >= 0 && cveGate > smokeGate && sbomGeneration > cveGate, "release gates must precede SBOM generation");
 const preGatePublication = publishWorkflow.slice(0, sbomGeneration);
 assert.doesNotMatch(preGatePublication, /--provenance=(?!false\b)|--sbom=(?!false\b)|actions\/attest-(?:sbom|build-provenance)@/, "release publication must not attest before exact-digest gates");
+assert.ok(publishWorkflow.includes('service="${service#tracegarden-}"'));
 assert.ok(publishWorkflow.includes('sbom_dir=".scratch/tracegarden-release-sbom"'));
 assert.ok(publishWorkflow.includes('test -s "$sbom_dir/${service}.spdx.json"'));
 assert.ok(publishWorkflow.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'"));
@@ -101,6 +102,7 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
 assert.ok(previewWorkflow.includes("backup_digest: ${{ steps.backup.outputs.digest }}"));
 assert.ok(previewWorkflow.includes('BACKUP_REPOSITORY="${IMAGE_PREFIX}-backup"'));
 assert.ok(previewWorkflow.includes('BACKUP_DIGEST="${{ steps.backup.outputs.digest }}"'));
+assert.ok(previewPostGate.includes('service="${service#tracegarden-}"'));
 assert.ok(previewPostGate.includes('sbom_dir=".scratch/tracegarden-preview-sbom"'));
 assert.ok(previewPostGate.includes('test -s "$sbom_dir/${service}.spdx.json"'));
 assert.ok(previewPostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'"));

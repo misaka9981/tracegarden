@@ -125,7 +125,7 @@ if ((publishWorkflow.match(/uses: actions\/attest@[0-9a-f]{40}/g) ?? []).length 
 if (!releasePostGate.includes("--format spdx-json") || !releasePostGate.includes("tracegarden-release-sbom")) {
   errors.push("release publication must generate SBOMs for exact pushed digests after the gates");
 }
-if (!releasePostGate.includes('sbom_dir=".scratch/tracegarden-release-sbom"') || !releasePostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !releasePostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
+if (!releasePostGate.includes('service="${service#tracegarden-}"') || !releasePostGate.includes('sbom_dir=".scratch/tracegarden-release-sbom"') || !releasePostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !releasePostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
   errors.push("release publication must stat, parse, and retain each SBOM before attestation");
 }
 for (const required of [
@@ -164,7 +164,7 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
 if (!previewWorkflow.includes("backup_digest: ${{ steps.backup.outputs.digest }}") || !previewWorkflow.includes("BACKUP_REPOSITORY=\"${IMAGE_PREFIX}-backup\"") || !previewWorkflow.includes("BACKUP_DIGEST=\"${{ steps.backup.outputs.digest }}\"")) {
   errors.push("preview publication must carry the exact backup digest into its artifact outputs");
 }
-if (!previewPostGate.includes('sbom_dir=".scratch/tracegarden-preview-sbom"') || !previewPostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !previewPostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
+if (!previewPostGate.includes('service="${service#tracegarden-}"') || !previewPostGate.includes('sbom_dir=".scratch/tracegarden-preview-sbom"') || !previewPostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !previewPostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
   errors.push("preview publication must stat and parse each SBOM before attestation");
 }
 if (/--platform linux\/arm64/.test(workflowText) && !workflowText.includes("runs-on: ubuntu-24.04-arm")) {

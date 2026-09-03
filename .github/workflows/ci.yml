@@ -376,6 +376,7 @@ jobs:
             "${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}"; do
             service="${service_ref##*/}"
             service="${service%%@*}"
+            service="${service#tracegarden-}"
             docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v "$GITHUB_WORKSPACE/$sbom_dir:/reports" \
@@ -623,6 +624,7 @@ jobs:
             "${IMAGE_PREFIX}-backup@${{ steps.backup.outputs.digest }}"; do
             service="${service_ref##*/}"
             service="${service%%@*}"
+            service="${service#tracegarden-}"
             docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v "$GITHUB_WORKSPACE/$sbom_dir:/reports" \
