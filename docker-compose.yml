@@ -28,7 +28,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    user: bun
+    user: nonroot
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
@@ -64,7 +64,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "3000:3000"
-    user: bun
+    user: nonroot
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
@@ -94,7 +94,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "3001:3001"
-    user: bun
+    user: nonroot
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m

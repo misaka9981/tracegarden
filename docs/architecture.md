@@ -29,7 +29,7 @@ deploy/
 docs/
 ```
 
-The web transport uses Bun's fetch listener and Hono route composition with Hono JSX view modules; it does not change the domain or URL contracts. Web, collector, migration, and backup now run on Bun 1.3.14 after their independent compatibility steps. See [ADR 0006](adr/0006-choose-hono-and-staged-bun-runtime.md).
+The web transport uses Bun's fetch listener and Hono route composition with Hono JSX view modules; it does not change the domain or URL contracts. Web, collector, migration, and backup now run on Bun 1.4.0 after their independent compatibility steps. See [ADR 0006](adr/0006-choose-hono-and-staged-bun-runtime.md).
 
 ## Deep modules and seams
 
@@ -95,7 +95,7 @@ Recent logs use a second ServiceAccount and the `logs:read` application capabili
 
 ## Runtime and persistence
 
-- Production runtime: Bun 1.3.14 for web, collector, migration, and backup
+- Production runtime: Bun 1.4.0 for web, collector, migration, and backup
 - Language: TypeScript 7 with explicit strict settings and its native `tsc` as the authoritative compiler
 - Web transport: Hono route composition; the production web entrypoint uses Bun's native server
 - Views and client: server-rendered HTML strings, native forms, and a small `fetch`/`EventSource` client today; Hono JSX may structure those views without React or hydration

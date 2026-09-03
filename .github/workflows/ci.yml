@@ -18,7 +18,7 @@ concurrency:
 env:
   NODE_VERSION: 26.8.1
   PNPM_VERSION: 11.9.0
-  BUN_IMAGE: docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2
+  BUN_IMAGE: docker.io/oven/bun:1.4.0-distroless@sha256:76caa97ddc0e01333d98c6ab5499539dad4bbceae6237eac83e7853d3826b981
   POSTGRES_IMAGE: postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7
   HELM_IMAGE: docker.io/alpine/helm:3.17.3@sha256:d899e6316789fec04ee95300a18e454b7942539cbb3d89bde3e0655d6ca2e895
   KUBECONFORM_IMAGE: ghcr.io/yannh/kubeconform:v0.6.7@sha256:0925177fb05b44ce18574076141b5c3d83235e1904d3f952182ac99ddc45762c
@@ -73,7 +73,7 @@ jobs:
           check-latest: false
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.0
       - run: npm install --global pnpm@${PNPM_VERSION}
       - run: pnpm install --frozen-lockfile
       - run: docker pull "$POSTGRES_IMAGE"
@@ -93,7 +93,7 @@ jobs:
           check-latest: false
       - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.0
       - run: npm install --global pnpm@${PNPM_VERSION}
       - run: pnpm install --frozen-lockfile
       - run: docker pull "$POSTGRES_IMAGE"
@@ -137,23 +137,23 @@ jobs:
             sleep 0.5
           done
           docker run --rm --pull=never --platform linux/arm64 --network host --read-only \
-            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user nonroot \
             -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
             -e BUN_COMPAT_DATABASE_URL="postgresql://tracegarden:local-only@127.0.0.1:${BUN_COMPAT_DATABASE_PORT}/tracegarden" \
             -e BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/bun-compat-cache \
             -e BUN_COMPAT_EXPECT_CONTAINER_BOUNDARY=1 \
             "$BUN_IMAGE" scripts/bun-compatibility.mjs
           docker run --rm --pull=never --platform linux/arm64 --network host --read-only \
-            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user nonroot \
             -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
             -e MIGRATION_BUN_DATABASE_URL="postgresql://tracegarden:local-only@127.0.0.1:${BUN_COMPAT_DATABASE_PORT}/tracegarden" \
             "$BUN_IMAGE" scripts/migrate-bun-smoke.mjs
           docker run --rm --pull=never --platform linux/arm64 --network host --read-only \
-            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user nonroot \
             -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
             "$BUN_IMAGE" scripts/collector-resilience.mjs
           docker run --rm --pull=never --platform linux/arm64 --network host --read-only \
-            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user bun \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m --user nonroot \
             -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
             "$BUN_IMAGE" scripts/backup-test.mjs
       - name: Scan built images for actionable CVEs
@@ -318,7 +318,7 @@ jobs:
               image: $migrate_ref
             backup:
               image: $backup_ref
-              user: bun
+              user: nonroot
               read_only: true
               tmpfs:
                 - /tmp:rw,noexec,nosuid,size=64m
@@ -561,7 +561,7 @@ jobs:
               image: $migrate_ref
             backup:
               image: $backup_ref
-              user: bun
+              user: nonroot
               read_only: true
               tmpfs:
                 - /tmp:rw,noexec,nosuid,size=64m

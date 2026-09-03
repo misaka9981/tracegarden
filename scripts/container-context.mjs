@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const context = resolve(process.env.TRACEGARDEN_CONTAINER_CONTEXT?.trim() || ".scratch/container-context");
@@ -35,6 +35,11 @@ const install = spawnSync(process.platform === "win32" ? "pnpm.cmd" : "pnpm", [
 });
 if (install.error) throw install.error;
 if (install.status !== 0) throw new Error(`offline production dependency install failed with exit code ${install.status ?? "unknown"}`);
+for (const path of [
+  "node_modules/.bin",
+  "node_modules/.pnpm/node_modules/.bin",
+  "node_modules/.pnpm/node_modules/@typescript",
+]) await rm(join(context, path), { recursive: true, force: true });
 const lock = await readFile("pnpm-lock.yaml");
 await writeFile(`${context}/manifest.json`, JSON.stringify({
   packageManager: "pnpm@11.9.0",

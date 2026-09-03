@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 const errors = [];
 const immutableDigest = /@sha256:[a-f0-9]{64}/;
-const bunImage = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
+const bunImage = "docker.io/oven/bun:1.4.0-distroless@sha256:76caa97ddc0e01333d98c6ab5499539dad4bbceae6237eac83e7853d3826b981";
 const actionFiles = [];
 
 async function visit(directory) {
@@ -172,11 +172,11 @@ for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Doc
   if (/^FROM\s+node:|(?:CMD|ENTRYPOINT)\s+\["node"/im.test(source)) errors.push(`${path}: Node cannot remain a production runtime`);
 }
 const collectorDockerfile = await readFile("deploy/docker/collector.Dockerfile", "utf8");
-if (!collectorDockerfile.startsWith("FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2\n")) errors.push("collector Dockerfile must use the pinned Bun 1.3.14 base");
-if (!collectorDockerfile.includes('USER bun') || !collectorDockerfile.includes('CMD ["bun", "dist/apps/collector/src/main.js"]')) errors.push("collector Dockerfile must run as Bun without a Node entrypoint");
+if (!collectorDockerfile.startsWith(`FROM ${bunImage}\n`)) errors.push("collector Dockerfile must use the pinned Bun 1.4.0 distroless base");
+if (!collectorDockerfile.includes('USER nonroot') || !collectorDockerfile.includes('CMD ["dist/apps/collector/src/main.js"]')) errors.push("collector Dockerfile must run as Bun without a Node entrypoint");
 if (/^FROM\s+node:/m.test(collectorDockerfile) || /CMD \["node"/.test(collectorDockerfile)) errors.push("collector Dockerfile must not retain a Node runtime");
 const migrateDockerfile = await readFile("deploy/docker/migrate.Dockerfile", "utf8");
-if (!migrateDockerfile.startsWith("FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2\n") || !migrateDockerfile.includes('USER bun') || !migrateDockerfile.includes('CMD ["bun", "dist/apps/migrate/src/main.js"]') || /^FROM\s+node:/m.test(migrateDockerfile) || /CMD \["node"/.test(migrateDockerfile)) {
+if (!migrateDockerfile.startsWith(`FROM ${bunImage}\n`) || !migrateDockerfile.includes('USER nonroot') || !migrateDockerfile.includes('CMD ["dist/apps/migrate/src/main.js"]') || /^FROM\s+node:/m.test(migrateDockerfile) || /CMD \["node"/.test(migrateDockerfile)) {
   errors.push("migration Dockerfile must use the pinned Bun runtime and no Node entrypoint");
 }
 const backupDockerfile = await readFile("deploy/docker/backup.Dockerfile", "utf8");
@@ -184,7 +184,7 @@ const backupScript = await readFile("scripts/backup.mjs", "utf8");
 if (/apt-get|awscli|spawn\(\s*["']aws["']/.test(backupDockerfile) || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_dump") || !backupDockerfile.includes("COPY --from=postgres-runtime /usr/local/bin/pg_restore")) {
   errors.push("backup image must use the pinned PostgreSQL runtime and no mutable apt/awscli dependency");
 }
-if (!backupDockerfile.includes("FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2") || !backupDockerfile.includes('USER bun') || !backupDockerfile.includes('ENTRYPOINT ["bun", "/app/backup.mjs"]') || /^FROM\s+node:/m.test(backupDockerfile) || /ENTRYPOINT \["node"/.test(backupDockerfile)) {
+if (!backupDockerfile.includes(`FROM ${bunImage}`) || !backupDockerfile.includes('USER nonroot') || !backupDockerfile.includes('ENTRYPOINT ["bun", "/app/backup.mjs"]') || /^FROM\s+node:/m.test(backupDockerfile) || /ENTRYPOINT \["node"/.test(backupDockerfile)) {
   errors.push("backup Dockerfile must use the pinned Bun runtime without a Node fallback");
 }
 if (/spawn\(\s*["']aws["']/.test(backupScript) || !backupScript.includes("createHmac") || !backupScript.includes("fetch(endpointUrl")) {
@@ -193,9 +193,9 @@ if (/spawn\(\s*["']aws["']/.test(backupScript) || !backupScript.includes("create
 const compose = await readFile("docker-compose.yml", "utf8");
 if (!/DATABASE_URL:\s+\$\{MIGRATION_DATABASE_URL:-/.test(compose)) errors.push("docker-compose migration DATABASE_URL must be parameterized");
 const webCompose = compose.slice(compose.indexOf("  web:\n"), compose.indexOf("  collector:\n"));
-if (!/\n    user: bun\n/.test(webCompose)) errors.push("docker-compose web service must run as the Bun image user");
+if (!/\n    user: nonroot\n/.test(webCompose)) errors.push("docker-compose web service must run as the Bun image user");
 const migrateCompose = compose.slice(compose.indexOf("  migrate:\n"), compose.indexOf("  web:\n"));
-if (!/\n    user: bun\n/.test(migrateCompose)) errors.push("docker-compose migration service must run as the Bun image user");
+if (!/\n    user: nonroot\n/.test(migrateCompose)) errors.push("docker-compose migration service must run as the Bun image user");
 for (const image of [...compose.matchAll(/^\s+image:\s+(\S+)/gm)].map(([, value]) => value)) {
   if (!immutableDigest.test(image)) errors.push(`docker-compose.yml: image is not digest-pinned (${image})`);
 }

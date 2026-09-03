@@ -88,9 +88,9 @@ for (const [component, section] of [["web", deploymentSections[0]], ["collector"
   assert.match(section, /MIGRATION_SCHEMA_READY_TIMEOUT_SECONDS/);
   assert.match(section, /MIGRATION_SCHEMA_READY_RETRY_SECONDS/);
 }
-assert.match(migrateDockerfile, /FROM docker\.io\/oven\/bun:1\.3\.14-slim@sha256:[0-9a-f]{64}/);
-assert.match(migrateDockerfile, /USER bun/);
-assert.match(migrateDockerfile, /CMD \["bun", "dist\/apps\/migrate\/src\/main\.js"\]/);
+assert.match(migrateDockerfile, /FROM docker\.io\/oven\/bun:1\.4\.0-distroless@sha256:[0-9a-f]{64}/);
+assert.match(migrateDockerfile, /USER nonroot/);
+assert.match(migrateDockerfile, /CMD \["dist\/apps\/migrate\/src\/main\.js"\]/);
 assert.doesNotMatch(migrateDockerfile, /node:26|USER node|CMD \["node"/i);
 assert.match(webBunSource, /createWebApplication/);
 assert.match(webBunSource, /bun\.serve/);

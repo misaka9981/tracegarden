@@ -21,8 +21,8 @@ import {
 } from "../dist/packages/db/src/index.js";
 import { createBetterAuthRuntime } from "../dist/packages/identity/src/index.js";
 
-export const BUN_VERSION = "1.3.14";
-export const BUN_IMAGE = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
+export const BUN_VERSION = "1.4.0";
+export const BUN_IMAGE = "docker.io/oven/bun:1.4.0-distroless@sha256:76caa97ddc0e01333d98c6ab5499539dad4bbceae6237eac83e7853d3826b981";
 const POSTGRES_IMAGE = "postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7";
 const workspaceId = "workspace-single";
 const bunRuntime = globalThis.Bun;

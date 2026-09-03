@@ -6,7 +6,12 @@ const project = process.env.CONTAINER_SMOKE_PROJECT?.trim() || `tracegarden-smok
 const backupSmoke = process.env.CONTAINER_SMOKE_BACKUP === "1";
 const invalidUrlProject = `${project}-invalid-url`;
 const schemaFailureProject = `${project}-schema-failure`;
-const bunImage = "docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2";
+const bunImage = "docker.io/oven/bun:1.4.0-distroless@sha256:76caa97ddc0e01333d98c6ab5499539dad4bbceae6237eac83e7853d3826b981";
+const bunUser = "nonroot";
+const bunVersion = "1.4.0";
+const noNodeRuntime = "const fs=process.getBuiltinModule('node:fs'); if (fs.existsSync('/usr/local/bin/node') || Bun.which('node')) process.exit(1)";
+const noProductionFiles = "const fs=process.getBuiltinModule('node:fs'); if (fs.existsSync('/app/apps') || fs.existsSync('/app/scripts') || fs.existsSync('/app/.env') || fs.existsSync('/app/node_modules/.pnpm/node_modules/.bin') || fs.existsSync('/app/node_modules/.pnpm/node_modules/@typescript')) process.exit(1)";
+const bunIdentity = "console.log(process.getuid(), process.getgid())";
 const postgresImage = "postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7";
 const environment = { ...process.env, COMPOSE_PROJECT_NAME: project, POSTGRES_PORT: "0" };
 
@@ -78,15 +83,15 @@ try {
   const imageIds = {
     migrate: docker(["inspect", "-f", "{{.Image}}", migrationContainer]),
   };
-  assert.equal(docker(["inspect", "-f", "{{.Config.User}}", migrationContainer]), "bun");
+  assert.equal(docker(["inspect", "-f", "{{.Config.User}}", migrationContainer]), bunUser);
   assert.equal(docker(["inspect", "-f", "{{.HostConfig.ReadonlyRootfs}}", migrationContainer]), "true");
   assert.match(docker(["inspect", "-f", "{{json .HostConfig.CapDrop}}", migrationContainer]), /ALL/);
   assert.match(docker(["inspect", "-f", "{{json .HostConfig.Tmpfs}}", migrationContainer]), /tmp/);
   assert.match(docker(["inspect", "-f", "{{json .HostConfig.SecurityOpt}}", migrationContainer]), /no-new-privileges:true/);
   assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", imageIds.migrate]), "arm64");
-  assert.match(docker(["run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "bun", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL", "--entrypoint", "id", imageIds.migrate, "-u"]), /^[1-9]\d*$/);
-  assert.equal(docker(["run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "bun", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL", "--entrypoint", "bun", imageIds.migrate, "--version"]), "1.3.14");
-  assert.equal(docker(["run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", "bun", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL", "--entrypoint", "sh", imageIds.migrate, "-c", "test ! -e /usr/local/bin/node && ! command -v node"]), "");
+  assert.match(docker(["run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", bunUser, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL", "--entrypoint", "bun", imageIds.migrate, "--eval", bunIdentity]), /^[1-9]\d* [1-9]\d*$/);
+  assert.equal(docker(["run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", bunUser, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL", "--entrypoint", "bun", imageIds.migrate, "--version"]), bunVersion);
+  assert.equal(docker(["run", "--rm", "--pull=never", "--platform", "linux/arm64", "--read-only", "--user", bunUser, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--cap-drop", "ALL", "--entrypoint", "bun", imageIds.migrate, "--eval", noNodeRuntime]), "");
 
   const webResponse = await waitFor("http://127.0.0.1:3000/health/readiness");
   const collectorResponse = await waitFor("http://127.0.0.1:3001/health/readiness", (response) => response.status === 503);
@@ -99,9 +104,8 @@ try {
 
   for (const service of ["web", "collector"]) {
     const container = compose(["ps", "-q", service]);
-    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", container]), "bun");
-    assert.match(compose(["exec", "-T", service, "id", "-u"]), /^[1-9]\d*$/);
-    assert.match(compose(["exec", "-T", service, "id", "-g"]), /^[1-9]\d*$/);
+    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", container]), bunUser);
+    assert.match(compose(["exec", "-T", service, "bun", "--eval", bunIdentity]), /^[1-9]\d* [1-9]\d*$/);
     assert.equal(docker(["inspect", "-f", "{{.HostConfig.ReadonlyRootfs}}", container]), "true");
     assert.match(docker(["inspect", "-f", "{{json .HostConfig.CapDrop}}", container]), /ALL/);
     assert.match(docker(["inspect", "-f", "{{json .HostConfig.Tmpfs}}", container]), /tmp/);
@@ -110,11 +114,11 @@ try {
     assert.match(imageId, /^sha256:[a-f0-9]{64}$/);
     assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", imageId]), "arm64");
     assert.doesNotMatch(docker(["image", "inspect", "-f", "{{json .Config.Env}}", imageId]), /GOOGLE|KUBERNETES/);
-    assert.equal(compose(["exec", "-T", service, "bun", "--version"]), "1.3.14");
-    assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /usr/local/bin/node && ! command -v node"]), "");
-    assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /app/apps && test ! -e /app/scripts && test ! -e /app/.env && test ! -e /app/node_modules/.pnpm/node_modules/.bin && test ! -e /app/node_modules/.pnpm/node_modules/@typescript"]), "");
-    assert.equal(expectFailure(["compose", "-p", project, "exec", "-T", service, "sh", "-c", "touch /app/.write-test"]), true);
-    assert.equal(compose(["exec", "-T", service, "sh", "-c", "touch /tmp/.write-test && rm /tmp/.write-test"]), "");
+    assert.equal(compose(["exec", "-T", service, "bun", "--version"]), bunVersion);
+    assert.equal(compose(["exec", "-T", service, "bun", "--eval", noNodeRuntime]), "");
+    assert.equal(compose(["exec", "-T", service, "bun", "--eval", noProductionFiles]), "");
+    assert.equal(expectFailure(["compose", "-p", project, "exec", "-T", service, "bun", "--eval", "process.getBuiltinModule('node:fs').writeFileSync('/app/.write-test','x')"]), true);
+    assert.equal(compose(["exec", "-T", service, "bun", "--eval", "const fs=process.getBuiltinModule('node:fs'); fs.writeFileSync('/tmp/.write-test','x'); fs.unlinkSync('/tmp/.write-test')"]), "");
     if (service === "collector") assert.doesNotMatch(docker(["inspect", "-f", "{{json .Config.Env}}", container]), /GOOGLE|KUBERNETES/);
     assert.doesNotMatch(docker(["logs", container]), /local-container-only|local-container-smoke|local-container-timeline/);
   }
@@ -124,7 +128,7 @@ try {
     assert.ok(backupContainer, "the exact release backup image must create a container");
     await waitForStopped(backupContainer);
     assert.notEqual(docker(["inspect", "-f", "{{.State.ExitCode}}", backupContainer]), "0", "backup must fail closed without backup configuration");
-    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", backupContainer]), "bun");
+    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", backupContainer]), bunUser);
     assert.equal(docker(["inspect", "-f", "{{.HostConfig.ReadonlyRootfs}}", backupContainer]), "true");
     assert.match(docker(["inspect", "-f", "{{json .HostConfig.CapDrop}}", backupContainer]), /ALL/);
     assert.match(docker(["inspect", "-f", "{{json .HostConfig.Tmpfs}}", backupContainer]), /tmp/);
@@ -133,7 +137,7 @@ try {
     assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", backupImageId]), "arm64");
     assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "pg_dump", backupImageId, "--version"]), "pg_dump (PostgreSQL) 18.3");
     assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "pg_restore", backupImageId, "--version"]), "pg_restore (PostgreSQL) 18.3");
-    assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "sh", backupImageId, "-c", "test ! -e /usr/local/bin/node && ! command -v node"]), "");
+    assert.equal(docker(["run", "--rm", "--pull=never", "--user", bunUser, "--entrypoint", "bun", backupImageId, "--eval", noNodeRuntime]), "");
     assert.doesNotMatch(docker(["inspect", "-f", "{{json .Config.Env}}", backupContainer]), /AWS_ACCESS_KEY|AWS_SECRET_ACCESS_KEY|BACKUP_ENCRYPTION/);
     assert.match(docker(["logs", backupContainer]), /missing backup configuration: DATABASE_URL/);
   }
@@ -193,7 +197,7 @@ try {
   );
   const imageFile = process.env.CONTAINER_SMOKE_IMAGE_FILE?.trim();
   if (imageFile) await writeFile(imageFile, `${Object.entries(imageIds).map(([service, imageId]) => `${service}=${imageId}`).join("\n")}\n`);
-  console.log("ARM64 Bun 1.3.14 web, collector, and migration non-root read-only, migration gate, invalid-URL, and schema-failure smoke passed");
+  console.log("ARM64 Bun 1.4.0 web, collector, and migration non-root read-only, migration gate, invalid-URL, and schema-failure smoke passed");
 } finally {
   try { compose(["down", "-v"]); } catch { /* preserve the original failure */ }
 }

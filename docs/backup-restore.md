@@ -1,6 +1,6 @@
 # Backup and restore rehearsal
 
-Tracegarden ships an encrypted PostgreSQL backup path running on pinned Bun 1.3.14, but it is disabled by default. The backup workload is omitted until the exact attested release image digest and all of these values are deliberately configured:
+Tracegarden ships an encrypted PostgreSQL backup path running on pinned Bun 1.4.0, but it is disabled by default. The backup workload is omitted until the exact attested release image digest and all of these values are deliberately configured:
 
 - an HTTPS object-storage endpoint, its authorized egress CIDR range, and bucket;
 - `aes-256-gcm` as the encryption mechanism and a Kubernetes Secret containing a 32-byte encryption key;

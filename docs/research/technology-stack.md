@@ -4,7 +4,7 @@ Research date: 2026-09-01. Sources are official documentation, specifications, r
 
 ## Verified facts
 
-- Node.js 26 is still Current and is scheduled to enter LTS on 2026-10-28. Node.js recommends Active or Maintenance LTS for production. Tracegarden retains Node.js 26.8.x for build, typecheck, and Node-based Playwright validation; the four production processes now use Bun 1.3.14. [Node.js releases](https://nodejs.org/en/about/previous-releases) and [release schedule](https://github.com/nodejs/Release/blob/main/schedule.json)
+- Node.js 26 is still Current and is scheduled to enter LTS on 2026-10-28. Node.js recommends Active or Maintenance LTS for production. Tracegarden retains Node.js 26.8.x for build, typecheck, and Node-based Playwright validation; the four production processes now use Bun 1.4.0. [Node.js releases](https://nodejs.org/en/about/previous-releases) and [release schedule](https://github.com/nodejs/Release/blob/main/schedule.json)
 - TypeScript 7 is stable and ships the native Go-based compiler through the standard `typescript` package and `tsc` command. Version 7.0 does not expose a programmatic compiler API, so compatibility for linting and other tools must be proven instead of assuming legacy compiler API behavior. The project configures strict ESM behavior explicitly rather than relying on defaults. [TypeScript 7 announcement](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/)
 - TanStack Start's React documentation still labels it Release Candidate even though the published package uses a 1.x version. It was considered during the initial design and is not adopted by the current product or modernization target. [TanStack Start overview](https://tanstack.com/start/latest/docs/framework/react/overview)
 - tRPC 11 is described as production-ready and provides end-to-end TypeScript inference without schema generation. It was considered during the initial design but is not the selected application transport; HTTP HTML/JSON routes remain the contract. [tRPC documentation](https://trpc.io/docs)
@@ -22,7 +22,7 @@ Research date: 2026-09-01. Sources are official documentation, specifications, r
 
 | Area | Current implementation | Accepted target or constraint |
 |---|---|---|
-| Runtime | Bun 1.3.14 for web, collector, migration, and backup; ESM | Bun adoption remains per-process; each parent Node image/entrypoint remains the rollback runtime for its migrated process |
+| Runtime | Bun 1.4.0 for web, collector, migration, and backup; ESM | Bun adoption remains per-process; each parent Node image/entrypoint remains the rollback runtime for its migrated process |
 | Language | TypeScript 7 with native `tsc` | `tsc --noEmit` remains authoritative |
 | Web transport | Hono fetch listener on Bun | Existing URLs, methods, statuses, redirects, cookies, authorization, health, metrics, telemetry, and SSE contracts remain unchanged |
 | Views and client | Server-rendered HTML strings, native forms, and a small `fetch`/`EventSource` client | Hono JSX may structure server views without React, hydration, or a client state framework |
