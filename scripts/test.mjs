@@ -31,6 +31,7 @@ import {
   validateClusterScopeInput,
 } from "../dist/packages/cluster/src/index.js";
 import { createTelemetry } from "../dist/packages/telemetry/src/index.js";
+import { isStoppedContainerStatus } from "./container-state.mjs";
 
 const webApplications = new Map();
 const nativeFetch = globalThis.fetch;
@@ -39,6 +40,8 @@ globalThis.fetch = (input, init) => {
   const application = webApplications.get(Number(new URL(request.url).port));
   return application ? application.app.fetch(request) : nativeFetch(input, init);
 };
+assert.deepEqual(["created", "running", "exited"].map(isStoppedContainerStatus), [false, false, true]);
+
 const readyMemoryDatabase = async () => {
   const database = new MemoryDatabase();
   await database.migrate();

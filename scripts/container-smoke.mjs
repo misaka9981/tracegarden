@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
+import { isStoppedContainerStatus } from "./container-state.mjs";
 
 const project = process.env.CONTAINER_SMOKE_PROJECT?.trim() || `tracegarden-smoke-${process.pid}`;
 const backupSmoke = process.env.CONTAINER_SMOKE_BACKUP === "1";
@@ -61,10 +62,19 @@ async function waitFor(url, ready = (response) => response.ok) {
 }
 async function waitForStopped(container) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    if (docker(["inspect", "-f", "{{.State.Running}}", container]) === "false") return;
+    const [status, startedAt] = docker(["inspect", "-f", "{{.State.Status}} {{.State.StartedAt}}", container]).split(/\s+/, 2);
+    if (isStoppedContainerStatus(status) && startedAt && !startedAt.startsWith("0001-01-01T00:00:00")) return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error(`container did not stop: ${container}`);
+  throw new Error(`container did not stop after a started run: ${container}`);
+}
+async function waitForLogMatch(readLogs, label, pattern) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const logs = readLogs();
+    if (pattern.test(logs)) return logs;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`container logs did not contain expected output: ${label}`);
 }
 async function waitForHealthy(container, extraEnvironment) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -139,7 +149,7 @@ try {
     assert.equal(docker(["run", "--rm", "--pull=never", "--entrypoint", "pg_restore", backupImageId, "--version"]), "pg_restore (PostgreSQL) 18.3");
     assert.equal(docker(["run", "--rm", "--pull=never", "--user", bunUser, "--entrypoint", "bun", backupImageId, "--eval", noNodeRuntime]), "");
     assert.doesNotMatch(docker(["inspect", "-f", "{{json .Config.Env}}", backupContainer]), /AWS_ACCESS_KEY|AWS_SECRET_ACCESS_KEY|BACKUP_ENCRYPTION/);
-    assert.match(docker(["logs", backupContainer]), /missing backup configuration: DATABASE_URL/);
+    await waitForLogMatch(() => compose(["logs", "--no-color", "backup"]), "backup", /missing backup configuration: DATABASE_URL/);
   }
 
   const collector = compose(["ps", "-q", "collector"]);
