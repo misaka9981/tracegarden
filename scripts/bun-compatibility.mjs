@@ -520,8 +520,8 @@ try {
   });
   assert.equal(backupResult.retentionDays, 7);
   assert.deepEqual(backup.decryptBackupBuffer(uploadedArtifact, key), Buffer.from("bun-backup-payload"));
-  const dumped = await backup.runPgDump(databaseUrl, { ...process.env, PATH: `/usr/local/bin:${process.env.PATH ?? ""}` }, {
-    command: "bun",
+  const dumped = await backup.runPgDump(databaseUrl, process.env, {
+    command: Bun.which("bun") ?? process.execPath,
     commandArgs: ["-e", "process.stdout.write('bun-pg-dump')"],
   });
   assert.equal(dumped.toString(), "bun-pg-dump");
