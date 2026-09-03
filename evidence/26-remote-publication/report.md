@@ -1,87 +1,89 @@
-# Ticket 26: remote publication and promotion evidence
+# Ticket 26: remote publication and pull-based promotion
 
-**Status:** blocked. Three authorized release attempts were retained for audit; no further tag, release, package, or publication attempt was made after the final failure.
+**Status:** resolved
+
+The sanitized command/result record is retained at `evidence/26-remote-publication/remote-transcript.txt`.
 
 ## Scope and authorization
 
-- Authorized source: public `misaka9981/tracegarden`; `main` was pushed without force-push.
-- Commits after tested source `a2ce7e0ba9ef5cf921bdbb84f370e647cf10f7ff` contain only this report and Ticket 26 metadata, as verified with `git diff-tree`; no runtime-bearing path changed after the final VM/CI-tested source.
-- Authorized release: annotated `v0.1.0`. It was deleted and recreated once at `a2ce7e0ba9ef5cf921bdbb84f370e647cf10f7ff`; it remains at that commit.
-- Authorized GHCR names were limited to `ghcr.io/misaka9981/tracegarden-{web,collector,migrate,backup}`.
-- Authorized GitOps target was private `misaka9981/tracegarden-gitops`, base `main`. No promotion PR was created because publication did not complete its required attestation gates.
-- Only disposable local/ARM64 validation was authorized. No production deployment or production resource was changed.
+- The authorized source repository was the public `misaka9981/tracegarden`; `main` was pushed without force-push.
+- The authorized release was the annotated tag and GitHub Release `v0.1.0`.
+- Publication was limited to `ghcr.io/misaka9981/tracegarden-{web,collector,migrate,backup}`.
+- The authorized GitOps repository is private `misaka9981/tracegarden-gitops`, with an explicit `main` base branch.
+- Cluster work was limited to the disposable ARM64 kind context `kind-k8s-cluster-v137` on the authorized VM. No production Cluster, Cloudflare, Google OAuth, object storage, or production promotion was touched.
+- The protected environment approval was performed through the normal `Xinyuan-chen0115` reviewer path. No protection or credential boundary was bypassed.
 
-## Pre-publication gates
+## Source and release
 
-- Main commit `01b7803b181f8bbac528adbf525a6053c51dab11` passed CI `33752445261` before the first release attempt.
-- The release attempt at `v0.1.0` commit `01b7803b181f8bbac528adbf525a6053c51dab11` was workflow `33753520623`, publication job `100643174029`. Its four image pushes completed, but the exact-digest smoke check failed.
-- The root repair was pushed as `91f6425799a5277c445fa4ba1847ed896b9479e5`. Main CI `33755802932` passed all jobs, including container/CVE and manifests. The authorized ARM64 VM passed full `CI=true pnpm acceptance` under Node `v26.8.1` and Bun `v1.4.0`; the exact four-image release Compose smoke also passed twice.
-- The prior authorized recreation at the repaired commit was workflow `33756528919`. Its prepublish gates, four image pushes, exact-digest smoke, Trivy HIGH/CRITICAL scan, and four SPDX SBOM generation all passed, but its first SBOM attestation failed.
-- The final authorized recreation at `a2ce7e0ba9ef5cf921bdbb84f370e647cf10f7ff` was workflow `33803813117`, publish job `100810194529`, after normal approval of protected environment `21157164002` by `Xinyuan-chen0115`. All prepublish jobs, four image pushes, exact-digest smoke, Trivy HIGH/CRITICAL scan, and four SPDX SBOM generation passed. Direct `actions/attest@59d894...` then failed at the first SBOM attestation, so the release is not accepted. Per the stop rule, no rerun or retag follows this failure.
-- Metadata commit `a2ce7e0ba9ef5cf921bdbb84f370e647cf10f7ff` also passed main CI `33758647263`; this was a normal push workflow and did not trigger another release or tag operation.
+- Runtime/publication source commit: `6ee9a5f33fc16541fe0054dec29bd682075816e2`.
+- Main CI workflow `33807930635` completed successfully for that source. The release workflow's offline policy, Helm/schema, frozen install/domain, PostgreSQL, browser, container/CVE, and supply-chain jobs all completed successfully before publication.
+- `v0.1.0` was recreated once after the final pre-release validation and points to `6ee9a5f33fc16541fe0054dec29bd682075816e2` both locally and on `origin`. It is the only release/tag recreation in this final successful attempt; no force-push or mutable tag was used.
+- Release workflow: `33808214530`.
+- Protected publication job: `100824381992`, approved normally through environment `production` (`21157164002`).
+- The final post-release metadata commit contains only this report and Ticket 26 metadata. A `git diff-tree` comparison from the tagged runtime/publication source was checked before push; no runtime-bearing source was changed after the published commit.
 
-## Published digest identifiers
+## Published immutable images
 
-The first failed run returned these immutable digests:
+The publication job pushed commit-SHA tags, pulled the resulting immutable references, ran exact-digest smoke and Trivy HIGH/CRITICAL checks before attestation, and persisted the following matrix:
 
-| image | first-run digest | state |
-|---|---|---|
-| `tracegarden-web` | `sha256:880c672575e89adb01caf6d832a4fd3f514fc1f6188d02bdb6693bef74d02421` | retained; smoke failed before attestation |
-| `tracegarden-collector` | `sha256:c12cebcea4bd4e2c3b946adc0ace7183656244e2e9fedd9b93f18d8f766ca574` | retained; smoke failed before attestation |
-| `tracegarden-migrate` | `sha256:28d69732ff30bd37abcd224e4edf9e56308a9c81a3bda7585c73dff239230bdb` | retained; smoke failed before attestation |
-| `tracegarden-backup` | `sha256:9e19ebbf66f2f47dc8d72d35951877122c05f45a2e29e0161566441f880d20f6` | retained; smoke failed before attestation |
+| image | commit-SHA tag | immutable digest | result |
+|---|---|---|---|
+| web | `6ee9a5f33fc16541fe0054dec29bd682075816e2` | `sha256:1fd128d55ff7d17cdbbabffa36b3827cc7ab4657a2017952b0584d95c8a142d4` | exact smoke/CVE passed |
+| collector | `6ee9a5f33fc16541fe0054dec29bd682075816e2` | `sha256:f893e7d18ceee2137bb8cbfc95beb4f02660c95059d09cca878d9e2cea714eec` | exact smoke/CVE passed |
+| migrate | `6ee9a5f33fc16541fe0054dec29bd682075816e2` | `sha256:7d287c17aa9dfadda7121c796d32df07cdf8a7dd5b9b8a451d0dc9c3cbdcd0d0` | exact smoke/CVE passed |
+| backup | `6ee9a5f33fc16541fe0054dec29bd682075816e2` | `sha256:dafa999de220c83cbbbc4bb9aea12b0fc237812cdfb2553e1007870cdf1e3180` | exact smoke/CVE passed |
 
-The prior recreation pushed a separate commit-SHA image set and returned:
+The successful publish job order was: push each image, pull exact digests, smoke-test those digests, scan them for HIGH/CRITICAL vulnerabilities, generate SPDX SBOMs, then attach attestations. Each final digest has one verified SPDX SBOM attestation and one verified SLSA provenance attestation:
 
-| image | final-run digest | state |
-|---|---|---|
-| `tracegarden-web` | `sha256:319d27147ad1bca05e22f38e57acd58b0eb22a1ca3d1219550524cc722305a9b` | exact smoke/CVE/SBOM generation passed; attestation failed |
-| `tracegarden-collector` | `sha256:9d12a80d5cd81378d812ea7988c292afb7e4777d9b93777db2e7a94965bf7a3c` | exact smoke/CVE/SBOM generation passed; attestation not reached |
-| `tracegarden-migrate` | `sha256:3e0bebc5cca4b4f293b8156153af5be622934e568e8ecbb3f0818a99aabdb9c0` | exact smoke/CVE/SBOM generation passed; attestation not reached |
-| `tracegarden-backup` | `sha256:ea6a735a48f27da8abd6a433053e53cd52d9817ff8ebe93985b390f0dbcecc89` | exact smoke/CVE/SBOM generation passed; attestation not reached |
+| image | SPDX predicate records | SLSA provenance records |
+|---|---:|---:|
+| web | 1 | 1 |
+| collector | 1 | 1 |
+| migrate | 1 | 1 |
+| backup | 1 | 1 |
 
-The prior workflow returned its digest outputs only to the failed job; those four values are taken from its exact-digest pull and SBOM command logs. No CVE failure occurred. No SBOM or provenance attestation is claimed because the first attestation action failed. GHCR package versions were not deleted.
+The source also retains earlier failed commit-SHA package versions as audit records; they were not deleted or reused. The successful release uses only the matrix above.
 
-The final authorized attempt at `a2ce7e0ba9ef5cf921bdbb84f370e647cf10f7ff` returned this third digest set:
+## GitHub Actions and promotion artifact
 
-| image | final-attempt digest | state |
-|---|---|---|
-| `tracegarden-web` | `sha256:0af34c3aa29996e67ba02bfea1823915a0ea98138ec720023be838dde58f9906` | exact smoke/CVE/SBOM generation passed; attestation failed |
-| `tracegarden-collector` | `sha256:e38a0d42bf5052e2e6a121df8a9aedb2a381bc17bde4fd7e016928f96d95dfc0` | exact smoke/CVE/SBOM generation passed; attestation not reached |
-| `tracegarden-migrate` | `sha256:756d98c757ccdd68fe2bfc1686415e3294da88114475376f3a0322c0279d709a` | exact smoke/CVE/SBOM generation passed; attestation not reached |
-| `tracegarden-backup` | `sha256:bb983c793b1880854b4e94b075e4d30b5e141e565a509d291660474d752409ae` | exact smoke/CVE/SBOM generation passed; attestation not reached |
+- The relative-path SBOM repair and service-name normalization were validated by main CI `33807930635`; the earlier failed attempts remain in workflow history and were not rewritten.
+- The successful publication job `100824381992` completed exact smoke, Trivy, four SPDX SBOM attestations, four provenance attestations, and immutable evidence upload.
+- Promotion job `100825286771` completed after the normal protected-environment approval. It created the digest-only promotion artifact with `releaseCommit=6ee9a5f33fc16541fe0054dec29bd682075816e2` and all four digest values above. CI performed no Kubernetes mutation and received no kubeconfig.
+- The private GitOps repository was confirmed to use `main` as its default branch and had no existing pull requests. The reviewable PR is [#1](https://github.com/misaka9981/tracegarden-gitops/pull/1), with base `main`, head `promotion/v0.1.0-6ee9a5f`, and head commit `e779a421e8065187ea8bf3701573d61c83f2e9c3`.
+- The PR adds `environments/production/tracegarden/desired-state.yaml` from the workflow artifact. It contains only the four immutable GHCR references, the release commit, protected-environment approval reference, `mechanism: pull-request`, and `directClusterMutation: false`. The PR remains open and was not merged.
 
-The final workflow's first attestation still reported `Error: SBOM file not found` for `/home/runner/work/tracegarden/tracegarden/.scratch/tracegarden-release-sbom/web.spdx.json`, despite the generation step's `test -s` and SPDX `jq` checks passing. This final failure is retained as the stopping point; no SBOM or provenance attestation is claimed and no GitOps promotion was attempted.
+## Disposable Argo/kind verification
 
-## Failures and repairs
+- Official Argo CD v3.4.6 declarations were fetched from `https://raw.githubusercontent.com/argoproj/argo-cd/v3.4.6/manifests/install.yaml`; the retained file was 1,890,752 bytes with SHA-256 `752b5a2681f2522fc78ea12ba2d23be44a4523cfa5d9a55cf1907909cc23fc5d` locally and on the VM.
+- Argo was installed only into the previously absent run-owned `argocd` namespace. The private GitOps PR head was mirrored into a run-owned local Git daemon solely to avoid supplying private GitHub credentials to the disposable Cluster. `git ls-remote` verified the mirror's `promotion/v0.1.0-6ee9a5f` at `e779a421e8065187ea8bf3701573d61c83f2e9c3`.
+- A run-labelled ApplicationSet using that exact PR revision generated an Application. The generated Application reported:
+  - `sync=Synced`
+  - `health=Healthy`
+  - `revision=e779a421e8065187ea8bf3701573d61c83f2e9c3`
+  - `operation=Succeeded`
+- The reconciled run-owned `ProductionDesiredState` contained the exact release commit and all four digest references from the successful publication matrix. This proves the PR revision was consumed by the real ApplicationSet controller and reconciled as digest-only desired state in the disposable destination; it does not claim production reconciliation.
+- A run-only CRD was used for the fixture custom resource, with unknown fields preserved so the exact `spec.images` values were observable. The initial disposable schema-pruning behavior was corrected before the final sync; no production schema or Cluster resource was changed.
 
-### First release attempt: Compose log channel/race
+## Cleanup and preservation
 
-`33753520623` failed at `scripts/container-smoke.mjs:142` with an empty stdout value while expecting `missing backup configuration: DATABASE_URL`. Direct execution of the exact published backup digest and a same-tree local ARM64 build both returned exit `1` and emitted the expected 58-byte stderr message under the release security settings. In the full Compose path, `docker compose logs backup` contained the message while the helper's stdout-only `docker logs` read was empty; the old helper also accepted a not-yet-started `created` container as stopped.
+All run-owned resources were removed after the successful observation:
 
-Commit `91f6425799a5277c445fa4ba1847ed896b9479e5` changed the state check to require terminal `exited`/`dead` with a non-zero `StartedAt`, added a deterministic `created -> running -> exited` unit assertion, and used bounded Compose log capture so stderr is included. The exact published four-image Compose smoke passed twice on ARM64.
+- ApplicationSet `tg26-promotion` and generated Application `tg26-promotion` were deleted.
+- Destination namespace `tg26-promotion` and fixture CRD `productiondesiredstates.delivery.tracegarden.dev` were deleted.
+- Official Argo namespaced resources were deleted from both the temporary default-namespace apply and the run-owned `argocd` namespace; the run-owned `argocd` namespace was deleted.
+- Official Argo CRDs, ClusterRoles, and ClusterRoleBindings were checked absent.
+- The run-local Git daemon was terminated by its recorded PID, and its repository, archive, manifest, and temporary directories were removed. No run-owned process remained.
+- Exact post-cleanup checks confirmed no run ApplicationSet, Application, destination namespace, fixture CRD, Argo namespace, official Argo CRDs, or run-local artifacts remained.
+- Before and after cleanup, the existing containers remained unchanged and running:
+  - `/railgun-caddy`: `26e35e579600473cee8faa08c2fcf4cb8856f6f5b37b77a6c301d44714884f75`
+  - `/k8s-cluster-v137-control-plane`: `d5f3759062bfbd5d96e1a8e4e401be488a3f156d14348feaa5dea95a20b7f2dc`
+  - `/k8s-cluster-v137-worker`: `ab79985d801cb252c6ce5e6da5629314f59f1d485d5c21b077dfa350f1c1251e`
+  Each retained `Running=true` and the exact same ID.
+- No credentials, tokens, authorization headers, private keys, database passwords, or protected values were written to evidence.
 
-### Prior release attempt: SBOM attestation path/action
+## Residual risks and explicit non-claims
 
-`33756528919` passed the repaired exact-digest smoke and Trivy scan. The generation loop passed `test -s` for all four Trivy SPDX files. It failed at `Attest web SBOM` when the deprecated `actions/attest-sbom@c604332...` wrapper invoked `actions/attest@59d894...` and reported:
-
-```text
-Error: SBOM file not found
-```
-
-The failing input was `/home/runner/work/_temp/tracegarden-release-sbom/web.spdx.json`; the generation step had written under the runner temporary directory and verified it there. This was an attestation path/action boundary failure, not a digest smoke, Trivy, image, or SBOM-generation failure.
-
-Commit `8ffecb8046416db4b038a9e946575dbfd2e64141` (pushed to `main`, no tag movement) changes both preview and release generation to `$GITHUB_WORKSPACE/.scratch/tracegarden-{preview,release}-sbom`, uses the fixed official `actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26` directly, and adds a bounded `test -s` plus `jq` SPDX object/version/ID check before each action. Delivery policy and delivery tests enforce those paths, action references, ordering, and pre-attestation readability checks.
-
-## Current state and boundaries
-
-- No release was rebuilt after final workflow `33803813117`; no further tag/release/package mutation is authorized by this run.
-- No GitOps branch/PR or Argo reconciliation was created because no final set of attested digests exists.
-- No production deployment, Cloudflare, Google OAuth, object storage, or production CNI operation was performed.
-- The authorized VM's pre-existing Caddy container and both kind node container identities were preserved. Exact-smoke and acceptance run-owned containers, images, networks, volumes, and temporary directories were cleaned.
-
-## Residual risks
-
-- `v0.1.0` and three commit-SHA image sets exist in GHCR from failed publication attempts; they are retained for audit but are not attested release inputs.
-- SBOM/provenance publication, GitOps promotion, disposable Argo digest reconciliation, and production promotion remain unverified.
-- A future release requires explicit authorization after this run; this worker must not retag or republish the existing release.
+- The GitOps PR is reviewable but intentionally unmerged. No production deployment or production Cluster mutation was performed; separate production authorization remains required.
+- The disposable Argo test used an exact PR-head mirror rather than private GitHub credentials. It proves ApplicationSet/controller behavior and exact revision/digest reconciliation, not private-repository authentication or production Argo reconciliation.
+- Google OAuth, Cloudflare Access, object-storage upload, off-VM restore, target-CNI NetworkPolicy behavior, and production promotion remain unverified by design.
+- Earlier failed publication workflows and their package versions remain retained for audit. They are not release inputs and have no final attestations.

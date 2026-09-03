@@ -1,0 +1,42 @@
+Ticket 26 sanitized validation transcript
+
+source repository: misaka9981/tracegarden (public)
+source runtime/publication commit: 6ee9a5f33fc16541fe0054dec29bd682075816e2
+main CI: workflow 33807930635 -> success
+release/tag: v0.1.0 annotated -> 6ee9a5f33fc16541fe0054dec29bd682075816e2
+release workflow: 33808214530
+protected publication job: 100824381992 -> success
+protected promotion job: 100825286771 -> success after normal Xinyuan-chen0115 approval
+
+image digests after exact pull/smoke/CVE gate:
+web=sha256:1fd128d55ff7d17cdbbabffa36b3827cc7ab4657a2017952b0584d95c8a142d4
+collector=sha256:f893e7d18ceee2137bb8cbfc95beb4f02660c95059d09cca878d9e2cea714eec
+migrate=sha256:7d287c17aa9dfadda7121c796d32df07cdf8a7dd5b9b8a451d0dc9c3cbdcd0d0
+backup=sha256:dafa999de220c83cbbbc4bb9aea12b0fc237812cdfb2553e1007870cdf1e3180
+
+publication order: exact digest smoke=passed; Trivy HIGH/CRITICAL=passed; SPDX generation=passed; four SPDX attestations=passed; four SLSA provenance attestations=passed; immutable evidence artifact=passed
+attestation verification: web=SPDX 1/SLSA 1; collector=SPDX 1/SLSA 1; migrate=SPDX 1/SLSA 1; backup=SPDX 1/SLSA 1
+
+GitOps repository: misaka9981/tracegarden-gitops (private), base=main
+promotion PR: https://github.com/misaka9981/tracegarden-gitops/pull/1
+promotion PR state=open draft=false head=promotion/v0.1.0-6ee9a5f headCommit=e779a421e8065187ea8bf3701573d61c83f2e9c3
+promotion file: environments/production/tracegarden/desired-state.yaml
+promotion file carries releaseCommit and all four exact digests; directClusterMutation=false
+
+Argo source declarations: Argo CD v3.4.6 install.yaml
+source URL: https://raw.githubusercontent.com/argoproj/argo-cd/v3.4.6/manifests/install.yaml
+bytes=1890752 sha256=752b5a2681f2522fc78ea12ba2d23be44a4523cfa5d9a55cf1907909cc23fc5d
+context: kind-k8s-cluster-v137; architecture=ARM64; destination=disposable tg26-promotion
+ApplicationSet: tg26-promotion generated Application: tg26-promotion
+ApplicationSet source revision: e779a421e8065187ea8bf3701573d61c83f2e9c3
+Argo sync=Synced health=Healthy operation=Succeeded
+reconciled releaseCommit=6ee9a5f33fc16541fe0054dec29bd682075816e2
+reconciled web=ghcr.io/misaka9981/tracegarden-web@sha256:1fd128d55ff7d17cdbbabffa36b3827cc7ab4657a2017952b0584d95c8a142d4
+reconciled collector=ghcr.io/misaka9981/tracegarden-collector@sha256:f893e7d18ceee2137bb8cbfc95beb4f02660c95059d09cca878d9e2cea714eec
+reconciled migrate=ghcr.io/misaka9981/tracegarden-migrate@sha256:7d287c17aa9dfadda7121c796d32df07cdf8a7dd5b9b8a451d0dc9c3cbdcd0d0
+reconciled backup=ghcr.io/misaka9981/tracegarden-backup@sha256:dafa999de220c83cbbbc4bb9aea12b0fc237812cdfb2553e1007870cdf1e3180
+
+cleanup: ApplicationSet/Application, destination namespace, fixture CRD, Argo namespace/CRDs/RBAC, Git daemon, repository/archive/manifest and run directories=absent
+preservation: Caddy and both kind-node container IDs unchanged and Running=true
+production deployment/mutation: not performed
+secret audit: no credentials, tokens, authorization headers, private keys, database passwords, or protected values
