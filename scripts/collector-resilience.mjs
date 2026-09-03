@@ -55,7 +55,7 @@ const store = new MemoryObservationStore();
 const controller = new AbortController();
 let sleepCalls = 0;
 const runtime = await createCollectorRuntime({
-  port: 43301,
+  port: 0,
   host: "127.0.0.1",
   scope,
   adapter,
@@ -80,7 +80,7 @@ try {
   assert.equal(runtime.signals().normalizationFailures, 0);
   assert.equal(runtime.signals().persistenceFailures, 0);
   assert.equal(runtime.signals().lagSeconds, 1);
-  assert.equal((await (await fetch("http://127.0.0.1:43301/health/readiness")).json()).signals.relists, 1);
+  assert.equal((await (await fetch(`http://127.0.0.1:${runtime.server.address().port}/health/readiness`)).json()).signals.relists, 1);
 } finally {
   await runtime.close();
 }
@@ -90,7 +90,7 @@ const restartAdapter = new DeterministicKubernetesAdapter([], {
   watchPlans: [{ events: [{ type: "BOOKMARK", resourceVersion: "22" }], error: new Error("restart disconnect") }],
 });
 const restarted = await createCollectorRuntime({
-  port: 43305,
+  port: 0,
   host: "127.0.0.1",
   scope,
   adapter: restartAdapter,
@@ -111,7 +111,7 @@ const boundedAdapter = new DeterministicKubernetesAdapter([], {
   watchPlans: [{ error: new Error("disconnect") }, { error: new Error("disconnect") }, { error: new Error("unexpected third retry") }],
 });
 const bounded = await createCollectorRuntime({
-  port: 43302,
+  port: 0,
   host: "127.0.0.1",
   scope,
   adapter: boundedAdapter,
@@ -133,7 +133,7 @@ const malformedAdapter = new DeterministicKubernetesAdapter([], {
 });
 const malformedStore = new MemoryObservationStore();
 const malformed = await createCollectorRuntime({
-  port: 43303,
+  port: 0,
   host: "127.0.0.1",
   scope,
   adapter: malformedAdapter,
@@ -155,7 +155,7 @@ class FailingCheckpointStore extends MemoryObservationStore {
 }
 const failingStore = new FailingCheckpointStore();
 const failing = await createCollectorRuntime({
-  port: 43304,
+  port: 0,
   host: "127.0.0.1",
   scope,
   adapter: new DeterministicKubernetesAdapter([], { listResults: [{ resources: [pod("30")], resourceVersion: "30" }] }),
@@ -313,7 +313,7 @@ try {
 
 const crossNamespaceStore = new MemoryObservationStore();
 const crossNamespace = await createCollectorRuntime({
-  port: 43310,
+  port: 0,
   host: "127.0.0.1",
   scope: { ...scope, clusterId: "cross-namespace-cluster", namespaces: ["alpha"] },
   adapter: new DeterministicKubernetesAdapter([], {
@@ -338,7 +338,7 @@ const opaqueAdapter = new DeterministicKubernetesAdapter([], {
   watchPlans: [{ events: [{ type: "MODIFIED", resource: pod("opaque-2", "Pending"), resourceVersion: "opaque-2" }], error: new Error("opaque disconnect") }],
 });
 const opaque = await createCollectorRuntime({
-  port: 43311,
+  port: 0,
   host: "127.0.0.1",
   scope: opaqueScope,
   adapter: opaqueAdapter,
@@ -372,7 +372,7 @@ const multiAdapter = new DeterministicKubernetesAdapter([], {
 const multiStore = new MemoryObservationStore();
 const multiController = new AbortController();
 const multi = await createCollectorRuntime({
-  port: 43306,
+  port: 0,
   host: "127.0.0.1",
   scope: multiScope,
   adapter: multiAdapter,
@@ -408,7 +408,7 @@ const isolatedAdapter = new DeterministicKubernetesAdapter([], {
 let isolatedSleepCalls = 0;
 let isolated;
 isolated = await createCollectorRuntime({
-  port: 43312,
+  port: 0,
   host: "127.0.0.1",
   scope: isolatedScope,
   adapter: isolatedAdapter,
@@ -440,7 +440,7 @@ const repeatedGoneAdapter = new DeterministicKubernetesAdapter([], {
   watchPlans: [{ error: new KubernetesWatchGoneError() }, { error: new KubernetesWatchGoneError() }, { error: new KubernetesWatchGoneError() }],
 });
 const repeatedGone = await createCollectorRuntime({
-  port: 43307,
+  port: 0,
   host: "127.0.0.1",
   scope,
   adapter: repeatedGoneAdapter,
@@ -457,7 +457,7 @@ try {
 
 const missingRelistVersionStore = new MemoryObservationStore();
 const missingRelistVersion = await createCollectorRuntime({
-  port: 43308,
+  port: 0,
   host: "127.0.0.1",
   scope,
   adapter: new DeterministicKubernetesAdapter([], {
@@ -487,7 +487,7 @@ const cancellationAdapter = {
   },
 };
 const cancellation = await createCollectorRuntime({
-  port: 43309,
+  port: 0,
   host: "127.0.0.1",
   scope,
   adapter: cancellationAdapter,
@@ -519,7 +519,7 @@ const listCancellationAdapter = {
   },
 };
 const listCancellation = await createCollectorRuntime({
-  port: 43313,
+  port: 0,
   host: "127.0.0.1",
   scope,
   adapter: listCancellationAdapter,
@@ -626,7 +626,7 @@ const timeoutScopeStore = {
   save: async (value) => value,
 };
 const timeoutScopeRuntime = await createCollectorRuntime({
-  port: 43317,
+  port: 0,
   host: "127.0.0.1",
   adapter: {
     kind: "deterministic",
@@ -680,7 +680,7 @@ const abortableHangingScopeAdapter = {
   },
 };
 const hangingScopeRuntime = await createCollectorRuntime({
-  port: 43316,
+  port: 0,
   host: "127.0.0.1",
   adapter: abortableHangingScopeAdapter,
   database: { kind: "memory", clusterScope: abortableHangingScopeStore, ping: async () => true },
@@ -738,7 +738,7 @@ const idleAdapter = {
 };
 const idleObservationStore = new MemoryObservationStore(idleScopeStore);
 const idleScopeRuntime = await createCollectorRuntime({
-  port: 43315,
+  port: 0,
   host: "127.0.0.1",
   adapter: idleAdapter,
   database: { kind: "memory", clusterScope: idleScopeStore, ping: async () => true },
@@ -787,7 +787,7 @@ const dynamicAdapter = new DeterministicKubernetesAdapter([], {
 });
 let dynamicSleepCalls = 0;
 const dynamic = await createCollectorRuntime({
-  port: 43314,
+  port: 0,
   host: "127.0.0.1",
   adapter: dynamicAdapter,
   database: { kind: "memory", clusterScope: dynamicScopeStore, ping: async () => true },

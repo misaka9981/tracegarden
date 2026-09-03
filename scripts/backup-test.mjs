@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { access, chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { decryptBackupBuffer, encryptBackupBuffer, runBackup, safePostgresDatabaseUrl, uploadWithAws, validateBackupConfiguration } from "./backup.mjs";
+import { decryptBackupBuffer, encryptBackupBuffer, runBackup, runPgDump, safePostgresDatabaseUrl, uploadWithAws, validateBackupConfiguration } from "./backup.mjs";
 import {
   assertCleanDatabase,
   checkRestoredDatabase,
@@ -129,8 +129,14 @@ try {
     PATH: `${hangingPgDumpDirectory}:${process.env.PATH ?? ""}`,
     PG_DUMP_PID_FILE: pgDumpPidFile,
   };
+  const bunDump = process.versions.bun
+    ? (databaseUrl, dumpEnvironment) => runPgDump(databaseUrl, dumpEnvironment, {
+      command: process.execPath,
+      commandArgs: ["-e", "import { writeFileSync } from 'node:fs'; writeFileSync(process.env.PG_DUMP_PID_FILE, String(process.pid)); setInterval(() => {}, 1000);"],
+    })
+    : undefined;
   await assert.rejects(
-    runBackup({ environment: pgDumpEnvironment, timeoutMs: 1_000 }),
+    runBackup({ environment: pgDumpEnvironment, timeoutMs: 1_000, ...(bunDump ? { dump: bunDump } : {}) }),
     (error) => error instanceof Error && error.message === "pg_dump timed out"
       && !error.message.includes("pg-dump-secret") && !error.message.includes("database.invalid"),
   );
