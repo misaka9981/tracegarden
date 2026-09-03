@@ -1,0 +1,108 @@
+Ticket 10 bounded VM acceptance transcript (sanitized)
+
+run=tracegarden-ticket10-20260904T084636Z-60396
+source-commit=b154d5a8b6364f76a14a0d5b83158c32f07baff5
+source-tree=8194a9da89c1fed009ffee870190a983ff07666e
+host=ubuntu@161.33.30.111 (authorized VM)
+architecture=aarch64
+acceptance-node=v26.8.1 (actual process; required check passed before pnpm acceptance)
+docker=29.1.3 linux/arm64
+helm=4.1.0
+pnpm=11.9.0 (run-owned user-space wrapper)
+bun=1.3.14
+kubeconform=v0.6.7
+playwright-chromium=headless-shell 1223 linux-arm64
+
+The clean tracked archive of the exact source commit was extracted into a run-owned directory. The frozen lockfile install and build ran in an ARM64 helper image derived from the pinned Node reference `node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89`. The helper reported `node --version=v26.8.1` before acceptance and added only the Debian browser runtime libraries needed by Chromium. Run-owned pnpm, Bun, Docker Buildx, Docker Compose, kubeconform, and Playwright artifacts were used without system installation or credential sources.
+
+The final bounded command was:
+
+```text
+test "$(node --version)" = v26.8.1
+PATH=/tmp/$RUN/tools/bin:$PATH \\
+DOCKER_CONFIG=/tmp/$RUN/docker-config \\
+PLAYWRIGHT_BROWSERS_PATH=/tmp/tracegarden-migrate-07-935d519/ms-playwright CI=true \\
+timeout 1700s pnpm acceptance
+```
+
+The command executed with `pnpm acceptance` under Node `v26.8.1` and exited `0`:
+
+`Tracegarden local acceptance workflow passed; no external integrations were contacted.`
+
+Sequential stages passed (20/20):
+1 format check
+2 lint
+3 strict typecheck
+4 production build
+5 Bun compiled-ESM compatibility
+6 Bun migration fresh/upgrade/lock/rollback/retry
+7 acceptance preflight
+8 frozen dependency fail-closed policy
+9 clean Docker-cache offline production builds
+10 unit/authorization/telemetry/domain suites
+11 Bun collector failure/recovery
+12 PostgreSQL integration/auth/retention/log/timeline
+13 bilingual browser smoke
+14 browser core-loop
+15 Bun encrypted backup/restore checks
+16 checked-in Kubernetes schemas
+17 production chart render/upgrade/failure gates
+18 preview/promotion declarations
+19 delivery policy
+20 production image smoke
+
+Selected outputs:
+- Playwright browser smoke passed
+- Playwright core-loop acceptance passed: admitted login, deterministic Observation, live delivery/recovery, structured Experiments, rejected/confirmed correlation review, persisted history, and bilingual UI
+- offline backup encryption, native SigV4 fixed vector, perturbation, timeout cancellation, off-VM gate, and credential-free boundary passed
+- offline chart render, upgrade, failure-gate, and policy checks passed
+- offline preview lifecycle, Access identity, promotion, and Helm declaration checks passed
+- offline delivery policy passed: 1 workflow(s), pinned bases, images, permissions, and credential boundary
+- ARM64 Bun 1.3.14 web, collector, and migration non-root read-only, migration gate, invalid-URL, and schema-failure smoke passed
+- backup image `pg_dump` and `pg_restore` reported PostgreSQL `18.3`
+
+Image/runtime boundary:
+- web, collector, migrate, and backup use the exact Bun 1.3.14 digest-pinned base
+- clean-cache images were built for linux/arm64 with no cache, no network, and pull=false
+- production smoke used pull=never, read-only root filesystems, non-root bun, and all capabilities dropped
+- node was absent from each production image (both path and command lookup checks)
+- chart and preview manifest/schema checks passed offline
+
+Path/tree equivalence recorded before metadata amend:
+`git diff --name-only b154d5a8b6364f76a14a0d5b83158c32f07baff5 b496df964d374cce279b77efa0ef9fd82433b87a`
+result (exactly these three metadata paths):
+- `.scratch/tracegarden-stack-modernization/issues/10-reprove-modernized-stack.md`
+- `evidence/10-modernized-stack/report.md`
+- `evidence/10-modernized-stack/vm-transcript.txt`
+No runtime-bearing path differed.
+
+Final metadata-amend candidate check:
+`git diff --name-only b154d5a8b6364f76a14a0d5b83158c32f07baff5`
+result (exactly the same three metadata paths above); no runtime-bearing path differed.
+After the final amend, the explicit committed check was:
+`git diff --name-only b154d5a8b6364f76a14a0d5b83158c32f07baff5 HEAD`
+with the same three-path result.
+
+Authorized-kind evidence aggregation:
+Ticket 10 records the already authorized, run-labelled kind evidence from predecessor gates rather than claiming a second broad cluster run:
+- web: evidence/05-bun-web/report.md — real Bun entrypoint, health/readiness, Hono/SSE browser behavior, cleanup
+- collector: evidence/06-collector-bun/report.md — real Bun entrypoint and kind readiness/shutdown; VM Bun adapter list/watch, checkpoint, relist, and failure recovery
+- migration: evidence/07-bun-migrations/report.md and vm-kind-transcript.txt — real Bun Jobs, concurrent migration, 15:15 result, rollback/retry, cleanup
+- combined kind behavior: evidence/22-kind-kubernetes/report.md — authorized context/nodes, list/watch, checkpoint/restart, 410 relist, RBAC, bounded logs, cleanup, and NetworkPolicy exception profile
+- ApplicationSet and preservation: evidence/23-kind-argocd/report.md — real controller lifecycle and unchanged Caddy/kind identities
+
+These predecessor runs use the exact authorized context `kind-k8s-cluster-v137` and preserved the named Caddy/kind containers. The integrated b154d5a source contains no later application-process code change after those tested runtime seams; the intervening changes are delivery/chart/docs/policy integration, checked by the final VM acceptance. No Ticket 10 run claimed production CNI compatibility.
+
+Preservation and cleanup (final VM run):
+before-preservation
+railgun-caddy 26e35e579600473cee8faa08c2fcf4cb8856f6f5b37b77a6c301d44714884f75 true
+k8s-cluster-v137-control-plane d5f3759062bfbd5d96e1a8e4e401be488a3f156d14348feaa5dea95a20b7f2dc true
+k8s-cluster-v137-worker ab79985d801cb252c6ce5e6da5629314f59f1d485d5c21b077dfa350f1c1251e true
+run-dir-before=present
+run-dir-after=absent
+after-preservation
+railgun-caddy 26e35e579600473cee8faa08c2fcf4cb8856f6f5b37b77a6c301d44714884f75 true
+k8s-cluster-v137-control-plane d5f3759062bfbd5d96e1a8e4e401be488a3f156d14348feaa5dea95a20b7f2dc true
+k8s-cluster-v137-worker ab79985d801cb252c6ce5e6da5629314f59f1d485d5c21b077dfa350f1c1251e true
+
+No kind resources were touched by the final Ticket 10 VM-only run. All predecessor kind runs removed only their run-labelled resources. No third-party providers, registries, production systems, credentials, or protected values were contacted.
