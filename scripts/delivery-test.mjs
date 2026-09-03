@@ -597,7 +597,7 @@ if (process.env.DELIVERY_RENDER === "true") {
     env: { ...process.env, KUBECONFIG: "/dev/null" },
   });
   assert.equal(render.status, 0, render.stderr || "preview Helm render failed");
-  const schemaDirectory = join(process.cwd(), ".ci/kubeconform-schemas/v1.31.0-standalone-strict");
+  const schemaDirectory = ".ci/kubeconform-schemas/v1.31.0-standalone-strict";
   const validation = spawnSync(process.execPath, ["scripts/kubeconform.mjs", schemaDirectory], {
     encoding: "utf8",
     input: render.stdout,
