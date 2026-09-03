@@ -64,7 +64,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "3000:3000"
-    user: node
+    user: bun
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m

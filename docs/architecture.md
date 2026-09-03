@@ -8,7 +8,7 @@ Current layout and target seam:
 
 ```text
 apps/
-  web/                 Node `node:http` transport, HTML views, Better Auth, JSON APIs, and SSE
+  web/                 Bun + Hono transport, HTML views, Better Auth, JSON APIs, and SSE
   collector/           Kubernetes list/watch ingestion
   migrate/             PostgreSQL migration gate
 packages/
@@ -29,7 +29,7 @@ deploy/
 docs/
 ```
 
-The current web transport and views remain Node/`node:http` until the modernization steps migrate them. The target seam is Hono route composition with Hono JSX view modules; it does not change the domain or URL contracts. See [ADR 0006](adr/0006-choose-hono-and-staged-bun-runtime.md).
+The web transport uses Bun's fetch listener and Hono route composition with Hono JSX view modules; it does not change the domain or URL contracts. Collector, migration, and backup remain on Node until their independent modernization steps. See [ADR 0006](adr/0006-choose-hono-and-staged-bun-runtime.md).
 
 ## Deep modules and seams
 
@@ -95,9 +95,9 @@ Recent logs use a second ServiceAccount and the `logs:read` application capabili
 
 ## Runtime and persistence
 
-- Current runtime: Node.js 26.8.x and ESM; target production runtime: one exact Bun version, adopted per process after compatibility proof
+- Production runtime: Bun 1.3.14 for the web process; Node.js 26.8.x remains for collector, migration, and backup until their independent tickets land
 - Language: TypeScript 7 with explicit strict settings and its native `tsc` as the authoritative compiler
-- Current web transport: Node `node:http`; target web transport: Hono route composition
+- Web transport: Hono route composition; the production web entrypoint uses Bun's native server
 - Views and client: server-rendered HTML strings, native forms, and a small `fetch`/`EventSource` client today; Hono JSX may structure those views without React or hydration
 - Application transport: existing validated HTTP HTML/JSON routes; no tRPC
 - Database: PostgreSQL 18 with the existing `pg` driver and repository boundary
@@ -106,7 +106,7 @@ Recent logs use a second ServiceAccount and the `logs:read` application capabili
 - Styling: existing page styles; no Tailwind
 - Development and validation: pnpm workspaces, native `tsc --noEmit`, and Node-based Playwright
 
-The current Node process images and commands remain the rollback baseline while Hono and Bun are proven. Exact dependency changes for each migration step are selected only in that step and do not change PostgreSQL, `pg`, or the validation toolchain.
+The parent Node web image and entrypoint remain the rollback baseline in Git history, while collector, migration, and backup stay on their own Node images. Exact dependency changes for each migration step are selected only in that step and do not change PostgreSQL, `pg`, or the validation toolchain.
 
 ## Verification strategy
 

@@ -136,6 +136,9 @@ for (const path of ["deploy/docker/web.Dockerfile", "deploy/docker/collector.Doc
   const source = await readFile(path, "utf8");
   const bases = [...source.matchAll(/^FROM\s+(\S+)/gm)].map(([, image]) => image);
   if (!bases.length || bases.some((image) => !immutableDigest.test(image))) errors.push(`${path}: every base image must be digest-pinned`);
+  if (path.endsWith("/web.Dockerfile") && (!source.includes("docker.io/oven/bun:1.3.14-slim@sha256:") || !source.includes('CMD ["bun", "dist/apps/web/src/bun.js"]') || source.includes("node:26.8"))) {
+    errors.push("web production image must use the pinned Bun runtime and no Node base");
+  }
 }
 const collectorDockerfile = await readFile("deploy/docker/collector.Dockerfile", "utf8");
 if (!collectorDockerfile.startsWith("FROM docker.io/oven/bun:1.3.14-slim@sha256:6068a9d40e9fc5c4519891edb63dfc5935c393fe2228eb9a5b7f472b444b5ee2\n")) errors.push("collector Dockerfile must use the pinned Bun 1.3.14 base");
@@ -151,6 +154,8 @@ if (/spawn\(\s*["']aws["']/.test(backupScript) || !backupScript.includes("create
 }
 const compose = await readFile("docker-compose.yml", "utf8");
 if (!/DATABASE_URL:\s+\$\{MIGRATION_DATABASE_URL:-/.test(compose)) errors.push("docker-compose migration DATABASE_URL must be parameterized");
+const webCompose = compose.slice(compose.indexOf("  web:\n"), compose.indexOf("  collector:\n"));
+if (!/\n    user: bun\n/.test(webCompose)) errors.push("docker-compose web service must run as the Bun image user");
 for (const image of [...compose.matchAll(/^\s+image:\s+(\S+)/gm)].map(([, value]) => value)) {
   if (!immutableDigest.test(image)) errors.push(`docker-compose.yml: image is not digest-pinned (${image})`);
 }

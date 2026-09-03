@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 
 const context = resolve(process.env.TRACEGARDEN_CONTAINER_CONTEXT?.trim() || ".scratch/container-context");
 const required = [
-  "dist/apps/web/src/main.js",
+  "dist/apps/web/src/bun.js",
   "dist/apps/collector/src/main.js",
   "dist/apps/migrate/src/main.js",
   "dist/packages/db/src/index.js",

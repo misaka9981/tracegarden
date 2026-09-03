@@ -3,13 +3,12 @@ import { Buffer } from "node:buffer";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { get as httpGet } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { CoreV1Api, KubeConfig } from "@kubernetes/client-node";
 import { createCollectorRuntime } from "../dist/apps/collector/src/main.js";
-import { createWebRuntime } from "../dist/apps/web/src/server.js";
+import { createWebApplication } from "../dist/apps/web/src/server.js";
 import {
   collectScopedResources,
   createKubernetesAdapter,
@@ -123,32 +122,21 @@ function waitForChild(child, timeoutMs = 10_000) {
       clearTimeout(timer);
       resolve({ code, signal });
     });
+    if (child.exitCode !== null || child.signalCode !== null) {
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code: child.exitCode, signal: child.signalCode });
+    }
   });
 }
 
-function openRawSse(url, cookie) {
-  return new Promise((resolve, reject) => {
-    const request = httpGet(url, { headers: { cookie } }, (response) => {
-      response.setEncoding("utf8");
-      resolve({
-        request,
-        response,
-        nextChunk: () => new Promise((chunkResolve, chunkReject) => {
-          response.once("data", chunkResolve);
-          response.once("error", chunkReject);
-          response.once("end", () => chunkReject(new Error("SSE stream ended early")));
-        }),
-      });
-    });
-    request.once("error", reject);
-  });
-}
-
-async function nextSseChunk(stream, timeoutMs = 10_000) {
-  return Promise.race([
-    stream.nextChunk(),
+async function nextSseChunk(reader, timeoutMs = 10_000) {
+  const result = await Promise.race([
+    reader.read(),
     delay(timeoutMs).then(() => { throw new Error("SSE stream did not emit the expected chunk"); }),
   ]);
+  if (result.done) throw new Error("SSE stream ended early");
+  return new TextDecoder().decode(result.value);
 }
 
 function databaseEnvironment(databaseUrl) {
@@ -177,7 +165,7 @@ const databasePort = 45_000 + (process.pid % 900);
 const databaseContainer = `${runTag}-postgres`;
 const databaseUrl = configuredDatabaseUrl || `postgresql://tracegarden:local-only@127.0.0.1:${databasePort}/tracegarden`;
 let database;
-let webRuntime;
+let webApplication;
 let collectorRuntime;
 let authPool;
 let tlsPool;
@@ -273,8 +261,8 @@ try {
   await waitFor("PostgreSQL NOTIFY delivery", () => notificationIds.includes(notificationResult.entry.id));
   await adminPool.query("SELECT pg_terminate_backend($1)", [listenerPid]);
   await waitFor("PostgreSQL listener failure", () => database.timeline.timelineNotificationsHealthy() === false);
-  unsubscribeNotification();
-  await delay(100);
+  await unsubscribeNotification();
+  assert.equal(database.timeline.timelineListenerClient, null);
   const resubscribedNotifications = [];
   const unsubscribeResubscribed = await database.timeline.subscribeTimeline((notification) => resubscribedNotifications.push(notification.entryId));
   assert.equal(database.timeline.timelineNotificationsHealthy(), true);
@@ -285,7 +273,8 @@ try {
   }, new Date().toISOString());
   const reconnectResult = await database.timeline.recordObservation(reconnectObservation);
   await waitFor("PostgreSQL NOTIFY reconnect delivery", () => resubscribedNotifications.includes(reconnectResult.entry.id));
-  unsubscribeResubscribed();
+  await unsubscribeResubscribed();
+  assert.equal(database.timeline.timelineListenerClient, null);
   await adminPool.end();
   adminPool = undefined;
 
@@ -352,33 +341,33 @@ try {
   await collectorRuntime.close();
   collectorRuntime = undefined;
 
-  // Hono's compiled Node adapter must serve a request, stream a committed notification, and release the SSE client on abort.
-  webRuntime = await createWebRuntime({
+  // Hono's compiled app.fetch serves a request and streams a committed notification under Bun.
+  webApplication = await createWebApplication({
     database,
     environment: { ...databaseEnvironment(databaseUrl), HOST: "127.0.0.1", PORT: "0" },
   });
-  const webAddress = webRuntime.server.address();
-  assert.ok(webAddress && typeof webAddress === "object");
-  const webBaseUrl = `http://127.0.0.1:${webAddress.port}`;
-  const health = await waitForHttp(`${webBaseUrl}/health/readiness`, 200);
+  webApplication.markStarted("127.0.0.1", 0);
+  const appRequest = (path, init) => webApplication.app.fetch(new Request(`http://bun.compatibility${path}`, init));
+  const health = await appRequest("/health/readiness");
+  assert.equal(health.status, 200);
   assert.equal((await health.json()).checks.timeline, "ready");
-  const login = await fetch(`${webBaseUrl}/auth/login`, {
+  const login = await appRequest("/auth/login", {
     method: "POST",
-    redirect: "manual",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: "identity=owner&lang=en",
   });
   assert.equal(login.status, 303);
   const cookie = login.headers.get("set-cookie") ?? "";
-  assert.match(cookie, /tracegarden_session=/);
-  const statusResponse = await fetch(`${webBaseUrl}/api/status`, { headers: { cookie } });
+  const statusResponse = await appRequest("/api/status", { headers: { cookie } });
   assert.equal(statusResponse.status, 200);
   assert.equal((await statusResponse.json()).service, "tracegarden-web");
 
-  const rawSse = await openRawSse(`${webBaseUrl}/api/timeline/stream`, cookie);
-  assert.equal(rawSse.response.statusCode, 200);
-  assert.equal(rawSse.response.headers["content-type"], "text/event-stream; charset=utf-8");
-  const readyChunk = await nextSseChunk(rawSse);
+  const rawSse = await appRequest("/api/timeline/stream", { headers: { cookie } });
+  assert.equal(rawSse.status, 200);
+  assert.equal(rawSse.headers.get("content-type"), "text/event-stream; charset=utf-8");
+  assert.ok(rawSse.body);
+  const rawSseReader = rawSse.body.getReader();
+  const readyChunk = await nextSseChunk(rawSseReader);
   assert.match(readyChunk, /event: ready/);
   const sseObservation = normalizePodObservation(scope, {
     kind: "Pod",
@@ -386,31 +375,111 @@ try {
     status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
   }, new Date().toISOString());
   const sseResult = await database.timeline.recordObservation(sseObservation);
-  const hint = await nextSseChunk(rawSse);
+  const hint = await nextSseChunk(rawSseReader);
   assert.match(hint, /event: timeline/);
   assert.match(hint, new RegExp(sseResult.entry.id));
-  rawSse.response.destroy();
-  rawSse.request.destroy();
-  rawSse.response.socket?.destroy();
+  await rawSseReader.cancel();
+  await webApplication.close();
+  webApplication = undefined;
 
-  await waitFor("Hono SSE abort cleanup", async () => {
-    const metrics = await fetch(`${webBaseUrl}/metrics`);
-    return (await metrics.text()).includes("tracegarden_sse_clients 0");
-  });
-  await webRuntime.close();
-  webRuntime = undefined;
-
-  // The compiled web and collector entrypoints must receive SIGTERM and finish their graceful shutdown paths under Bun.
+  // The actual Bun web entrypoint must release a disconnected SSE client and stop with another active stream.
   const signalWebPort = databasePort + 1;
-  const webProcess = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
-    env: { ...process.env, ...databaseEnvironment(databaseUrl), HOST: "127.0.0.1", PORT: String(signalWebPort) },
+  const webProcess = spawn("bun", ["dist/apps/web/src/bun.js"], {
+    env: { ...process.env, ...databaseEnvironment(databaseUrl), TRACEGARDEN_SSE_BOUNDARY_PROBE: "1", HOST: "127.0.0.1", PORT: String(signalWebPort) },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  let webOutput = "";
+  webProcess.stdout.on("data", (chunk) => { webOutput += chunk; });
+  webProcess.stderr.on("data", (chunk) => { webOutput += chunk; });
+  const boundaryEvents = () => webOutput.split("\n").flatMap((line) => {
+    try {
+      const event = JSON.parse(line);
+      return event.kind === "web.sse.boundary" ? [event] : [];
+    } catch {
+      return [];
+    }
+  });
+  const boundaryCount = (phase) => boundaryEvents().filter((event) => event.phase === phase).length;
+  const assertSaturatedBoundary = (phase, occurrence) => {
+    const event = boundaryEvents().filter((candidate) => candidate.phase === phase)[occurrence - 1];
+    assert.ok(event, `Bun SSE ${phase} boundary was not reported`);
+    assert.equal(typeof event.desiredSize, "number");
+    assert.ok(event.desiredSize <= 0, `Bun SSE ${phase} boundary was not saturated: ${event.desiredSize}`);
+    assert.equal(typeof event.pendingWrites, "number");
+    assert.ok(event.pendingWrites > 0, `Bun SSE ${phase} boundary had no pending writer write`);
+  };
+  const assertReleasedBoundary = (occurrence) => {
+    const event = boundaryEvents().filter((candidate) => candidate.phase === "producer-released")[occurrence - 1];
+    assert.ok(event, `Bun SSE producer release ${occurrence} was not reported`);
+    assert.equal(event.pendingWrites, 0);
+    assert.equal(event.appWriteSettled, true);
+  };
+  const sseBoundaryTimeoutMs = 5_000;
   signalChildren.push(webProcess);
   await waitForHttp(`http://127.0.0.1:${signalWebPort}/health/live`, 200);
+  const signalLogin = await fetch(`http://127.0.0.1:${signalWebPort}/auth/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: "identity=owner&lang=en",
+  });
+  assert.equal(signalLogin.status, 303);
+  const signalCookie = signalLogin.headers.get("set-cookie") ?? "";
+  const disconnectedController = new AbortController();
+  const disconnectedStream = await fetch(`http://127.0.0.1:${signalWebPort}/api/timeline/stream`, { headers: { cookie: signalCookie }, signal: disconnectedController.signal });
+  assert.equal(disconnectedStream.status, 200);
+  assert.ok(disconnectedStream.body);
+  const disconnectedReader = disconnectedStream.body.getReader();
+  assert.match(await nextSseChunk(disconnectedReader), /event: ready/);
+  const unreadDisconnectObservation = normalizePodObservation(scope, {
+    kind: "Pod",
+    metadata: { name: "bun-sse-unread-disconnect", namespace: "tracegarden", uid: "bun-sse-unread-disconnect", resourceVersion: "1" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, new Date().toISOString());
+  await database.timeline.recordObservation(unreadDisconnectObservation);
+  await waitFor("Bun SSE unread hint backpressure", () => boundaryCount("backpressured") === 1, sseBoundaryTimeoutMs);
+  assert.equal(boundaryCount("producer-released"), 0);
+  assertSaturatedBoundary("backpressured", 1);
+  disconnectedController.abort();
+  await disconnectedReader.cancel().catch(() => undefined);
+  await waitFor("Bun SSE blocked producer release", () => boundaryCount("producer-released") === 1, sseBoundaryTimeoutMs);
+  assertReleasedBoundary(1);
+  await waitFor("Bun SSE disconnect subscription cleanup", () => boundaryCount("subscription-released") === 1, sseBoundaryTimeoutMs);
+  await waitFor("Bun SSE disconnect cleanup", async () => {
+    const metrics = await fetch(`http://127.0.0.1:${signalWebPort}/metrics`);
+    return (await metrics.text()).includes("tracegarden_sse_clients 0") && boundaryCount("client-closed") === 1;
+  }, sseBoundaryTimeoutMs);
+  const activeStream = await fetch(`http://127.0.0.1:${signalWebPort}/api/timeline/stream`, { headers: { cookie: signalCookie } });
+  assert.equal(activeStream.status, 200);
+  assert.ok(activeStream.body);
+  const activeReader = activeStream.body.getReader();
+  assert.match(await nextSseChunk(activeReader), /event: ready/);
+  const unreadShutdownObservation = normalizePodObservation(scope, {
+    kind: "Pod",
+    metadata: { name: "bun-sse-unread-shutdown", namespace: "tracegarden", uid: "bun-sse-unread-shutdown", resourceVersion: "1" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] },
+  }, new Date().toISOString());
+  await database.timeline.recordObservation(unreadShutdownObservation);
+  await waitFor("Bun SSE shutdown hint backpressure", () => boundaryCount("backpressured") === 2, sseBoundaryTimeoutMs);
+  assert.equal(boundaryCount("producer-released"), 1);
+  assertSaturatedBoundary("backpressured", 2);
   webProcess.kill("SIGTERM");
-  const webExit = await waitForChild(webProcess);
+  await waitFor("Bun SSE shutdown blocked producer release", () => boundaryCount("producer-released") === 2, sseBoundaryTimeoutMs);
+  assertReleasedBoundary(2);
+  await waitFor("Bun SSE shutdown subscription cleanup", () => boundaryCount("subscription-released") === 2, sseBoundaryTimeoutMs);
+  const activeStreamResult = await Promise.race([
+    (async () => {
+      let result;
+      do result = await activeReader.read().catch(() => ({ done: true, value: undefined })); while (!result.done);
+      return result;
+    })(),
+    delay(5_000).then(() => { throw new Error("Bun web SIGTERM left the active SSE stream open"); }),
+  ]);
+  assert.equal(activeStreamResult.done, true);
+  const webExit = await waitForChild(webProcess, 5_000);
   assert.equal(webExit.code, 0);
+  assert.equal(boundaryCount("client-closed"), 2);
+  assert.equal(boundaryCount("subscription-released"), 2);
   signalChildren.pop();
 
   const signalCollectorPort = databasePort + 2;
@@ -472,7 +541,7 @@ try {
   }
   await Promise.all(signalChildren.map((child) => waitForChild(child, 5_000).catch(() => undefined)));
   if (collectorRuntime) await collectorRuntime.close().catch(() => undefined);
-  if (webRuntime) await webRuntime.close().catch(() => undefined);
+  if (webApplication) await webApplication.close().catch(() => undefined);
   if (authPool) await authPool.end().catch(() => undefined);
   if (tlsPool) await tlsPool.end().catch(() => undefined);
   if (adminPool) await adminPool.end().catch(() => undefined);

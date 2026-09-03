@@ -164,7 +164,7 @@ try {
   await database.migrate();
   await database.clusterScope.save({ workspaceId, clusterId: "core-loop-cluster", ...scopeInput });
 
-  web = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
+  web = spawn("bun", ["dist/apps/web/src/bun.js"], {
     env: { ...process.env, NODE_ENV: "test", DATABASE_MODE: undefined, DATABASE_URL: databaseUrl, PORT: String(webPort), HOST: "127.0.0.1" },
     stdio: ["ignore", "pipe", "pipe"],
   });

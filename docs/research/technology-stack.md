@@ -22,9 +22,9 @@ Research date: 2026-09-01. Sources are official documentation, specifications, r
 
 | Area | Current implementation | Accepted target or constraint |
 |---|---|---|
-| Runtime | Node.js 26.8.x, ESM | Bun becomes the production runtime one process at a time after compatibility and behavior parity are proven; Node remains the rollback runtime during migration |
+| Runtime | Bun 1.3.14 for web; Node.js 26.8.x for collector, migration, and backup; ESM | Bun adoption remains per-process; Node remains the rollback runtime for each process during migration |
 | Language | TypeScript 7 with native `tsc` | `tsc --noEmit` remains authoritative |
-| Web transport | Node `node:http` route dispatch | Hono owns route composition; existing URLs, methods, statuses, redirects, cookies, authorization, health, metrics, telemetry, and SSE contracts remain unchanged |
+| Web transport | Hono fetch listener on Bun | Existing URLs, methods, statuses, redirects, cookies, authorization, health, metrics, telemetry, and SSE contracts remain unchanged |
 | Views and client | Server-rendered HTML strings, native forms, and a small `fetch`/`EventSource` client | Hono JSX may structure server views without React, hydration, or a client state framework |
 | Application transport | Validated HTTP HTML/JSON routes | No React, TanStack Router, TanStack Start, tRPC, or Tailwind |
 | Database | PostgreSQL 18 through `pg` | PostgreSQL remains the durable authority; no embedded database or driver replacement |
@@ -35,4 +35,4 @@ Research date: 2026-09-01. Sources are official documentation, specifications, r
 
 ## Evidence boundary
 
-The current source and production images use Node.js, `node:http`, PostgreSQL, and `pg`; no Hono or Bun production migration has been claimed by this decision. Hono route/view compatibility, Bun runtime behavior, exact migration images, and any dependency changes remain unverified until the corresponding modernization tickets produce direct evidence. Live cluster behavior and external integrations remain unverified under the existing authorization boundary.
+The web source and production image use Bun with Hono; collector, migration, and backup remain on Node.js. PostgreSQL and `pg` remain unchanged. The web migration is covered by Ticket 05 evidence; the remaining process migrations, live cluster behavior, and external integrations remain unverified under the existing authorization boundary.

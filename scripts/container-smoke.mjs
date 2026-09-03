@@ -91,8 +91,7 @@ try {
 
   for (const service of ["web", "collector"]) {
     const container = compose(["ps", "-q", service]);
-    const runtimeUser = service === "collector" ? "bun" : "node";
-    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", container]), runtimeUser);
+    assert.equal(docker(["inspect", "-f", "{{.Config.User}}", container]), "bun");
     assert.match(compose(["exec", "-T", service, "id", "-u"]), /^[1-9]\d*$/);
     assert.match(compose(["exec", "-T", service, "id", "-g"]), /^[1-9]\d*$/);
     assert.equal(docker(["inspect", "-f", "{{.HostConfig.ReadonlyRootfs}}", container]), "true");
@@ -103,12 +102,8 @@ try {
     assert.match(imageId, /^sha256:[a-f0-9]{64}$/);
     assert.equal(docker(["image", "inspect", "-f", "{{.Architecture}}", imageId]), "arm64");
     assert.doesNotMatch(docker(["image", "inspect", "-f", "{{json .Config.Env}}", imageId]), /GOOGLE|KUBERNETES/);
-    if (service === "collector") {
-      assert.equal(compose(["exec", "-T", service, "bun", "--version"]), "1.3.14");
-      assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /usr/local/bin/node"]), "");
-    } else {
-      assert.match(compose(["exec", "-T", service, "node", "--version"]), /^v26\.8\.\d+$/);
-    }
+    assert.equal(compose(["exec", "-T", service, "bun", "--version"]), "1.3.14");
+    assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /usr/local/bin/node"]), "");
     assert.equal(compose(["exec", "-T", service, "sh", "-c", "test ! -e /app/apps && test ! -e /app/scripts && test ! -e /app/.env && test ! -e /app/node_modules/.pnpm/node_modules/.bin && test ! -e /app/node_modules/.pnpm/node_modules/@typescript"]), "");
     assert.equal(expectFailure(["compose", "-p", project, "exec", "-T", service, "sh", "-c", "touch /app/.write-test"]), true);
     assert.equal(compose(["exec", "-T", service, "sh", "-c", "touch /tmp/.write-test && rm /tmp/.write-test"]), "");
@@ -189,7 +184,7 @@ try {
   );
   const imageFile = process.env.CONTAINER_SMOKE_IMAGE_FILE?.trim();
   if (imageFile) await writeFile(imageFile, `${Object.entries(imageIds).map(([service, imageId]) => `${service}=${imageId}`).join("\n")}\n`);
-  console.log("ARM64 Node 26.8.x web and Bun 1.3.14 collector non-root read-only, migration gate, invalid-URL, and schema-failure smoke passed");
+  console.log("ARM64 Bun 1.3.14 web and collector non-root read-only, migration gate, invalid-URL, and schema-failure smoke passed");
 } finally {
   try { compose(["down", "-v"]); } catch { /* preserve the original failure */ }
 }

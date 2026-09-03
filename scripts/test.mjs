@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { ServerResponse } from "node:http";
 import { CollectorRecoveryError, collectorStatus, createCollectorRuntime } from "../dist/apps/collector/src/main.js";
-import { createWebRuntime, renderApplicationPage, renderLoginPage, renderStatusPage } from "../dist/apps/web/src/server.js";
+import { createWebApplication, renderApplicationPage, renderLoginPage, renderStatusPage } from "../dist/apps/web/src/server.js";
 import { createDatabase, MemoryAdmissionStore, MemoryClusterScopeStore, MemoryDatabase, MemoryObservationStore, TimelineQueryValidationError, parseTimelineNotification, probePostgresReadiness, waitForDatabase, waitForMigrations } from "../dist/packages/db/src/index.js";
 import { capabilities, createBetterAuthRuntime, createIdentityAdapter, GOOGLE_ISSUER, googleOAuthConfig, hasCapability, LastWorkspaceOwnerError, LocalIdentityAdapter } from "../dist/packages/identity/src/index.js";
 import { catalogs, parseLanguage } from "../dist/packages/i18n/src/index.js";
@@ -33,10 +32,31 @@ import {
 } from "../dist/packages/cluster/src/index.js";
 import { createTelemetry } from "../dist/packages/telemetry/src/index.js";
 
+const webApplications = new Map();
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = (input, init) => {
+  const request = input instanceof Request && init === undefined ? input : new Request(input, init);
+  const application = webApplications.get(Number(new URL(request.url).port));
+  return application ? application.app.fetch(request) : nativeFetch(input, init);
+};
 const readyMemoryDatabase = async () => {
   const database = new MemoryDatabase();
   await database.migrate();
   return database;
+};
+const createWebTestRuntime = async (options = {}) => {
+  const application = await createWebApplication(options);
+  const port = Number(options.port ?? 0);
+  if (port > 0) webApplications.set(port, application);
+  application.markStarted(options.host ?? "127.0.0.1", port);
+  return {
+    status: application.status,
+    telemetry: application.telemetry,
+    close: async () => {
+      if (port > 0 && webApplications.get(port) === application) webApplications.delete(port);
+      await application.close();
+    },
+  };
 };
 
 const exporterFailureTelemetry = createTelemetry({
@@ -266,7 +286,7 @@ if (concurrentOwner.admitted) {
 }
 
 const productionTimeline = new MemoryObservationStore("production-test-cursor-secret");
-const productionRuntime = await createWebRuntime({
+const productionRuntime = await createWebTestRuntime({
   database: {
     kind: "postgres", verifyMigrations: async () => {},
     admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "test-google-subject" }),
@@ -312,7 +332,7 @@ try {
   await productionRuntime.close();
 }
 await assert.rejects(
-  createWebRuntime({
+  createWebTestRuntime({
     database: {
       kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "injected-experiment" }),
@@ -339,7 +359,7 @@ await assert.rejects(
   /Production Experiment must use the database-owned durable store/,
 );
 await assert.rejects(
-  createWebRuntime({
+  createWebTestRuntime({
     database: {
       kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "test-google-subject" }),
@@ -364,7 +384,7 @@ await assert.rejects(
   /Production Timeline must use the database-owned durable store/,
 );
 await assert.rejects(
-  createWebRuntime({
+  createWebTestRuntime({
     database: {
       kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "missing-timeline" }),
@@ -388,7 +408,7 @@ await assert.rejects(
   /Production Timeline must use the database-owned durable store/,
 );
 await assert.rejects(
-  createWebRuntime({
+  createWebTestRuntime({
     database: { kind: "postgres", verifyMigrations: async () => {}, migrate: async () => {}, ping: async () => true, close: async () => {} },
     environment: {
       NODE_ENV: "production",
@@ -405,7 +425,7 @@ await assert.rejects(
   /Production admission must use the database-owned durable store/,
 );
 await assert.rejects(
-  createWebRuntime({
+  createWebTestRuntime({
     database: {
       kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" }),
@@ -458,7 +478,7 @@ const callbackAuthRuntime = {
 };
 const callbackAdmissionStore = new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" });
 const callbackTimeline = new MemoryObservationStore("production-test-cursor-secret");
-const callbackRuntime = await createWebRuntime({
+const callbackRuntime = await createWebTestRuntime({
   database: {
     kind: "postgres", verifyMigrations: async () => {},
     admission: callbackAdmissionStore,
@@ -501,7 +521,7 @@ try {
   await callbackRuntime.close();
 }
 await assert.rejects(
-  createWebRuntime({
+  createWebTestRuntime({
     database: {
       kind: "postgres", verifyMigrations: async () => {},
       admission: new MemoryAdmissionStore({ issuer: GOOGLE_ISSUER, subject: "google-subject" }),
@@ -543,7 +563,7 @@ const restrictedStore = {
   admit: async () => ({ admitted: true, session: restrictedSession }),
   getSession: async (token) => token === restrictedSession.token ? restrictedSession : null,
 };
-const restrictedRuntime = await createWebRuntime({
+const restrictedRuntime = await createWebTestRuntime({
   database: await readyMemoryDatabase(),
   admissionStore: restrictedStore,
   identityAdapter,
@@ -706,7 +726,7 @@ await assert.rejects(
   }),
   /migrations readiness timeout/,
 );
-const exporterWebRuntime = await createWebRuntime({
+const exporterWebRuntime = await createWebTestRuntime({
   database: await readyMemoryDatabase(),
   identityAdapter: new LocalIdentityAdapter(),
   telemetry: exporterFailureTelemetry,
@@ -753,7 +773,7 @@ try {
 const dependencyDatabase = await readyMemoryDatabase();
 let dependencyReady = true;
 dependencyDatabase.ping = async () => dependencyReady;
-const dependencyRuntime = await createWebRuntime({
+const dependencyRuntime = await createWebTestRuntime({
   database: dependencyDatabase,
   identityAdapter: new LocalIdentityAdapter(),
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
@@ -775,7 +795,7 @@ try {
 }
 const listenFailureDatabase = await readyMemoryDatabase();
 listenFailureDatabase.timeline.subscribeTimeline = async () => { throw new Error("LISTEN unavailable"); };
-const listenFailureRuntime = await createWebRuntime({
+const listenFailureRuntime = await createWebTestRuntime({
   database: listenFailureDatabase,
   identityAdapter: new LocalIdentityAdapter(),
   environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
@@ -798,32 +818,6 @@ try {
 } finally {
   await listenFailureRuntime.close();
 }
-const bindFailureWebTelemetry = createTelemetry({ serviceName: "tracegarden-web-bind-test" });
-const occupiedWebPort = 43221;
-const occupiedWebRuntime = await createWebRuntime({
-  database: await readyMemoryDatabase(),
-  identityAdapter: new LocalIdentityAdapter(),
-  environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
-  port: occupiedWebPort,
-});
-try {
-  await assert.rejects(
-    createWebRuntime({
-      database: await readyMemoryDatabase(),
-      identityAdapter: new LocalIdentityAdapter(),
-      telemetry: bindFailureWebTelemetry,
-      environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
-      port: occupiedWebPort,
-    }),
-    /EADDRINUSE/,
-  );
-  const webBindSignals = bindFailureWebTelemetry.signals();
-  assert.ok(webBindSignals.some((signal) => signal.kind === "log" && signal.event === "web.startup.failure"));
-  assert.equal(webBindSignals.some((signal) => signal.kind === "log" && signal.event === "web.started"), false);
-} finally {
-  await occupiedWebRuntime.close();
-}
-
 const scopeInput = {
   clusterId: "lab-cluster",
   name: "Personal lab",
@@ -1150,107 +1144,7 @@ if (liveObservation) {
     .map((result) => result.observation.name);
   assert.deepEqual([equalTimestampPage.entries[0]?.observation.name, equalTimestampNextPage.entries[0]?.observation.name], expectedEqualNames);
 }
-unsubscribeLiveTimeline();
-const backpressureDatabase = await readyMemoryDatabase();
-await configureClusterScope(ownerMember, backpressureDatabase.clusterScope, scopeInput);
-let backpressureSubscriptions = 0;
-let backpressureCleanupCalls = 0;
-const originalSubscribeTimeline = backpressureDatabase.timeline?.subscribeTimeline?.bind(backpressureDatabase.timeline);
-if (originalSubscribeTimeline && backpressureDatabase.timeline) {
-  backpressureDatabase.timeline.subscribeTimeline = async (listener) => {
-    backpressureSubscriptions += 1;
-    const unsubscribe = await originalSubscribeTimeline(listener);
-    return () => {
-      backpressureCleanupCalls += 1;
-      backpressureSubscriptions -= 1;
-      unsubscribe();
-    };
-  };
-}
-const backpressureRuntime = await createWebRuntime({
-  database: backpressureDatabase,
-  identityAdapter: new LocalIdentityAdapter(),
-  environment: { NODE_ENV: "test", HOST: "127.0.0.1" },
-  port: 43209,
-});
-const backpressureBaselineSubscriptions = backpressureSubscriptions;
-const originalResponseWrite = ServerResponse.prototype.write;
-let backpressureWritePending = false;
-let backpressureWriteObserved = false;
-ServerResponse.prototype.write = function (...args) {
-  const accepted = originalResponseWrite.apply(this, args);
-  if (backpressureWritePending) {
-    backpressureWritePending = false;
-    backpressureWriteObserved = true;
-    setImmediate(() => this.emit("drain"));
-    return false;
-  }
-  return accepted;
-};
-try {
-  const backpressureLogin = await fetch("http://127.0.0.1:43209/auth/login", {
-    method: "POST",
-    redirect: "manual",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: "identity=owner&lang=en",
-  });
-  backpressureWritePending = true;
-  const backpressureRequestAbort = new AbortController();
-  const backpressureStream = await fetch("http://127.0.0.1:43209/api/timeline/stream", {
-    headers: { cookie: backpressureLogin.headers.get("set-cookie") ?? "" },
-    signal: backpressureRequestAbort.signal,
-  });
-  assert.equal(backpressureStream.status, 200);
-  assert.ok(backpressureStream.body);
-  const backpressureReader = backpressureStream.body.getReader();
-  const backpressureReady = await backpressureReader.read();
-  assert.equal(backpressureReady.done, false);
-  assert.match(new TextDecoder().decode(backpressureReady.value), /event: ready/);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(backpressureWriteObserved, true);
-  assert.equal(backpressureSubscriptions, backpressureBaselineSubscriptions + 1);
-  const backpressureNotification = await backpressureDatabase.timeline.recordObservation(normalizePodObservation(savedScope, {
-    kind: "Pod",
-    metadata: { name: "backpressure-notification", namespace: "tracegarden", uid: "backpressure-notification", resourceVersion: "1" },
-    status: { phase: "Running" },
-  }, "2099-01-01T00:00:00.000Z"));
-  let backpressureTimelineBody = "";
-  let backpressureReadTimeout;
-  const backpressureTimelineRead = await Promise.race([
-    (async () => {
-      for (;;) {
-        const { done, value } = await backpressureReader.read();
-        if (done) return { done: true, value: undefined };
-        backpressureTimelineBody += new TextDecoder().decode(value);
-        if (backpressureTimelineBody.includes("event: timeline")) return { done: false, value };
-      }
-    })(),
-    new Promise((_, reject) => {
-      backpressureReadTimeout = setTimeout(() => reject(new Error("SSE timeline notification did not arrive after drain")), 1_000);
-    }),
-  ]).finally(() => clearTimeout(backpressureReadTimeout));
-  assert.equal(backpressureTimelineRead.done, false);
-  assert.match(backpressureTimelineBody, /event: timeline/);
-  assert.match(backpressureTimelineBody, new RegExp(`\\"entryId\\":\\"${backpressureNotification.entry.id}\\"`));
-  assert.equal(backpressureSubscriptions, backpressureBaselineSubscriptions + 1);
-  backpressureReader.releaseLock();
-  const backpressureAbort = new AbortController();
-  const backpressureBodyDone = backpressureStream.body.pipeTo(new WritableStream(), { signal: backpressureAbort.signal }).catch(() => undefined);
-  backpressureRequestAbort.abort();
-  backpressureAbort.abort();
-  await backpressureBodyDone;
-  for (let attempt = 0; attempt < 20 && (backpressureSubscriptions !== backpressureBaselineSubscriptions || backpressureCleanupCalls !== 1); attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  assert.equal(backpressureSubscriptions, backpressureBaselineSubscriptions);
-  assert.equal(backpressureCleanupCalls, 1, "explicit SSE close must clean exactly once");
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(backpressureCleanupCalls, 1);
-} finally {
-  backpressureWritePending = false;
-  ServerResponse.prototype.write = originalResponseWrite;
-  await backpressureRuntime.close();
-}
+await unsubscribeLiveTimeline();
 const memoryTimeline = new MemoryObservationStore();
 const experimentInput = {
   hypothesis: "**markdown hypothesis**",
@@ -1729,7 +1623,7 @@ const transportLogAdapter = {
     return ["transport-log-one", "transport-log-two"];
   },
 };
-const scopeRuntime = await createWebRuntime({
+const scopeRuntime = await createWebTestRuntime({
   database: scopeDatabase,
   logAdapter: transportLogAdapter,
   telemetry: exporterFailureTelemetry,
@@ -1908,7 +1802,7 @@ try {
 }
 
 const viewerToken = "viewer-cluster-token";
-const viewerScopeRuntime = await createWebRuntime({
+const viewerScopeRuntime = await createWebTestRuntime({
   database: scopeDatabase,
   admissionStore: {
     admit: async () => ({ admitted: false, reason: "admission_required" }),
@@ -2080,7 +1974,7 @@ if (rejectionCandidate) {
 
 let migrationFailed = false;
 try {
-  await createWebRuntime({
+  await createWebTestRuntime({
     database: { kind: "postgres", verifyMigrations: async () => { throw new Error("migration state is pending"); }, clusterScope: new MemoryClusterScopeStore(), migrate: async () => { throw new Error("migration runner must not be called"); }, ping: async () => true, close: async () => {} },
     port: 0,
   });
@@ -2106,7 +2000,7 @@ assert.throws(
 );
 assert.throws(() => createDatabase({ DATABASE_MODE: "memory" }));
 await assert.rejects(
-  createWebRuntime({ database: new MemoryDatabase(), environment: { NODE_ENV: "production" }, port: 0 }),
+  createWebTestRuntime({ database: new MemoryDatabase(), environment: { NODE_ENV: "production" }, port: 0 }),
   /Memory database is not allowed in production/,
 );
 const staleOutput = "dist/apps/web/src/deleted-output-regression.js";

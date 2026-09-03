@@ -1,6 +1,4 @@
-import { createServer, type Server } from "node:http";
 import { randomUUID } from "node:crypto";
-import { getRequestListener, type HttpBindings } from "@hono/node-server";
 import { Hono, type Context } from "hono";
 import { streamSSE, type SSEStreamingApi } from "hono/streaming";
 import { state, type StatusResponse } from "../../../packages/contracts/src/index.js";
@@ -13,6 +11,7 @@ import {
   type DatabaseBoundary,
   type TimelineNotification,
   type TimelineNotificationSource,
+  type TimelineNotificationUnsubscribe,
   type ExperimentStore,
   type TimelineEntry,
   type TimelinePage,
@@ -87,15 +86,15 @@ type WebOptions = Readonly<{
   identityAdapter?: IdentityAdapter;
   logAdapter?: KubernetesLogAdapter;
   environment?: Record<string, string | undefined>;
-  port?: number;
-  host?: string;
   telemetry?: TelemetryRuntime;
 }>;
 
-export type WebRuntime = Readonly<{
-  server: Server;
+export type WebApplication = Readonly<{
+  app: Hono<WebContext>;
   status: () => Promise<StatusResponse>;
   telemetry: TelemetryRuntime;
+  markStarted: (host: string, port: number) => void;
+  markFailed: () => void;
   close: () => Promise<void>;
 }>;
 
@@ -219,44 +218,90 @@ function requestHeaders(request: Request): Headers {
   return headers;
 }
 
-function listenForStartup(server: Server, port: number, host: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const onListening = (): void => {
-      if (settled) return;
-      settled = true;
-      resolve();
-    };
-    const onError = (error: unknown): void => {
-      if (settled) return;
-      settled = true;
-      server.removeListener("listening", onListening);
-      reject(error);
-    };
-    server.once("error", onError);
-    server.once("listening", onListening);
-    try {
-      server.listen(port, host);
-    } catch (error) {
-      server.removeListener("error", onError);
-      server.removeListener("listening", onListening);
-      onError(error);
-    }
-  });
-}
-
-type WebBindings = HttpBindings;
 type WebVariables = {
   correlation: CorrelationMetadata;
   requestSpan: TelemetrySpan;
 };
-type WebContext = { Bindings: WebBindings; Variables: WebVariables };
+type WebContext = { Variables: WebVariables };
 type AppContext = Context<WebContext>;
 
-export async function createWebRuntime(options: WebOptions = {}): Promise<WebRuntime> {
+type SseBoundaryWriter = {
+  desiredSize: number | null;
+  write: (chunk: Uint8Array | string) => Promise<unknown>;
+  abort?: (reason?: unknown) => Promise<unknown>;
+};
+
+function instrumentSseBoundaryWriter(
+  stream: SSEStreamingApi,
+  onBackpressure: (desiredSize: number, pendingWrites: number) => void,
+  onRelease: (pendingWrites: number, appWriteSettled: boolean) => void,
+): () => void {
+  // Hono 4.13.5 keeps this actual WHATWG writer private; this probe is test-only.
+  const writer = (stream as unknown as { writer?: SseBoundaryWriter }).writer;
+  if (!writer) throw new Error("SSE boundary probe could not access Hono's WHATWG writer");
+  let armed = false;
+  let observed = false;
+  let released = false;
+  let pendingWrites = 0;
+  let appWriteSettled = false;
+  let releaseTrackedWrites = (): void => {};
+  const trackedWritesReleased = new Promise<void>((resolve) => { releaseTrackedWrites = resolve; });
+  const write = writer.write.bind(writer);
+  const releaseIfSettled = (): void => {
+    if (released || !observed || !appWriteSettled || pendingWrites !== 0) return;
+    released = true;
+    onRelease(pendingWrites, appWriteSettled);
+  };
+  const trackWrite = (chunk: Uint8Array | string, applicationWrite = false, holdUntilAbort = false): Promise<unknown> => {
+    pendingWrites += 1;
+    if (applicationWrite) appWriteSettled = false;
+    const result = write(chunk);
+    const trackedResult = holdUntilAbort ? Promise.all([result, trackedWritesReleased]) : result;
+    void trackedResult.then(() => {
+      pendingWrites -= 1;
+      if (applicationWrite) appWriteSettled = true;
+      releaseIfSettled();
+    }, () => {
+      pendingWrites -= 1;
+      if (applicationWrite) appWriteSettled = true;
+      releaseIfSettled();
+    });
+    return result;
+  };
+  const observe = (): void => {
+    const desiredSize = writer.desiredSize;
+    if (!armed || observed || desiredSize === null || desiredSize > 0) return;
+    observed = true;
+    // Keep the real WHATWG queue saturated until this test exercises cleanup.
+    const probeChunk = new Uint8Array(32 * 1024);
+    for (let index = 0; index < 512; index += 1) void trackWrite(probeChunk, false, true);
+    const saturatedDesiredSize = writer.desiredSize;
+    onBackpressure(saturatedDesiredSize !== null && saturatedDesiredSize <= 0 ? saturatedDesiredSize : desiredSize, pendingWrites);
+    releaseIfSettled();
+  };
+  stream.onAbort(() => {
+    const abortPromise = writer.abort?.("SSE boundary probe cleanup");
+    releaseTrackedWrites();
+    if (abortPromise) void abortPromise.catch(() => undefined);
+  });
+  writer.write = (chunk: Uint8Array | string): Promise<unknown> => {
+    const result = trackWrite(chunk, armed, armed);
+    observe();
+    return result;
+  };
+  return (): void => {
+    armed = true;
+  };
+}
+
+export async function createWebApplication(options: WebOptions = {}): Promise<WebApplication> {
   const environment = options.environment ?? process.env;
   const production = environment.NODE_ENV === "production";
   const preview = environment.NODE_ENV === "preview";
+  const sseBoundaryProbe = environment.NODE_ENV === "test" && environment.TRACEGARDEN_SSE_BOUNDARY_PROBE === "1";
+  const reportSseBoundary = (phase: "backpressured" | "producer-released" | "client-closed" | "subscription-released", desiredSize?: number, pendingWrites?: number, appWriteSettled?: boolean): void => {
+    if (sseBoundaryProbe) console.log(JSON.stringify({ kind: "web.sse.boundary", phase, ...(desiredSize === undefined ? {} : { desiredSize }), ...(pendingWrites === undefined ? {} : { pendingWrites }), ...(appWriteSettled === undefined ? {} : { appWriteSettled }) }));
+  };
   const cloudflareAccess = configuredCloudflareAccess(environment);
   if (preview && !cloudflareAccess) {
     throw new Error("Preview identity requires complete Cloudflare Access JWT configuration");
@@ -392,11 +437,12 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     cursorLagEntries: number;
     cursorLagSince: number | null;
     sendPendingHint?: () => void;
-    close: () => void;
+    close: () => Promise<void>;
   };
   const liveSseClients = new Map<string, LiveSseClient>();
   let timelineReady = false;
   let stopping = false;
+  let closePromise: Promise<void> | undefined;
   const refreshLiveClientLag = async (client: LiveSseClient): Promise<void> => {
     if (!client.query || !timelineStore?.countTimelineEntriesAfterCursor) return;
     try {
@@ -538,7 +584,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   const removeTimelineErrorListener = timelineNotifications?.onTimelineError?.(() => {
     timelineReady = false;
     telemetry.log("warn", "timeline.notifications.unhealthy", telemetry.correlation("timeline-notifications"));
-    for (const client of [...liveSseClients.values()]) client.close();
+    for (const client of [...liveSseClients.values()]) void client.close().catch(() => undefined);
   });
   const defineWebMetrics = (): void => {
     telemetry.defineGauge("tracegarden_sse_clients");
@@ -589,7 +635,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     analytics: (event: RecentLogTelemetryEvent) => telemetry.log("debug", "recent_log.analytics", correlation, { clusterId: event.clusterId, namespace: event.namespace, pod: event.pod, container: event.container, tail: event.tail, lineCount: event.lineCount, byteCount: event.byteCount }),
   });
 
-  let releaseTimelineReadiness: (() => void) | undefined;
+  let releaseTimelineReadiness: TimelineNotificationUnsubscribe | undefined;
   const timelineNotificationsAreHealthy = (): boolean => {
     try {
       return timelineNotifications?.timelineNotificationsHealthy?.() !== false;
@@ -610,12 +656,13 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       timelineReady = true;
       return;
     }
-    releaseTimelineReadiness?.();
+    const previousRelease = releaseTimelineReadiness;
     releaseTimelineReadiness = undefined;
+    if (previousRelease) await previousRelease();
     try {
       const unsubscribe = await timelineNotifications.subscribeTimeline(() => {});
       if (!timelineNotificationsAreHealthy()) {
-        unsubscribe();
+        await unsubscribe();
         timelineReady = false;
         return;
       }
@@ -823,11 +870,19 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     if (!timelineNotifications) return json(context, 503, { error: "timeline_notifications_unavailable" });
     const clientId = randomUUID();
     let closed = false;
-    let unsubscribe: (() => void) | undefined;
+    let unsubscribe: TimelineNotificationUnsubscribe | undefined;
+    let releasePromise: Promise<void> | undefined;
+    const releaseSubscription = (): Promise<void> => {
+      if (releasePromise) return releasePromise;
+      const current = unsubscribe;
+      if (!current) return Promise.resolve();
+      unsubscribe = undefined;
+      releasePromise = current().then(() => reportSseBoundary("subscription-released"));
+      return releasePromise;
+    };
     let stream: SSEStreamingApi | undefined;
     let finishStream = (): void => {};
-    const outgoing = context.env.outgoing;
-    const onOutgoingClose = (): void => client.close();
+    let closePromise: Promise<void> | undefined;
     const client: LiveSseClient = {
       workspaceId: session.member.workspaceId,
       memberId: session.member.id,
@@ -838,18 +893,22 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       cursorLagEntries: 0,
       cursorLagSince: null,
       close: () => {
-        if (closed) return;
-        closed = true;
-        liveSseClients.delete(clientId);
-        outgoing.removeListener("close", onOutgoingClose);
-        outgoing.socket?.removeListener("close", onOutgoingClose);
-        unsubscribe?.();
-        finishStream();
-        if (stream && !stream.aborted && !stream.closed && !outgoing.destroyed && !outgoing.writableEnded) stream.abort();
+        if (closePromise) return closePromise;
+        closePromise = (async () => {
+          if (closed) return;
+          closed = true;
+          reportSseBoundary("client-closed");
+          liveSseClients.delete(clientId);
+          try {
+            await releaseSubscription();
+          } finally {
+            finishStream();
+            if (stream && !stream.aborted && !stream.closed) stream.abort();
+          }
+        })();
+        return closePromise;
       },
     };
-    outgoing.once("close", onOutgoingClose);
-    outgoing.socket?.once("close", onOutgoingClose);
     const sendAuthorizedHint = async (): Promise<void> => {
       if (client.hintCheckInFlight || closed || !client.readySent || !stream) return;
       client.hintCheckInFlight = true;
@@ -861,7 +920,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           try {
             entry = await timelineStore?.getTimelineEntry(client.workspaceId, notification.entryId) ?? null;
           } catch {
-            client.close();
+            await client.close().catch(() => undefined);
             return;
           }
           if (!entry || entry.workspaceId !== client.workspaceId) continue;
@@ -869,7 +928,7 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
           client.hintQueued = true;
           await stream.writeSSE({ event: "timeline", data: JSON.stringify({ entryId: entry.id }) });
           if (stream.aborted) {
-            client.close();
+            await client.close().catch(() => undefined);
             return;
           }
           void refreshLiveClientLag(client);
@@ -887,18 +946,18 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
       if (!client.hintQueued) void sendAuthorizedHint();
     };
     liveSseClients.set(clientId, client);
-    const abort = (): void => client.close();
+    const abort = (): void => { void client.close().catch(() => undefined); };
     context.req.raw.signal?.addEventListener("abort", abort, { once: true });
     try {
       unsubscribe = await timelineNotifications.subscribeTimeline(onNotification);
       if (closed) {
-        unsubscribe();
+        await releaseSubscription();
         return context.body(null, 204);
       }
       if (timelineNotifications.timelineNotificationsHealthy?.() === false) throw new Error("Timeline notifications are not healthy");
     } catch {
       timelineReady = false;
-      client.close();
+      await client.close().catch(() => undefined);
       return json(context, 503, { error: "timeline_notifications_unavailable" });
     }
     timelineReady = true;
@@ -907,13 +966,15 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
     context.header("x-accel-buffering", "no");
     const response = streamSSE(context, async (nextStream) => {
       stream = nextStream;
-      nextStream.onAbort(client.close);
+      nextStream.onAbort(() => { void client.close().catch(() => undefined); });
+      const armBoundaryProbe = sseBoundaryProbe ? instrumentSseBoundaryWriter(nextStream, (desiredSize, pendingWrites) => reportSseBoundary("backpressured", desiredSize, pendingWrites), (pendingWrites, appWriteSettled) => reportSseBoundary("producer-released", undefined, pendingWrites, appWriteSettled)) : undefined;
       await nextStream.writeSSE({ event: "ready", data: JSON.stringify({ clientId }) });
       if (nextStream.aborted) {
-        client.close();
+        await client.close().catch(() => undefined);
         return;
       }
       client.readySent = true;
+      armBoundaryProbe?.();
       void sendAuthorizedHint();
       // The ready marker is emitted only after LISTEN is active; the browser now recovers durably.
       await new Promise<void>((resolve) => {
@@ -1448,66 +1509,40 @@ export async function createWebRuntime(options: WebOptions = {}): Promise<WebRun
   app.options("*", methodNotAllowed);
   app.notFound((context) => context.json({ error: "not_found" }, 404));
 
-  const server = createServer(getRequestListener((request, bindings) => app.fetch(request, bindings)));
-  const port = options.port ?? Number(environment.PORT ?? "3000");
-  const host = options.host ?? environment.HOST ?? "127.0.0.1";
-  const drainServer = (): Promise<void> => new Promise((resolve, reject) => {
-    try {
-      server.close((error?: Error) => error ? reject(error) : resolve());
-    } catch (error) {
-      reject(error);
-    }
-  });
-  try {
-    await listenForStartup(server, port, host);
-  } catch (error) {
+  const markStarted = (host: string, port: number): void => {
+    startupState = "ready";
+    telemetry.log("info", "web.started", startupCorrelation, { host, port });
+    syncWebMetrics();
+  };
+  const markFailed = (): void => {
     startupState = "failed";
-    telemetry.log("error", "web.startup.failure", startupCorrelation, {
-      error_type: error instanceof Error ? error.name : "unknown",
-    });
-    try {
-      removeTimelineErrorListener?.();
-    } catch {
-      // Cleanup cannot mask the bind failure.
-    }
-    try {
-      releaseTimelineReadiness?.();
-    } catch {
-      // Cleanup cannot mask the bind failure.
-    }
-    releaseTimelineReadiness = undefined;
-    try {
-      await database.close();
-    } catch {
-      // Cleanup cannot mask the bind failure.
-    }
-    throw error;
-  }
-  startupState = "ready";
-  telemetry.log("info", "web.started", startupCorrelation, { host, port });
-  syncWebMetrics();
+    telemetry.log("error", "web.startup.failure", startupCorrelation, { error_type: "Error" });
+  };
   return {
-    server,
+    app,
     status,
     telemetry,
-    close: async () => {
-      stopping = true;
-      databaseReady = false;
-      migrationReady = false;
-      timelineReady = false;
-      telemetry.log("info", "web.stopping", startupCorrelation);
-      try {
+    markStarted,
+    markFailed,
+    close: () => {
+      if (closePromise) return closePromise;
+      closePromise = (async () => {
+        stopping = true;
+        databaseReady = false;
+        migrationReady = false;
+        timelineReady = false;
+        telemetry.log("info", "web.stopping", startupCorrelation);
         try {
           removeTimelineErrorListener?.();
-          for (const client of [...liveSseClients.values()]) client.close();
-          releaseTimelineReadiness?.();
+          await Promise.all([...liveSseClients.values()].map((client) => client.close()));
+          const release = releaseTimelineReadiness;
           releaseTimelineReadiness = undefined;
+          if (release) await release();
         } finally {
-          await drainServer();
+          await database.close();
         }
-      } finally {
-        await database.close();
-      }
+      })();
+      return closePromise;
     },
   };
 }

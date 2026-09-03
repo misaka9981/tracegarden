@@ -4,13 +4,17 @@
 
 **Blocked by:** 03: Structure server views with Hono JSX; 04: Prove Bun runtime compatibility.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Web startup uses Hono's Bun entrypoint and the pinned Bun runtime.
-- [ ] Better Auth, Cloudflare Access, cookies, redirects, capability checks, SSE, telemetry, health, metrics, migration/readiness gates, and shutdown retain parity.
-- [ ] The production web image is immutable, non-root, read-only, capability-dropped, ARM64-compatible, and contains no unnecessary Node runtime.
-- [ ] Container, browser, PostgreSQL, core-loop, chart, delivery, ARM64 VM, and authorized kind checks pass.
-- [ ] The previous Node web entrypoint remains recoverable from the parent commit; no runtime fallback or dual server remains in current source.
+- [x] Web startup uses Hono's Bun entrypoint and the pinned Bun runtime.
+- [x] Better Auth, Cloudflare Access, cookies, redirects, capability checks, SSE, telemetry, health, metrics, migration/readiness gates, and shutdown retain parity.
+- [x] The production web image is immutable, non-root, read-only, capability-dropped, ARM64-compatible, and contains no unnecessary Node runtime.
+- [x] Container, browser, PostgreSQL, core-loop, chart, delivery, ARM64 VM, and authorized kind checks pass.
+- [x] The previous Node web entrypoint remains recoverable from the parent commit; no runtime fallback or dual server remains in current source.
+
+## Answer
+
+Implemented and verified the web-only Bun runtime migration. The Hono application is served directly by Bun's `fetch` interface; no Node web listener or runtime fallback remains in the current source or production image. PostgreSQL, `pg`, pnpm, TypeScript, and the Node Playwright runner remain unchanged. The previous Node entrypoint remains recoverable from the parent commit only. The full evidence report is `evidence/05-bun-web/report.md`, including the ARM64 VM acceptance and the run-labelled authorized kind image execution/cleanup check. Collector, migration, and backup processes were not migrated.
 
 ## Safe stop rules
 

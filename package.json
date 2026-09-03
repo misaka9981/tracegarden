@@ -20,7 +20,7 @@
     "format": "node scripts/format.mjs --write",
     "format:check": "node scripts/format.mjs",
     "lint": "node scripts/lint.mjs",
-    "start": "node dist/apps/web/src/main.js",
+    "start": "bun dist/apps/web/src/bun.js",
     "pretest": "pnpm build",
     "test": "node scripts/test.mjs && node scripts/collector-resilience.mjs && node scripts/delivery-test.mjs",
     "test:backup": "node scripts/backup-test.mjs",
@@ -49,7 +49,6 @@
     "typescript": "7.0.2"
   },
   "dependencies": {
-    "@hono/node-server": "2.1.1",
     "@kubernetes/client-node": "2.0.0",
     "better-auth": "1.3.24",
     "hono": "4.13.5",

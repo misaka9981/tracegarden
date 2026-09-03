@@ -593,9 +593,10 @@ export type TimelineNotification = Readonly<{
 
 export type TimelineNotificationListener = (notification: TimelineNotification) => void;
 export type TimelineNotificationErrorListener = (error: unknown) => void;
+export type TimelineNotificationUnsubscribe = () => Promise<void>;
 
 export interface TimelineNotificationSource {
-  subscribeTimeline(listener: TimelineNotificationListener): Promise<() => void>;
+  subscribeTimeline(listener: TimelineNotificationListener): Promise<TimelineNotificationUnsubscribe>;
   onTimelineError?(listener: TimelineNotificationErrorListener): () => void;
   timelineNotificationsHealthy?(): boolean;
 }
@@ -1122,10 +1123,10 @@ export class MemoryObservationStore implements TimelineStore, TimelineNotificati
     return results;
   }
 
-  async subscribeTimeline(listener: TimelineNotificationListener): Promise<() => void> {
+  async subscribeTimeline(listener: TimelineNotificationListener): Promise<TimelineNotificationUnsubscribe> {
     this.timelineListeners.add(listener);
     let active = true;
-    return () => {
+    return async () => {
       if (!active) return;
       active = false;
       this.timelineListeners.delete(listener);
@@ -1986,11 +1987,14 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
     if (!client) return;
     if (handler) client.removeListener("notification", handler);
     if (errorHandler) client.removeListener("error", errorHandler);
-    await client.query("UNLISTEN tracegarden_timeline").catch(() => undefined);
-    client.release();
+    try {
+      await client.query("UNLISTEN tracegarden_timeline");
+    } finally {
+      client.release();
+    }
   }
 
-  async subscribeTimeline(listener: TimelineNotificationListener): Promise<() => void> {
+  async subscribeTimeline(listener: TimelineNotificationListener): Promise<TimelineNotificationUnsubscribe> {
     this.timelineListeners.add(listener);
     try {
       await this.ensureTimelineListener();
@@ -1999,11 +2003,14 @@ export class PostgresObservationStore implements TimelineStore, TimelineNotifica
       throw error;
     }
     let active = true;
+    let releasePromise: Promise<void> | undefined;
     return () => {
-      if (!active) return;
+      if (releasePromise) return releasePromise;
+      if (!active) return Promise.resolve();
       active = false;
       this.timelineListeners.delete(listener);
-      if (this.timelineListeners.size === 0) void this.releaseTimelineListener();
+      releasePromise = this.timelineListeners.size === 0 ? this.releaseTimelineListener() : Promise.resolve();
+      return releasePromise;
     };
   }
 

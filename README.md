@@ -4,7 +4,7 @@ Tracegarden is a self-hosted change and incident timeline for a personal Kuberne
 
 ## Foundation
 
-The repository is a pnpm TypeScript 7 monorepo with independent web and collector processes. The foundation includes a PostgreSQL migration boundary, health endpoints, a bilingual status page (Simplified Chinese by default), and credential-free local smoke tests. Browser checks use Playwright; container checks fail rather than pass when the pinned Node 26 base image is unavailable locally.
+The repository is a pnpm TypeScript 7 monorepo with independent web and collector processes. The foundation includes a PostgreSQL migration boundary, health endpoints, a bilingual status page (Simplified Chinese by default), and credential-free local smoke tests. Browser checks use Playwright; container checks fail rather than pass when a pinned Node 26, Bun 1.3.14, or PostgreSQL image is unavailable locally.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -29,15 +29,15 @@ Run the status page without a database for a local HTTP smoke run:
 NODE_ENV=test DATABASE_MODE=memory pnpm start
 ```
 
-For PostgreSQL-backed development, copy `.env.example`, start `postgres:18.3-alpine` with `docker compose up -d postgres`, and run the web process with `DATABASE_URL` set. `pnpm db:migrate` applies the repository-owned migrations after a build. The production Compose path builds ARM64-pinned web, collector, and one-shot migration images; web and collector wait for the migration gate, verify its committed state without running migrations, and still fail closed if migrations or readiness checks fail. The web and migration images run as `node`, while the collector runs as pinned Bun `1.3.14`; all application images use a read-only root and `/tmp` as their only writable filesystem. Start the independent collector with `DATABASE_URL` set; without explicit Kubernetes settings its adapter remains inert and does not contact a Cluster.
+For PostgreSQL-backed development, copy `.env.example`, start `postgres:18.3-alpine` with `docker compose up -d postgres`, and run the web process with `DATABASE_URL` set. `pnpm db:migrate` applies the repository-owned migrations after a build. The production Compose path builds ARM64-pinned web, collector, and one-shot migration images; web and collector wait for the migration gate, verify its committed state without running migrations, and still fail closed if migrations or readiness checks fail. Web and collector run as pinned Bun `1.3.14`, while migration and backup remain on Node.js 26.8.x; all application images use a read-only root and `/tmp` as their only writable filesystem. Start the independent collector with `DATABASE_URL` set; without explicit Kubernetes settings its adapter remains inert and does not contact a Cluster.
 
 `pnpm env:check` requires Node.js 26.8.x and validates production database and `TIMELINE_CURSOR_SECRET` configuration. The current development host may report this check as unavailable until Node 26 is installed.
 
 ## Agreed baseline
 
-- The current implementation uses Node.js 26.8.x for web/migration/backup, Bun 1.3.14 for the collector, ESM, and TypeScript 7.0.2; the prior Node collector image remains its rollback runtime.
+- Web and collector production entrypoints use Bun 1.3.14; migration and backup remain on Node.js 26.8.x until their independent migrations land. TypeScript 7.0.2 and ESM remain unchanged; the parent commits retain the Node rollback runtimes.
 - pnpm workspaces and Turborepo task metadata remain the development workspace.
-- The current web uses Node `node:http`, server-rendered HTML, native forms, and a small `fetch`/`EventSource` client. Hono is the target web transport and Hono JSX may structure those views without React or hydration.
+- The web uses Hono with Bun's production entrypoint, server-rendered Hono JSX, native forms, and a small `fetch`/`EventSource` client without React or hydration.
 - PostgreSQL 18 and the repository-owned `pg` migration/data boundary remain unchanged.
 - Better Auth and Kubernetes adapters are implemented; React, TanStack Router, TanStack Start, tRPC, Tailwind, Zod, and Drizzle are not part of the current or accepted target stack. See [ADR 0006](docs/adr/0006-choose-hono-and-staged-bun-runtime.md).
 

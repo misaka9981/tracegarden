@@ -173,7 +173,7 @@ try {
   await legacyMigrationDatabase.close();
   legacyMigrationDatabase = undefined;
 
-  web = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
+  web = spawn("bun", ["dist/apps/web/src/bun.js"], {
     env: { ...process.env, DATABASE_URL: databaseUrl, PORT: String(webPort), HOST: "127.0.0.1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -799,7 +799,7 @@ try {
   assert.ok(recoveryBase.resumeCursor);
   const disconnectedHints = [];
   const unsubscribeDisconnected = await timelineStore.subscribeTimeline((hint) => disconnectedHints.push(hint));
-  unsubscribeDisconnected();
+  await unsubscribeDisconnected();
   const missedObservation = normalizePodObservation(observationScope, {
     kind: "Pod",
     metadata: { name: "missed-live-entry", namespace: "tracegarden", uid: "pod-uid-missed-live", resourceVersion: "11" },
@@ -821,7 +821,7 @@ try {
   }, "2099-10-01T00:00:02.000Z");
   const reconnectedResult = await timelineStore.recordObservation(reconnectedObservation);
   assert.deepEqual(reconnectHints, [{ entryId: reconnectedResult.entry.id }]);
-  unsubscribeReconnected();
+  await unsubscribeReconnected();
   const concurrencyClient = new pg.Client(databaseUrl);
   await concurrencyClient.connect();
   const concurrencyObservationId = `concurrency-observation-${process.pid}`;
@@ -1016,7 +1016,8 @@ try {
     }
     assert.deepEqual((await collectorDatabase.clusterScope.get(observationScope.workspaceId))?.namespaces, observationScope.namespaces);
   }
-  unsubscribeTimeline();
+  await unsubscribeTimeline();
+  assert.equal(timelineStore.timelineListenerClient, null);
   const pendingObservation = normalizePodObservation(observationScope, {
     kind: "Pod",
     metadata: { name: "pending", namespace: "tracegarden", uid: "pod-uid-pending", resourceVersion: "10" },
@@ -1511,7 +1512,7 @@ try {
   assert.deepEqual(await timelineStore.getCorrelationSuggestion("workspace-single", parityCandidates[0].id), confirmedParityEvidence);
   assert.deepEqual(await timelineStore.getCorrelationSuggestion("workspace-single", parityCandidates[1].id), rejectedParityEvidence);
 
-  productionWeb = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
+  productionWeb = spawn("bun", ["dist/apps/web/src/bun.js"], {
     env: {
       ...process.env,
       NODE_ENV: "production",

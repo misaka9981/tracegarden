@@ -39,7 +39,7 @@ spec:
         - name: wait-for-schema
           image: {{ include "tracegarden.image" (dict "root" . "component" "web") | quote }}
           imagePullPolicy: IfNotPresent
-          command: ["node", "--input-type=module", "--eval"]
+          command: ["bun", "--input-type=module", "--eval"]
           args:
             - |
 {{ include "tracegarden.schemaWaitScript" . | nindent 14 }}

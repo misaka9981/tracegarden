@@ -1,6 +1,6 @@
 # Choose Hono transport and a staged Bun production runtime
 
-Tracegarden's current implementation uses Node.js 26.8.x, Node `node:http`, server-rendered HTML strings, native forms, a small `fetch`/`EventSource` client, PostgreSQL, and the `pg` driver. This ADR records the target direction rather than claiming that migration is complete: Hono owns web transport and route composition; Hono JSX may structure server-rendered views without React or hydration; and Bun becomes the production runtime one process at a time after compatibility and behavior parity are proven. pnpm, native TypeScript `tsc --noEmit`, the Node-based Playwright toolchain, PostgreSQL, and `pg` remain. React, TanStack Router, TanStack Start, tRPC, and Tailwind are not adopted.
+At decision time Tracegarden used Node.js 26.8.x, Node `node:http`, server-rendered HTML strings, native forms, a small `fetch`/`EventSource` client, PostgreSQL, and the `pg` driver. This ADR records the staged direction: Hono owns web transport and route composition; Hono JSX structures server-rendered views without React or hydration; and Bun becomes the production runtime one process at a time after compatibility and behavior parity are proven. Ticket 05 has now moved only the web process to Bun. pnpm, native TypeScript `tsc --noEmit`, the Node-based Playwright toolchain, PostgreSQL, and `pg` remain. React, TanStack Router, TanStack Start, tRPC, and Tailwind are not adopted.
 
 ## Alternatives
 

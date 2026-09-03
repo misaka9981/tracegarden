@@ -5,6 +5,6 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p ../../tsconfig.json",
-    "start": "node ../../dist/apps/web/src/main.js"
+    "start": "bun ../../dist/apps/web/src/bun.js"
   }
 }

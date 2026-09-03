@@ -48,7 +48,7 @@ try {
   }, 10_000, 250);
   timelineDatabase = new PostgresDatabase(databaseUrl);
   await timelineDatabase.migrate();
-  child = spawn(process.execPath, ["dist/apps/web/src/main.js"], {
+  child = spawn("bun", ["dist/apps/web/src/bun.js"], {
     env: { ...process.env, NODE_ENV: "test", DATABASE_URL: databaseUrl, PORT: String(port), HOST: "127.0.0.1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
