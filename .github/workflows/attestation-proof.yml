@@ -1,0 +1,53 @@
+name: Tracegarden SBOM attestation proof
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  TRIVY_IMAGE: docker.io/aquasec/trivy:0.59.1@sha256:029e990b328d149bf0a9ffe355919041e1f86192db2df47e217f8a36dd42ceac
+  SUBJECT_NAME: ghcr.io/misaka9981/tracegarden-web
+  SUBJECT_DIGEST: sha256:0af34c3aa29996e67ba02bfea1823915a0ea98138ec720023be838dde58f9906
+
+jobs:
+  sbom-proof:
+    name: Prove relative SBOM attestation path
+    runs-on: ubuntu-24.04-arm
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+      - name: Login to the configured GHCR namespace
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Pull the previously published exact digest
+        run: docker pull --platform linux/arm64 "$SUBJECT_NAME@$SUBJECT_DIGEST"
+      - name: Generate and verify SPDX SBOM at a relative path
+        run: |
+          set -eu
+          sbom_dir=".scratch/tracegarden-proof-sbom"
+          mkdir -p "$sbom_dir"
+          docker run --rm --pull=never \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$GITHUB_WORKSPACE/$sbom_dir:/reports" \
+            "$TRIVY_IMAGE" image --format spdx-json --output /reports/web.spdx.json "$SUBJECT_NAME@$SUBJECT_DIGEST"
+          test -s "$sbom_dir/web.spdx.json"
+          jq -e 'type == "object" and has("spdxVersion") and has("SPDXID")' "$sbom_dir/web.spdx.json" >/dev/null
+      - name: Attest the exact published web digest
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ env.SUBJECT_NAME }}
+          subject-digest: ${{ env.SUBJECT_DIGEST }}
+          sbom-path: .scratch/tracegarden-proof-sbom/web.spdx.json
+          push-to-registry: true

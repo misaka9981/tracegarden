@@ -68,6 +68,10 @@ if (!workflowText.includes("--exit-code 1") || !workflowText.includes("--severit
 if (!workflowText.includes('"$BUN_IMAGE" scripts/migrate-bun-smoke.mjs')) errors.push("workflow suite must run the Bun migration smoke");
 if (!workflowText.includes('"$BUN_IMAGE" scripts/backup-test.mjs')) errors.push("workflow suite must run the backup test under Bun");
 const ciWorkflow = workflows.find(([path]) => path === ".github/workflows/ci.yml")?.[1] ?? "";
+const proofFile = workflows.find(([path]) => path === ".github/workflows/attestation-proof.yml")?.[1] ?? "";
+if (!proofFile.includes("on:\n  workflow_dispatch:") || !proofFile.includes("actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26") || !proofFile.includes("sbom-path: .scratch/tracegarden-proof-sbom/web.spdx.json") || !proofFile.includes("test -s \"$sbom_dir/web.spdx.json\"")) {
+  errors.push("workflow suite must retain the bounded standalone SBOM attestation proof");
+}
 const publishStart = ciWorkflow.indexOf("\n  publish:");
 const publishEnd = ciWorkflow.indexOf("\n  promotion-proposal:", publishStart);
 const publishWorkflow = publishStart >= 0 && publishEnd > publishStart ? ciWorkflow.slice(publishStart, publishEnd) : "";
@@ -105,7 +109,7 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
   const subjectDigest = "subject-digest: ${{ steps." + service + ".outputs.digest }}";
   const sbomStep = releaseStepBlock("Attest " + service + " SBOM");
   const provenanceStep = releaseStepBlock("Attest " + service + " provenance");
-  if (!sbomStep.includes("uses: actions/attest@") || !sbomStep.includes(subjectName) || !sbomStep.includes(subjectDigest) || !sbomStep.includes("sbom-path: ${{ github.workspace }}/.scratch/tracegarden-release-sbom/" + service + ".spdx.json")) {
+  if (!sbomStep.includes("uses: actions/attest@") || !sbomStep.includes(subjectName) || !sbomStep.includes(subjectDigest) || !sbomStep.includes("sbom-path: .scratch/tracegarden-release-sbom/" + service + ".spdx.json")) {
     errors.push(`release SBOM attestation is missing the exact ${service} digest or SBOM`);
   }
   if (!provenanceStep.includes("uses: actions/attest-build-provenance@") || !provenanceStep.includes(subjectName) || !provenanceStep.includes(subjectDigest)) {
@@ -121,7 +125,7 @@ if ((publishWorkflow.match(/uses: actions\/attest@[0-9a-f]{40}/g) ?? []).length 
 if (!releasePostGate.includes("--format spdx-json") || !releasePostGate.includes("tracegarden-release-sbom")) {
   errors.push("release publication must generate SBOMs for exact pushed digests after the gates");
 }
-if (!releasePostGate.includes('sbom_dir="$GITHUB_WORKSPACE/.scratch/tracegarden-release-sbom"') || !releasePostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !releasePostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
+if (!releasePostGate.includes('sbom_dir=".scratch/tracegarden-release-sbom"') || !releasePostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !releasePostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
   errors.push("release publication must stat, parse, and retain each SBOM before attestation");
 }
 for (const required of [
@@ -160,7 +164,7 @@ for (const service of ["web", "collector", "migrate", "backup"]) {
 if (!previewWorkflow.includes("backup_digest: ${{ steps.backup.outputs.digest }}") || !previewWorkflow.includes("BACKUP_REPOSITORY=\"${IMAGE_PREFIX}-backup\"") || !previewWorkflow.includes("BACKUP_DIGEST=\"${{ steps.backup.outputs.digest }}\"")) {
   errors.push("preview publication must carry the exact backup digest into its artifact outputs");
 }
-if (!previewPostGate.includes('sbom_dir="$GITHUB_WORKSPACE/.scratch/tracegarden-preview-sbom"') || !previewPostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !previewPostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
+if (!previewPostGate.includes('sbom_dir=".scratch/tracegarden-preview-sbom"') || !previewPostGate.includes('test -s "$sbom_dir/${service}.spdx.json"') || !previewPostGate.includes("jq -e 'type == \"object\" and has(\"spdxVersion\") and has(\"SPDXID\")'")) {
   errors.push("preview publication must stat and parse each SBOM before attestation");
 }
 if (/--platform linux\/arm64/.test(workflowText) && !workflowText.includes("runs-on: ubuntu-24.04-arm")) {

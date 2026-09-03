@@ -367,7 +367,7 @@ jobs:
       - name: Generate SBOMs for exact preview digests
         run: |
           set -eu
-          sbom_dir="$GITHUB_WORKSPACE/.scratch/tracegarden-preview-sbom"
+          sbom_dir=".scratch/tracegarden-preview-sbom"
           mkdir -p "$sbom_dir" "$RUNNER_TEMP/trivy-preview-cache"
           for service_ref in \
             "${IMAGE_PREFIX}-web@${{ steps.web.outputs.digest }}" \
@@ -378,7 +378,7 @@ jobs:
             service="${service%%@*}"
             docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
-              -v "$sbom_dir:/reports" \
+              -v "$GITHUB_WORKSPACE/$sbom_dir:/reports" \
               -v "$RUNNER_TEMP/trivy-preview-cache:/root/.cache" \
               "$TRIVY_IMAGE" image --format spdx-json --output "/reports/${service}.spdx.json" "$service_ref"
             test -s "$sbom_dir/${service}.spdx.json"
@@ -389,7 +389,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-web
           subject-digest: ${{ steps.web.outputs.digest }}
-          sbom-path: ${{ github.workspace }}/.scratch/tracegarden-preview-sbom/web.spdx.json
+          sbom-path: .scratch/tracegarden-preview-sbom/web.spdx.json
           push-to-registry: true
       - name: Attest preview web provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
@@ -402,7 +402,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-collector
           subject-digest: ${{ steps.collector.outputs.digest }}
-          sbom-path: ${{ github.workspace }}/.scratch/tracegarden-preview-sbom/collector.spdx.json
+          sbom-path: .scratch/tracegarden-preview-sbom/collector.spdx.json
           push-to-registry: true
       - name: Attest preview collector provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
@@ -415,7 +415,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-migrate
           subject-digest: ${{ steps.migrate.outputs.digest }}
-          sbom-path: ${{ github.workspace }}/.scratch/tracegarden-preview-sbom/migrate.spdx.json
+          sbom-path: .scratch/tracegarden-preview-sbom/migrate.spdx.json
           push-to-registry: true
       - name: Attest preview migrate provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
@@ -428,7 +428,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-backup
           subject-digest: ${{ steps.backup.outputs.digest }}
-          sbom-path: ${{ github.workspace }}/.scratch/tracegarden-preview-sbom/backup.spdx.json
+          sbom-path: .scratch/tracegarden-preview-sbom/backup.spdx.json
           push-to-registry: true
       - name: Attest preview backup provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
@@ -614,7 +614,7 @@ jobs:
       - name: Generate SBOMs for exact published digests
         run: |
           set -eu
-          sbom_dir="$GITHUB_WORKSPACE/.scratch/tracegarden-release-sbom"
+          sbom_dir=".scratch/tracegarden-release-sbom"
           mkdir -p "$sbom_dir" "$RUNNER_TEMP/trivy-release-cache"
           for service_ref in \
             "${IMAGE_PREFIX}-web@${{ steps.web.outputs.digest }}" \
@@ -625,7 +625,7 @@ jobs:
             service="${service%%@*}"
             docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
-              -v "$sbom_dir:/reports" \
+              -v "$GITHUB_WORKSPACE/$sbom_dir:/reports" \
               -v "$RUNNER_TEMP/trivy-release-cache:/root/.cache" \
               "$TRIVY_IMAGE" image --format spdx-json --output "/reports/${service}.spdx.json" "$service_ref"
             test -s "$sbom_dir/${service}.spdx.json"
@@ -636,7 +636,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-web
           subject-digest: ${{ steps.web.outputs.digest }}
-          sbom-path: ${{ github.workspace }}/.scratch/tracegarden-release-sbom/web.spdx.json
+          sbom-path: .scratch/tracegarden-release-sbom/web.spdx.json
           push-to-registry: true
       - name: Attest web provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
@@ -649,7 +649,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-collector
           subject-digest: ${{ steps.collector.outputs.digest }}
-          sbom-path: ${{ github.workspace }}/.scratch/tracegarden-release-sbom/collector.spdx.json
+          sbom-path: .scratch/tracegarden-release-sbom/collector.spdx.json
           push-to-registry: true
       - name: Attest collector provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
@@ -662,7 +662,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-migrate
           subject-digest: ${{ steps.migrate.outputs.digest }}
-          sbom-path: ${{ github.workspace }}/.scratch/tracegarden-release-sbom/migrate.spdx.json
+          sbom-path: .scratch/tracegarden-release-sbom/migrate.spdx.json
           push-to-registry: true
       - name: Attest migrate provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
@@ -675,7 +675,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-backup
           subject-digest: ${{ steps.backup.outputs.digest }}
-          sbom-path: ${{ github.workspace }}/.scratch/tracegarden-release-sbom/backup.spdx.json
+          sbom-path: .scratch/tracegarden-release-sbom/backup.spdx.json
           push-to-registry: true
       - name: Attest backup provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.2.3
@@ -704,7 +704,7 @@ jobs:
           for service in web collector migrate backup; do
             digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/${service}.json")
             test "$digest" != "null" && printf '%s\n' "$digest" > "$evidence/${service}-digest.txt"
-            cp "$GITHUB_WORKSPACE/.scratch/tracegarden-release-sbom/${service}.spdx.json" "$evidence/${service}-sbom.spdx.json"
+            cp ".scratch/tracegarden-release-sbom/${service}.spdx.json" "$evidence/${service}-sbom.spdx.json"
             docker buildx imagetools inspect --raw "${IMAGE_PREFIX}-${service}@${digest}" > "$evidence/${service}-manifest.json"
           done
           jq -n \
