@@ -1,0 +1,37 @@
+# Tracegarden live-acceptance evidence matrix
+
+This matrix records the evidence boundary at reviewed `main` commit `86faa4fa7180d045bf4bda00f204c9778d5f93fd`. It is an index, not a substitute for the linked reports. A ticket marked `resolved` below reflects its issue-tracker state; a ticket marked `claimed` or `needs-info` is not closed by this matrix.
+
+## Evidence classes
+
+| Class | Meaning | Evidence boundary |
+| --- | --- | --- |
+| Local deterministic | Repository tests, offline rendering, and local container checks | Does not prove a live provider or Cluster |
+| ARM64 VM/kind | Bounded execution on the authorized ARM64 VM and its named disposable kind context | Does not prove production infrastructure or provider authentication |
+| GitHub/GHCR/GitOps | Authorized GitHub release, immutable GHCR publication, attestations, and reviewable GitOps proposal | Does not prove production promotion or a merged PR |
+| Disposable Argo | Argo CD reconciliation against a run-owned local mirror and disposable destination | Does not prove private GitHub-source authentication or production Argo |
+| Production non-claim | Intentionally unverified boundary | Requires its own authorization and evidence |
+
+## Predecessor matrix
+
+| Ticket | State | Evidence class | Secret-free source/evidence | What is evidenced | Explicit residual boundary |
+| --- | --- | --- | --- | --- | --- |
+| [21 — ARM64 VM runtime](../.scratch/tracegarden-mvp/issues/21-prove-arm64-vm-runtime.md) | `claimed` | Local deterministic + ARM64 VM | [Issue](../.scratch/tracegarden-mvp/issues/21-prove-arm64-vm-runtime.md) · [report](../evidence/21-vm-runtime/report.md) | Run `tracegarden-validation-21-20260902T074817Z-30845`; tested implementation `3240952e49dca28474584d8e8158223705bcb791`; Node `v26.8.1`, Bun/ARM64 production image lifecycle, full local acceptance, bounded cleanup, and preserved named Caddy/kind containers. | Fresh review remains required; this is local/VM evidence only and does not prove external integrations. |
+| [22 — kind Kubernetes boundaries](../.scratch/tracegarden-mvp/issues/22-prove-kind-kubernetes-boundaries.md) | `resolved` | ARM64 VM/kind | [Issue](../.scratch/tracegarden-mvp/issues/22-prove-kind-kubernetes-boundaries.md) · [report](../evidence/22-kind-kubernetes/report.md) | Run `tracegarden-live-20260902-0813-22a7` on explicit context `kind-k8s-cluster-v137`; real list/watch, checkpoints, relist recovery, RBAC, bounded logs, cleanup, and preservation. | Profile intentionally excludes target-CNI NetworkPolicy portability; candidate Service/endpoint tuples remain unverified in [Ticket 29](../.scratch/tracegarden-mvp/issues/29-prove-target-cni-apiserver-networkpolicy.md). |
+| [23 — Argo reconciliation](../.scratch/tracegarden-mvp/issues/23-prove-kind-argocd-reconciliation.md) | `resolved` | Disposable Argo + ARM64 VM/kind | [Issue](../.scratch/tracegarden-mvp/issues/23-prove-kind-argocd-reconciliation.md) · [report](../evidence/23-kind-argocd/report.md) | Real Argo CD v3.4.6 ApplicationSet generation/deletion, digest-only disposable reconciliation, bounded lifecycle cleanup, and unchanged named Caddy/kind identities. | Uses a trusted local Git mirror and disposable destination; it does not prove private GitHub-source authentication or production Argo reconciliation. |
+| [24 — Google OAuth callbacks](../.scratch/tracegarden-mvp/issues/24-attest-google-oauth-callbacks.md) | `needs-info` | Production non-claim | [Issue](../.scratch/tracegarden-mvp/issues/24-attest-google-oauth-callbacks.md) · no `evidence/24-google-oauth/` directory | No live client, redirect URI, identities, credentials, or callback evidence supplied. | Requires an explicitly authorized disposable OAuth client, exact HTTPS redirect URI, test identities, credential path, and cleanup authority. |
+| [25 — Cloudflare Access/Preview ingress](../.scratch/tracegarden-mvp/issues/25-attest-cloudflare-preview-access.md) | `needs-info` | Production non-claim | [Issue](../.scratch/tracegarden-mvp/issues/25-attest-cloudflare-preview-access.md) · no `evidence/25-cloudflare-access/` directory | No disposable hostname, Access application, tunnel, JWT configuration, or ingress evidence supplied. | Requires explicitly disposable DNS/Access/ingress resources, test identity, approved configuration path, and cleanup authority. |
+| [26 — remote publication/promotion](../.scratch/tracegarden-mvp/issues/26-attest-remote-publication-and-promotion.md) | `resolved` | GitHub/GHCR/GitOps + disposable Argo | [Issue](../.scratch/tracegarden-mvp/issues/26-attest-remote-publication-and-promotion.md) · [report](../evidence/26-remote-publication/report.md) · [transcript](../evidence/26-remote-publication/remote-transcript.txt) | Release `v0.1.0` from source `6ee9a5f33fc16541fe0054dec29bd682075816e2`; four exact GHCR digests, SPDX/SLSA attestations, reviewable GitOps PR #1, disposable ApplicationSet reconciliation, cleanup, and preserved containers. | PR remains open and unmerged; no production Cluster or production promotion was performed. Earlier failed package versions remain audit records, not release inputs. |
+| [27 — off-VM backup/restore](../.scratch/tracegarden-mvp/issues/27-attest-off-vm-backup-and-restore.md) | `needs-info` | Production non-claim | [Issue](../.scratch/tracegarden-mvp/issues/27-attest-off-vm-backup-and-restore.md) · no `evidence/27-backup-restore/` directory | No authorized object-storage endpoint/bucket/prefix, credentials, encryption-key path, or separate restore target supplied; no live upload/restore evidence. | Requires explicitly authorized object storage, unique test prefix, least-privilege credential path, clean separate target, retention rule, and cleanup authority. |
+
+## Current matrix conclusions
+
+- Local deterministic evidence is not inferred to be live provider evidence.
+- ARM64 VM and disposable kind/Argo evidence is not inferred to be production Kubernetes, CNI, OAuth, Cloudflare, object-storage, or production-promotion evidence.
+- GitHub/GHCR/GitOps publication is evidenced for the authorized release and reviewable PR; the PR is intentionally not merged and no production mutation occurred.
+- Ticket 29 is a non-blocking `needs-info` follow-up. Its required target-CNI evaluation point and narrow API egress proof remain unverified; Ticket 22's validation-only exception must not be read as production policy compatibility.
+- Tickets 24, 25, and 27 remain open because their required external resources and authorization details are absent. Ticket 28 remains claimed until every predecessor is closed and a fresh Sol medium review accepts this matrix.
+
+## Secret-safety and cleanup audit
+
+The retained predecessor reports and transcripts were audited for obvious credential-bearing patterns without printing matched values. The audit covered private-key headers, common access-token forms, authorization headers, cookie assignments, credential-bearing database URLs, and plaintext dump/key material. No matching secret values were emitted. Linked reports separately record their run-scoped cleanup; the open tickets have no live resources or evidence directories to clean up. The matrix itself contains only public issue paths, run labels, commit/release identifiers, bounded resource names, and residual-risk statements.
