@@ -35,6 +35,7 @@ const previewSeed = await read("deploy/preview/chart/templates/seed-job.yaml");
 const ciWorkflow = await read(".github/workflows/ci.yml");
 const proofFile = await read(".github/workflows/attestation-proof.yml");
 assert.match(proofFile, /on:\n  workflow_dispatch:/);
+assert.match(proofFile, /packages: write/);
 assert.match(proofFile, /actions\/attest@59d89421af93a897026c735860bf21b6eb4f7b26/);
 assert.match(proofFile, /sbom-path: \.scratch\/tracegarden-proof-sbom\/web\.spdx\.json/);
 assert.match(proofFile, /test -s "\$sbom_dir\/web\.spdx\.json"/);
