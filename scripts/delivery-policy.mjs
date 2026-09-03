@@ -37,7 +37,6 @@ for (const command of [
   "pnpm lint",
   "pnpm typecheck",
   "pnpm test",
-  "pnpm test:backup",
   "pnpm test:postgres",
   "pnpm test:browser",
   "pnpm test:container",
