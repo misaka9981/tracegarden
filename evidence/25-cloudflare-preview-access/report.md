@@ -10,6 +10,7 @@ The workers.dev hostnames used during the run were:
 
 - OAuth: `tracegarden-25-oauth-20260904-121248.misaka9981.workers.dev`
 - Preview: `tracegarden-25-preview-20260904-121248.misaka9981.workers.dev`
+- Probe: Worker name `tracegarden-25-probe-20260904`; hostname `tracegarden-25-probe-20260904.misaka9981.workers.dev`; recorded Wrangler deploy exited `0` and the initial host probe returned `200`.
 
 The disposable Access application had ID `471bde58-ff33-4b3f-92b1-72defef3ce71`, issuer `https://misaka9981.cloudflareaccess.com`, and AUD `65e8e9f69145ef28c316121d5efad1e0f0998ee5c4ce021ae8a5f496ae764490`. Its allow policy had ID `4a52106e-00e4-4741-a317-2227825a1975`. The policy used the email held in the VM credential file; the email was not recorded.
 
@@ -37,7 +38,7 @@ The account and token verification API calls returned success. The account Acces
 
 ## Cleanup and preservation
 
-- Worker deletion: OAuth `200`, Preview `200`, and the initial run-labelled probe Worker `200`; all three returned `404` afterward.
+- Worker deletion: OAuth `200`, Preview `200`, and probe Worker `tracegarden-25-probe-20260904` `200`; post-delete probes for all three named hostnames returned `404`.
 - Access application deletion: `202`; bounded follow-up GETs for the application and policy returned `404`.
 - Namespace deletion: absent after the bounded wait.
 - Caddy source restored from the pre-run backup, validated, and reloaded; the temporary origin host was absent afterward.
