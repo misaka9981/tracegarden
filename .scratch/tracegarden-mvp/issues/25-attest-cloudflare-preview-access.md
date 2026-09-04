@@ -22,4 +22,4 @@ Do not enumerate unrelated Cloudflare zones, applications, tunnels, Workers, or 
 
 ## Needed from the operator
 
-Provide the disposable hostname source (owned zone or account `workers.dev`), Access application details, authenticated Tunnel or Worker-to-origin path, approved credential/configuration path, and explicit route/origin cleanup authority.
+The free `workers.dev` source, credential path, disposable Access application/policy, authenticated Worker-to-origin path, direct-origin denial, Preview isolation, and cleanup were exercised and recorded in [the evidence report](../../../evidence/25-cloudflare-preview-access/report.md). One manual browser action remains: during a future bounded run, complete the Cloudflare Access OTP login for the configured test identity and confirm only that login succeeded. Do not provide the OTP, JWT, cookie, email address, or any secret. The follow-up must then verify valid identity admission, bootstrap subject, authenticated SSE, and cleanup before this ticket can be resolved.
