@@ -1,0 +1,68 @@
+Ticket 25 final bounded live run: 20260904-124522-1049820
+Profile: free workers.dev Worker-to-origin ingress; no production deployment
+
+Final authenticated live-check booleans/status classes (values only; no identity or credential values retained):
+hasAccessAssertion=true
+hasAuthorizationCookie=true
+parsedAccessCookie=true
+hadUntrustedIdentityHeader=true
+applicationAuthenticated=true
+applicationStatusClass=2xx
+applicationLocationPath=none
+originReceivedAssertion=true
+captureStatusClass=2xx
+applicationHtml=true
+applicationMarker=true
+applicationContentType=true
+sseStatusOk=true
+sseStatusClass=2xx
+sseContentType=true
+sseReady=true
+sseTimeline=true
+sseReconnectReady=true
+reconnectStatusClass=2xx
+notifyStatusClass=2xx
+failurePhase=none
+
+Strict application-side Access validation (run-only, values omitted):
+tokenShape=true
+algorithmRS256=true
+issuer=true
+audience=true
+subject=true
+expiry=true
+signature=true
+capturedSubjectMatches=true
+strictValid=true
+
+Boundary behavior before cleanup:
+direct-origin-no-secret=403
+direct-origin-wrong-secret=403
+direct-origin-correct-secret=200
+preview-without-access-session=302
+invalid-application-jwt-partitions=401
+
+Run-owned cleanup results:
+worker-preview-delete=200
+worker-oauth-preflight=404
+worker-probe-preflight=404
+access-app-delete=202
+access-policy-delete=404
+caddy-restore-rc=0
+caddy-validate-rc=0
+caddy-reload-rc=0
+capture-stop-rc=0
+namespace-delete-rc=0
+namespace-absent=true
+hostname-preview-status=404
+hostname-oauth-status=404
+hostname-probe-status=404
+access-app-postdelete=404
+access-policy-postdelete=404
+caddy-run-route-absent=true
+run-directory-absent=true
+
+Preservation checks:
+railgun-caddy id=26e35e579600473cee8faa08c2fcf4cb8856f6f5b37b77a6c301d44714884f75 running=true
+k8s-cluster-v137-control-plane id=d5f3759062bfbd5d96e1a8e4e401be488a3f156d14348feaa5dea95a20b7f2dc running=true
+k8s-cluster-v137-worker id=ab79985d801cb252c6ce5e6da5629314f59f1d485d5c21b077dfa350f1c1251e running=true

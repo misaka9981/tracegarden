@@ -4,22 +4,24 @@
 
 **Blocked by:** 23: Prove Argo CD reconciliation and Preview Environment cleanup on kind.
 
-**Status:** needs-info
+**Status:** resolved
 
-- [ ] A disposable Cloudflare-controlled hostname source (owned DNS zone or account `workers.dev`), Access application, issuer, audience, test identity, authenticated Tunnel or Worker-to-origin path, and cleanup authority are supplied explicitly.
-- [ ] DNS/TLS or `workers.dev` routing reaches only the authorized disposable Preview ingress.
-- [ ] The Worker-to-origin path requires a high-entropy run-scoped secret; direct origin access without it returns `403`.
-- [ ] Valid Access JWT admission succeeds; missing, expired, wrong-signature, wrong-issuer, and wrong-audience assertions fail.
-- [ ] Spoofed identity headers without a valid JWT fail.
-- [ ] A real SSE stream passes through the selected Tunnel or Worker path.
-- [ ] The Preview mounts no production data, credentials, or volumes.
-- [ ] Draft/close reconciliation removes the ingress and makes the hostname unavailable within the documented bound.
-- [ ] Disposable Worker/Access, DNS or Tunnel route, origin route, and run secret are removed where authorized; unrelated Caddy routes remain unchanged.
+- [x] A disposable Cloudflare-controlled hostname source (owned DNS zone or account `workers.dev`), Access application, issuer, audience, test identity, authenticated Tunnel or Worker-to-origin path, and cleanup authority are supplied explicitly.
+- [x] DNS/TLS or `workers.dev` routing reaches only the authorized disposable Preview ingress.
+- [x] The Worker-to-origin path requires a high-entropy run-scoped secret; direct origin access without it returns `403`.
+- [x] Valid Access JWT admission succeeds; missing, expired, wrong-signature, wrong-issuer, and wrong-audience assertions fail.
+- [x] Spoofed identity headers without a valid JWT fail.
+- [x] A real SSE stream passes through the selected Worker path, including a committed Timeline event and reconnect.
+- [x] The Preview mounts no production data, credentials, or volumes.
+- [x] Draft/close reconciliation removes the ingress and makes the hostname unavailable within the documented bound.
+- [x] Disposable Worker/Access, DNS or Tunnel route, origin route, and run secret are removed where authorized; unrelated Caddy routes remain unchanged.
 
 ## Safe stop rules
 
 Do not enumerate unrelated Cloudflare zones, applications, tunnels, Workers, or secrets. Stop if any resource is shared with production or not explicitly disposable. Never weaken JWT validation, expose a direct origin, use a Quick Tunnel as persistent ingress, or alter production DNS/Access policy. Stop if the origin secret, route ownership, SSE path, or cleanup authority is ambiguous.
 
-## Needed from the operator
+## Answer
 
-The free `workers.dev` source, credential path, disposable Access application/policy, authenticated Worker-to-origin path, direct-origin denial, Preview isolation, and cleanup were exercised and recorded in [the evidence report](../../../evidence/25-cloudflare-preview-access/report.md). One manual browser action remains: during a future bounded run, complete the Cloudflare Access OTP login for the configured test identity and confirm only that login succeeded. Do not provide the OTP, JWT, cookie, email address, or any secret. The follow-up must then verify valid identity admission, bootstrap subject, authenticated SSE, and cleanup before this ticket can be resolved.
+Resolved using the free personal-use `workers.dev` profile documented in [the evidence report](../../../evidence/25-cloudflare-preview-access/report.md) and its [sanitized cleanup transcript](../../../evidence/25-cloudflare-preview-access/cleanup-transcript.txt). The final bounded run proved the disposable Access boundary, strict JWT signature/issuer/audience/expiry validation, rejection of untrusted identity headers, authenticated Worker-to-origin application access, direct-origin secret denial, isolated Preview resources, and real SSE ready/Timeline/reconnect behavior. The run-owned notification trigger produced a committed Timeline event without retaining row or identity values. Cleanup removed the run Worker, Access resources, origin route/secret, namespace, and temporary files; post-cleanup hostnames were unavailable and the existing Caddy/kind container IDs and running state were unchanged.
+
+This resolution is limited to the disposable free `workers.dev` provider profile. It does not claim an owned production DNS zone, production Tunnel, Google OAuth, off-VM object-storage backup/restore, target-CNI compatibility, production deployment, or production promotion.
