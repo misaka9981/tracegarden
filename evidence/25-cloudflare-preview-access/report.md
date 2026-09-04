@@ -61,7 +61,7 @@ Ticket 25 remains `needs-info`. Open the Preview Worker URL during a future boun
 - Disposable kind namespace, immutable published web/migrate/collector images, PostgreSQL/migration, readiness, and cleanup: passed.
 - Direct-origin secret boundary and invalid application JWT/header partition probes: passed.
 - Caddy validate/reload, exact restoration, hostname unavailability, and Caddy/kind identity preservation: passed.
-- Local report format, link, diff, and secret-safe scans: pending final commit check.
+- Local report format, link, diff, and secret-safe scans: passed.
 
 ## Residual boundary
 
