@@ -37,7 +37,7 @@ The account and token verification API calls returned success. The account Acces
 
 ## Cleanup and preservation
 
-- Worker deletion: OAuth `200`, Preview `200`.
+- Worker deletion: OAuth `200`, Preview `200`, and the initial run-labelled probe Worker `200`; all three returned `404` afterward.
 - Access application deletion: `202`; bounded follow-up GETs for the application and policy returned `404`.
 - Namespace deletion: absent after the bounded wait.
 - Caddy source restored from the pre-run backup, validated, and reloaded; the temporary origin host was absent afterward.
@@ -45,7 +45,7 @@ The account and token verification API calls returned success. The account Acces
 - `railgun-caddy`: ID `26e35e579600473cee8faa08c2fcf4cb8856f6f5b37b77a6c301d44714884f75`, running before and after.
 - `k8s-cluster-v137-control-plane`: ID `d5f3759062bfbd5d96e1a8e4e401be488a3f156d14348feaa5dea95a20b7f2dc`, running before and after.
 - `k8s-cluster-v137-worker`: ID `ab79985d801cb252c6ce5e6da5629314f59f1d485d5c21b077dfa350f1c1251e`, running before and after.
-- Temporary Caddy backup, origin secret, Kubernetes namespace, Workers, Access application/policy, and run files were removed. No production deployment occurred.
+- Temporary Caddy backup, origin secret, Kubernetes namespace, all three Workers, Access application/policy, and run files were removed. No production deployment occurred.
 
 ## Remaining manual action
 
@@ -56,7 +56,7 @@ Ticket 25 remains `needs-info`. Open the Preview Worker URL during a future boun
 - Authorized SSH with `BatchMode=yes`, `IdentitiesOnly=yes`, `ConnectTimeout=10`, and server-alive bounds: passed.
 - Credential owner/mode/allowlist check: passed.
 - Cloudflare account/token/subdomain/API checks: passed; Access organization endpoint was `403` and was not treated as ready.
-- Pinned Wrangler Worker deploy, secret storage, health probes, and Worker deletion: passed.
+- Pinned Wrangler Worker deploy, secret storage, health probes, deletion of OAuth/Preview/probe Workers, and post-delete `404` checks: passed.
 - Cloudflare Access application/policy create, metadata capture, delete, and post-delete `404` checks: passed.
 - Disposable kind namespace, immutable published web/migrate/collector images, PostgreSQL/migration, readiness, and cleanup: passed.
 - Direct-origin secret boundary and invalid application JWT/header partition probes: passed.
