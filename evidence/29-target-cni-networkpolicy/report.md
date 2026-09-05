@@ -1,8 +1,8 @@
 # Ticket 29 target-CNI NetworkPolicy evidence
 
-Status: **partial / needs-info**
+Status: **characterized / production target deferred**
 
-This report records a bounded characterization of a **separate disposable Cilium kind cluster**. It does not claim that Cilium is the production CNI of `kind-k8s-cluster-v137`, and it does not resolve the production target-CNI criterion. No existing kind cluster, CNI, Caddy route, workload, policy, or production resource was changed.
+This report records a bounded characterization of a **separate disposable Cilium kind cluster**. It does not claim that Cilium is the production CNI or a supported production target for `kind-k8s-cluster-v137`; production-target proof is intentionally deferred. No existing kind cluster, CNI, Caddy route, workload, policy, or production resource was changed.
 
 ## Run and immutable versions
 
@@ -116,4 +116,4 @@ The run namespace, ServiceAccounts, probes, standard NetworkPolicies, CiliumNetw
 
 ## Result and remaining information
 
-This run satisfies the disposable Cilium characterization and demonstrates a compatibility gap: Cilium's narrow `kube-apiserver` entity rule reaches the API, while unchanged standard NetworkPolicy `ipBlock` rules do not. Therefore Ticket 29 remains `needs-info` rather than resolved. To resolve it, the operator must name the supported production CNI/version and authorize its target tuple/evaluation behavior; no production exception should be added merely to make this disposable Cilium result pass.
+This run satisfies the disposable Cilium characterization and demonstrates a compatibility gap: Cilium's narrow `kube-apiserver` entity rule reaches the API, while unchanged standard NetworkPolicy `ipBlock` rules do not. Cilium `1.20.1` is not a supported production target, and production-target proof is intentionally deferred. Ticket 29 is administratively closed as `wontfix` for the currently unspecified target. Reopen this ticket or create a successor when the operator names the production CNI and exact version, supplies the real API Service/EndpointSlice tuple and observed pre- or post-Service-DNAT evaluation behavior, authorizes the disposable namespace and run label, and confirms cleanup authority; no production exception should be added merely to make this disposable Cilium result pass.

@@ -207,7 +207,7 @@ Official references: [R2 S3 API](https://developers.cloudflare.com/r2/get-starte
 
 ## Ticket 29: separate kind cluster and target CNI
 
-Ticket 29 is non-blocking and needs a named production CNI before it can be resolved. For characterization, create a new disposable kind context such as `tracegarden-cilium-29` with non-overlapping Pod/Service CIDRs and `disableDefaultCNI: true`. Pin Cilium `1.20.1` as required by the current guide, install it only in that cluster, and delete the cluster after the run. Do not mutate `k8s-cluster-v137` or its Caddy/kind resources.
+Ticket 29 is non-blocking and is administratively closed as `wontfix` with production-target proof deferred because no supported production CNI has been named. If reopened or replaced by a successor, create a new disposable kind context such as `tracegarden-cilium-29` with non-overlapping Pod/Service CIDRs and `disableDefaultCNI: true`. Pin Cilium `1.20.1` for characterization, install it only in that cluster, and delete the cluster after the run. Do not mutate `k8s-cluster-v137` or its Caddy/kind resources.
 
 Before Tracegarden policy/probe mutation, record only metadata:
 
