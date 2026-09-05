@@ -12,7 +12,26 @@ Status: **resolved**
 
 ## Historical versus current evidence
 
-The earlier run `tracegarden-validation-21-20260902T074817Z-30845` against implementation commit `3240952e49dca28474584d8e8158223705bcb791` remains historical evidence. Its results are not rewritten as current-runtime proof. This report's claims below are exclusively for the current `e78d736` archive and the bounded run above.
+The earlier run `tracegarden-validation-21-20260902T074817Z-30845` against implementation commit `3240952e49dca28474584d8e8158223705bcb791` remains historical evidence. Its results are not rewritten as current-runtime proof. This report's claims below are exclusively for the VM-tested runtime source archive `e78d736` and the bounded run above.
+
+## Post-run metadata equivalence bridge
+
+The first post-run evidence-only commit is `263bd538f8a2335827d0c51110070f36cc8b7c30`, tree `b05fccd78a769d568545297b6e90dca5898185ca`, with tested runtime source parent `e78d7365346315accccce4bc240ca3e2c7241b3d`, tree `646b479ba93709bd3747289f088ad4d29eb36234`. The deterministic command
+
+```text
+git diff-tree --no-commit-id --name-status -r e78d7365346315accccce4bc240ca3e2c7241b3d 263bd538f8a2335827d0c51110070f36cc8b7c30
+```
+
+reports exactly these paths and statuses:
+
+```text
+M .scratch/tracegarden-mvp/issues/21-prove-arm64-vm-runtime.md
+M evidence/21-vm-runtime/report.md
+A evidence/21-vm-runtime/vm-transcript.txt
+M evidence/live-acceptance-matrix.md
+```
+
+The post-run evidence commits collectively alter only this metadata allow-list; no runtime-bearing path changed. Reviewers can verify the final checkout with the same `git diff-tree` command ending at `HEAD`; the VM-tested runtime source remains `e78d736`, and this metadata bridge does not require another VM run.
 
 ## VM baseline and validation toolchain
 

@@ -9,6 +9,15 @@ remote_local_archive_sha256_match=passed
 remote_archive_path_manifest_match=passed
 protected_data_transferred=no
 
+first_post_run_metadata_commit=263bd538f8a2335827d0c51110070f36cc8b7c30
+first_post_run_metadata_tree=b05fccd78a769d568545297b6e90dca5898185ca
+first_post_run_metadata_parent=e78d7365346315accccce4bc240ca3e2c7241b3d
+metadata_bridge_command=git diff-tree --no-commit-id --name-status -r e78d7365346315accccce4bc240ca3e2c7241b3d 263bd538f8a2335827d0c51110070f36cc8b7c30
+metadata_bridge_result=passed
+metadata_bridge_paths=M .scratch/tracegarden-mvp/issues/21-prove-arm64-vm-runtime.md; M evidence/21-vm-runtime/report.md; A evidence/21-vm-runtime/vm-transcript.txt; M evidence/live-acceptance-matrix.md
+metadata_bridge_runtime_paths_changed=no
+post_run_evidence_commits_scope=metadata-only allow-listed paths above; verify e78d7365346315accccce4bc240ca3e2c7241b3d..HEAD
+
 vm_arch=aarch64
 vm_os=Ubuntu 24.04
 vm_cpu_count=4
