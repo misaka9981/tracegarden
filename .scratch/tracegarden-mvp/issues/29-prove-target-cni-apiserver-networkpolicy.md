@@ -19,6 +19,12 @@
 
 Stop before mutation if the production CNI identity/version, API endpoint, policy ownership, test namespace, cleanup authority, or evaluation target is ambiguous. Stop if the observed evaluation point cannot be measured or proving reachability would require a broad rule, disabled production policy, proxy, CNI mutation, or cluster-wide privilege.
 
+## Progress
+
+A bounded characterization was completed on a separate disposable ARM64 kind cluster with Cilium `1.20.1`; see [the secret-free evidence report](../../../evidence/29-target-cni-networkpolicy/report.md). It recorded the API Service/EndpointSlice tuple, web and collector probe readiness separately from RBAC and API reachability, Cilium monitor flow metadata, and exact cleanup/preservation checks. The run found that the unchanged standard `NetworkPolicy` `ipBlock` rules timed out for the host-network API endpoint, while a run-only Cilium `toEntities: [kube-apiserver]` rule reached it. No production chart or existing cluster was changed.
+
+This does not identify or prove the supported production CNI. The ticket remains `needs-info` and unresolved until the operator names the production CNI/version and authorizes its target tuple/evaluation behavior.
+
 ## Needed from the operator
 
 Provide the named production CNI and version, its documented API egress behavior, the authorized disposable namespace and run label, the exact narrow collector/web API egress targets, and cleanup authority. Evidence must state whether evaluation was pre- or post-Service-DNAT and record the observed tuple: Service ClusterIP plus Service port, or endpoint IP plus target port. Do not provide credentials or Secret values in the issue or evidence.
