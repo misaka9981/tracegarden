@@ -1,0 +1,109 @@
+Ticket 21 sanitized ARM64 VM transcript
+
+run=tracegarden-validation-21-20260905T002916Z-31881
+source_archive_commit=e78d7365346315accccce4bc240ca3e2c7241b3d
+source_archive_tree=646b479ba93709bd3747289f088ad4d29eb36234
+source_archive_entries=299
+source_archive_sha256=2de58fd851b53afe71f83b7013208c6c80675cf2cef325be66aa53ae714aec93
+remote_local_archive_sha256_match=passed
+remote_archive_path_manifest_match=passed
+protected_data_transferred=no
+
+vm_arch=aarch64
+vm_os=Ubuntu 24.04
+vm_cpu_count=4
+vm_memory_total_mib=23975
+vm_disk_tmp_total_kib=151263856
+vm_disk_tmp_available_kib=44521088
+vm_disk_tmp_used_percent=71
+docker=29.1.3 linux/arm64
+git=2.43.0
+corepack=0.34.6
+host_helm=v4.1.0+g4553a0 unchanged
+host_system_node=v22.23.2 unchanged
+validation_node=v26.8.1
+bun=1.4.0
+pnpm=11.9.0
+helm=v3.17.3+ge4da497
+kubeconform=v0.6.7 native ARM64
+
+pinned_bun_image=docker.io/oven/bun:1.4.0-distroless@sha256:76caa97ddc0e01333d98c6ab5499539dad4bbceae6237eac83e7853d3826b981
+pinned_bun_image_id=sha256:f143194f5f7dde4e9ae5061159cb4802e0f4bdf6b68418e3f23d3a3ccc939eed
+pinned_postgres_image=postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7
+pinned_postgres_image_id=sha256:ce5a49d4f47955bc3cc0120cb109a39b13a10791e35f5ac8400dc0fd7842ff5e
+pinned_node_validation_image=node:26.8-bookworm@sha256:9f94d34c787165dca03b74e5bf9c3bf90e8de79b19aa3d87fe1fa1694bf75c89
+pinned_node_validation_image_id=sha256:2563b93b12a989395d4c4a6392dbd286abb5cf527efc8967784490d17f83e7ad
+helm_helper_image=docker.io/alpine/helm:3.17.3@sha256:d899e6316789fec04ee95300a18e454b7942539cbb3d89bde3e0655d6ca2e895
+helm_helper_image_id=sha256:4881dbcb2850d508bfe703bda748a216b177ad1a44fc0fe27357f85ffc202527
+
+canonical_schema_files=14
+schema_directory=.ci/kubeconform-schemas/v1.31.0-standalone-strict
+production_render_resource_count=20
+preview_render_resource_count=17
+production_strict_validation=passed in acceptance
+preview_strict_validation=passed in acceptance
+
+clean_cache_web_image_id=sha256:e9c1eae372bc26354ed7fba8e9224edc38a1f002dd93f1825c501006010f0733
+clean_cache_collector_image_id=sha256:46f377573ceb5e93552145c6a2816fd074c347c5ca19e738c1b7a9fe5fcf68ed
+clean_cache_migrate_image_id=sha256:8e32d3bc7579a57f9e960399e16972469b0f3609f45b58fad5e746dab215a7d1
+clean_cache_backup_image_id=sha256:6bc349ae47f001dbd26559f4c8e4b0c4419f71f177dd4df9ed5875b1f242cb86
+clean_cache_build_flags=--no-cache --network none --pull=false --platform linux/arm64
+
+acceptance_command=CI=true timeout --foreground 1700s pnpm acceptance
+acceptance_exit=0
+acceptance_stage_count=20
+acceptance_final_message=Tracegarden local acceptance workflow passed; no external integrations were contacted.
+acceptance_stages=all 20 sequential stages passed
+- format check
+- lint
+- strict typecheck
+- production build
+- Bun compiled-ESM compatibility gate
+- Bun migration fresh/upgrade/lock/rollback/retry smoke
+- offline acceptance image preflight policy
+- clean-cache frozen dependency fail-closed policy
+- clean Docker-cache offline container build
+- unit, authorization, telemetry, and domain failure suites
+- deterministic collector failure and recovery suites (Bun)
+- real PostgreSQL integration, auth, retention, log-bound, and live timeline suites
+- existing bilingual browser smoke suite
+- focused browser core-loop scenario
+- offline encrypted backup and restore validation (Bun)
+- provision checked-in Kubernetes schemas
+- offline production deployment and backup manifest validation
+- offline Preview and promotion declaration validation
+- delivery policy validation
+- production web and collector non-root image smoke
+
+selected_results=passed
+- real PostgreSQL integration/auth/retention/timeline
+- Bun compatibility and migration rollback/retry
+- Bun collector resilience
+- browser and core-loop
+- encrypted backup/restore validation
+- strict chart/preview schema and delivery checks
+- ARM64 Bun web/collector/migrate/backup container checks
+
+existing_resource_pre_state=recorded
+railgun-caddy=26e35e579600473cee8faa08c2fcf4cb8856f6f5b37b77a6c301d44714884f75 running=true
+k8s-cluster-v137-control-plane=d5f3759062bfbd5d96e1a8e4e401be488a3f156d14348feaa5dea95a20b7f2dc running=true
+k8s-cluster-v137-worker=ab79985d801cb252c6ce5e6da5629314f59f1d485d5c21b077dfa350f1c1251e running=true
+existing_resource_post_state=unchanged
+railgun-caddy=26e35e579600473cee8faa08c2fcf4cb8856f6f5b37b77a6c301d44714884f75 running=true
+k8s-cluster-v137-control-plane=d5f3759062bfbd5d96e1a8e4e401be488a3f156d14348feaa5dea95a20b7f2dc running=true
+k8s-cluster-v137-worker=ab79985d801cb252c6ce5e6da5629314f59f1d485d5c21b077dfa350f1c1251e running=true
+listeners=22,443 unchanged
+
+cleanup=passed
+run_directory=absent
+run_archive=absent
+run_manifest=absent
+run_processes=none
+run_containers=none
+run_networks=none
+run_volumes=none
+run_image_tags=none
+helm_helper_image_after_cleanup=absent
+no_global_prune=true
+no_kubernetes_or_cloud_operations=true
+no_credentials_or_protected_values_retained=true
