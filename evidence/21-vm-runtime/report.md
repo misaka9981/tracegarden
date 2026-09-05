@@ -5,7 +5,7 @@ Status: **resolved**
 ## Current run and source boundary
 
 - Run: `tracegarden-validation-21-20260905T002916Z-31881`.
-- The tested source was the clean tracked archive of the exact current `main` commit `e78d7365346315accccce4bc240ca3e2c7241b3d`, tree `646b479ba93709bd3747289f088ad4d29eb36234`.
+- The tested source was the clean tracked archive of the exact `main` commit current when the archive was created, `e78d7365346315accccce4bc240ca3e2c7241b3d`, tree `646b479ba93709bd3747289f088ad4d29eb36234`.
 - The archive contained 299 tracked archive entries. Its SHA-256 was `2de58fd851b53afe71f83b7013208c6c80675cf2cef325be66aa53ae714aec93`; the remote archive and local path manifest matched exactly.
 - No Git metadata, Git credentials, local secrets, build caches, application data, or Kubernetes context was transferred. The run used only the archive and run-scoped validation material.
 - A sanitized command/result transcript is retained at [`vm-transcript.txt`](vm-transcript.txt).
