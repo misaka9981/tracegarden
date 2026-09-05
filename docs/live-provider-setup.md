@@ -16,7 +16,7 @@ Use one disposable resource set per run:
 4. Prepare the optional Ticket 27 R2 bucket and separate clean PostgreSQL restore target only when off-site disaster recovery is needed; otherwise keep the backup CronJob disabled and skip its live proof.
 5. Run Ticket 29 only in a new disposable kind cluster with pinned Cilium. Never replace the CNI in the existing `k8s-cluster-v137` cluster.
 
-Ticket 24 remains `needs-info` until its required provider resources and cleanup authority are explicitly supplied. Ticket 27 is currently `wontfix` for this personal deployment because off-site disaster recovery is not needed; its implementation and this future runbook remain available if that need changes.
+Ticket 24 remains `claimed` until its owner-only provider behavior and cleanup are evidenced. This personal deployment intentionally defers live invited-Member and rejected-identity Google-provider flows; deterministic application authorization tests remain authoritative for those paths. Ticket 27 is currently `wontfix` for this personal deployment because off-site disaster recovery is not needed; its implementation and this future runbook remain available if that need changes.
 
 ## Profile A: free personal use (recommended)
 
@@ -141,7 +141,7 @@ Official references: [Workers Access](https://developers.cloudflare.com/workers/
 
 ## Ticket 24: Google OAuth callback
 
-Create a disposable Google Cloud project/client manually. Configure the consent screen and explicit test users for three controlled identities: bootstrap owner, invited Member, and rejected/uninvited identity. Use stable issuer-and-subject identity; email is not the durable key.
+Create or authorize a Google Cloud Web OAuth client manually. For this personal single-owner deployment, configure one designated Bootstrap Owner identity only. Live invited-Member and rejected/uninvited Google-provider identities are explicitly out of scope and must not be treated as prerequisites or live evidence; application invitation authorization remains covered by deterministic tests. Use stable issuer-and-subject identity; email is not the durable key.
 
 The authorized redirect URI must exactly match the deployed HTTPS hostname and path:
 
@@ -171,7 +171,7 @@ GOOGLE_REDIRECT_URI=https://<selected-oauth-host>/api/auth/callback/google
 
 The production chart maps this to `config.googleClientId`, `config.googleRedirectUri`, `config.bootstrapIssuer`, `config.bootstrapSubject`, and Secret `tracegarden-google/GOOGLE_CLIENT_SECRET`. The runtime also requires its existing database, Better Auth, and timeline secrets through their approved Secret paths.
 
-The operator must complete browser consent; automation must not capture passwords, OAuth codes, JWTs, cookies, or full email addresses. Live evidence should cover valid state/callback, returning login, bootstrap owner exactly once, invited admission, absent/revoked Invitation rejection, invalid state, denied callback, insecure/wrong redirect, and repeat-login partitions. Remove only the authorized test Invitations, sessions, and Memberships afterward. Delete the disposable client/project only if that cleanup is authorized.
+The operator must complete browser consent for the designated Bootstrap Owner; automation must not capture passwords, OAuth codes, JWTs, cookies, or full email addresses. Live evidence should cover valid state/callback, returning login, Bootstrap Owner exactly once, invalid state, denied callback, insecure/wrong redirect, and repeat-login partitions. Invited-Member and rejected-identity provider flows are explicitly deferred; their application authorization semantics remain covered by deterministic tests. Remove only the authorized test sessions and Memberships afterward. Delete the disposable client/project only if that cleanup is authorized.
 
 Official references: [Google OAuth web-server flow](https://developers.google.com/identity/protocols/oauth2/web-server), [OAuth clients](https://support.google.com/cloud/answer/15549257?hl=en), [OIDC claims](https://developers.google.com/identity/openid-connect/openid-connect), and [Google test users](https://support.google.com/cloud/answer/15549945?hl=en).
 
@@ -233,6 +233,7 @@ OAuth hostname: <hostname>
 Preview hostname: <hostname>
 Cloudflare Access team/issuer and AUD: <metadata only>
 Google credential file: /home/ubuntu/tracegarden-credentials/google.env
+Google Bootstrap Owner selector: <secure path or redacted label only>
 R2 credential file (optional Ticket 27): /home/ubuntu/tracegarden-credentials/object-storage.env
 Backup encryption-key path (optional Ticket 27): /home/ubuntu/tracegarden-credentials/backup-key
 Restore target (optional Ticket 27): separate clean PostgreSQL target and cleanup authority
