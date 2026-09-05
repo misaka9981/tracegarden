@@ -15,7 +15,7 @@ An acceptable backup setup must prove both directions:
 - A scheduled backup produces an encrypted off-VM artifact.
 - A documented restore rehearsal can populate a newly created clean PostgreSQL instance and pass integrity and application-readable checks.
 
-Copying a dump to the same VM is not considered disaster recovery. Live upload and restore rehearsal remain **unverified** until authorized storage, restore infrastructure, and credentials are supplied.
+Copying a dump to the same VM is not considered disaster recovery. The current personal deployment intentionally skips live R2 upload and restore rehearsal because off-site disaster recovery is not currently needed. If that need changes, reopen Ticket 27 and supply authorized storage, restore infrastructure, credentials, lifecycle, and cleanup authority before enabling the CronJob.
 
 ## Recent Log Window
 

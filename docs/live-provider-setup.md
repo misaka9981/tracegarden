@@ -13,10 +13,10 @@ Use one disposable resource set per run:
 1. Prepare Cloudflare account/Workers and Google Cloud access manually.
 2. Establish the Ticket 25 HTTPS ingress and Access boundary.
 3. Establish the Ticket 24 callback on a separate hostname; do not put Access in front of it unless that interaction is explicitly being tested.
-4. Prepare the Ticket 27 R2 bucket and a separate clean PostgreSQL restore target.
+4. Prepare the optional Ticket 27 R2 bucket and separate clean PostgreSQL restore target only when off-site disaster recovery is needed; otherwise keep the backup CronJob disabled and skip its live proof.
 5. Run Ticket 29 only in a new disposable kind cluster with pinned Cilium. Never replace the CNI in the existing `k8s-cluster-v137` cluster.
 
-Tickets remain `needs-info` until their required provider resources and cleanup authority are explicitly supplied.
+Ticket 24 remains `needs-info` until its required provider resources and cleanup authority are explicitly supplied. Ticket 27 is currently `wontfix` for this personal deployment because off-site disaster recovery is not needed; its implementation and this future runbook remain available if that need changes.
 
 ## Profile A: free personal use (recommended)
 
@@ -54,7 +54,7 @@ The operator must manually complete account bootstrap and interactive identity s
 
 - create/sign in to the Cloudflare account and perform the first `workers.dev` subdomain setup;
 - onboard the Zero Trust organization/team and choose the disposable Access identity/provider;
-- create least-privilege Cloudflare API tokens and R2 S3 credentials;
+- create least-privilege Cloudflare API tokens and R2 S3 credentials only if the optional Ticket 27 backup is being enabled;
 - create the Google Cloud project/client, configure consent/test users, and perform browser consent for controlled identities;
 - authorize the VM, local restore target, and cleanup scope.
 
@@ -177,7 +177,7 @@ Official references: [Google OAuth web-server flow](https://developers.google.co
 
 ## Ticket 27: encrypted R2 backup and clean restore
 
-Create one run-labelled R2 bucket and one bucket-scoped Object Read & Write token. Keep the access key identifier as metadata only and keep the secret key in a `0600` file. The endpoint is:
+This optional path is intentionally skipped for the current personal deployment; Ticket 27 is `wontfix` until off-site disaster recovery is needed. If that need changes, reopen the ticket and create one run-labelled R2 bucket and one bucket-scoped Object Read & Write token. Keep the access key identifier as metadata only and keep the secret key in a `0600` file. The endpoint is:
 
 ```text
 https://<account-id>.r2.cloudflarestorage.com
@@ -233,10 +233,10 @@ OAuth hostname: <hostname>
 Preview hostname: <hostname>
 Cloudflare Access team/issuer and AUD: <metadata only>
 Google credential file: /home/ubuntu/tracegarden-credentials/google.env
-R2 credential file: /home/ubuntu/tracegarden-credentials/object-storage.env
-Backup encryption-key path: /home/ubuntu/tracegarden-credentials/backup-key
-Restore target: separate clean PostgreSQL target and cleanup authority
+R2 credential file (optional Ticket 27): /home/ubuntu/tracegarden-credentials/object-storage.env
+Backup encryption-key path (optional Ticket 27): /home/ubuntu/tracegarden-credentials/backup-key
+Restore target (optional Ticket 27): separate clean PostgreSQL target and cleanup authority
 Ticket 29 target CNI/version/context: <metadata when selected>
 ```
 
-Do not send token values, client secrets, R2 secret keys, database passwords, encryption keys, JWTs, cookies, codes, dumps, full emails, or protected row content. Tickets 24, 25, and 27 cannot be honestly resolved until their provider resources, secure delivery paths, controlled identities, and cleanup authority are available.
+Do not send token values, client secrets, R2 secret keys, database passwords, encryption keys, JWTs, cookies, codes, dumps, full emails, or protected row content. Ticket 24 cannot be honestly resolved until its provider resources, secure delivery path, controlled identities, and cleanup authority are available. Ticket 27 is intentionally deferred for the current personal deployment and should be reopened only when its explicit off-site disaster-recovery triggers and resources are available.
